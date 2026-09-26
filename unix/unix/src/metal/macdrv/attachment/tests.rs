@@ -59,6 +59,32 @@ fn is_same(a: &Arc<Attachment>, b: &Arc<Attachment>) -> bool {
 }
 
 #[test]
+fn an_immediate_present_cap_does_not_hold_the_drawable_on_screen() {
+    const VIEW: usize = 0x9_1000;
+    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    att.set_min_present_duration(1.0 / 120.0);
+    att.set_pacing_bits(pack_pacing(&PresentPacing {
+        vsync_requested: false,
+        max_fps: 120,
+    }));
+    assert_eq!(
+        att.drawable_present_duration_sec().to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert_eq!(att.pacing().max_fps, 120);
+    att.set_pacing_bits(pack_pacing(&PresentPacing {
+        vsync_requested: true,
+        max_fps: 120,
+    }));
+    att.set_min_present_duration(1.0 / 60.0);
+    assert_eq!(
+        att.drawable_present_duration_sec().to_bits(),
+        (1.0_f64 / 60.0).to_bits()
+    );
+    unregister(VIEW);
+}
+
+#[test]
 fn two_attachments_coexist() {
     const VIEW_A: usize = 0x1_0000;
     const VIEW_B: usize = 0x1_1000;

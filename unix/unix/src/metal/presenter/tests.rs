@@ -15,6 +15,72 @@ use objc2_metal::MTLPixelFormat;
 
 use super::*;
 
+#[test]
+fn the_cpu_cap_waits_only_for_the_unelapsed_interval() {
+    let start = Instant::now();
+    let pacing = PresentPacing {
+        vsync_requested: false,
+        max_fps: 100,
+    };
+    for (elapsed_ms, deadline_ms) in [(0, 10), (4, 10), (10, 10), (15, 15)] {
+        assert_eq!(
+            cap_deadline(
+                Some(start),
+                start + Duration::from_millis(elapsed_ms),
+                &pacing
+            ),
+            Some(start + Duration::from_millis(deadline_ms)),
+        );
+    }
+}
+
+#[test]
+fn timer_overshoot_does_not_accumulate_across_frames() {
+    let start = Instant::now();
+    let pacing = PresentPacing {
+        vsync_requested: false,
+        max_fps: 100,
+    };
+    let first = cap_deadline(None, start, &pacing);
+    let second = cap_deadline(first, start + Duration::from_millis(4), &pacing);
+    assert_eq!(second, Some(start + Duration::from_millis(10)));
+    let third = cap_deadline(second, start + Duration::from_millis(15), &pacing);
+    assert_eq!(third, Some(start + Duration::from_millis(20)));
+    let after_pause = cap_deadline(third, start + Duration::from_secs(2), &pacing);
+    assert_eq!(after_pause, Some(start + Duration::from_secs(2)));
+}
+
+#[test]
+fn the_cpu_cap_skips_first_frames_vsync_and_an_unlimited_rate() {
+    let now = Instant::now();
+    for (last, vsync_requested, max_fps, expected) in [
+        (None, false, 120, Some(now)),
+        (Some(now), true, 120, None),
+        (Some(now), false, 0, None),
+    ] {
+        let pacing = PresentPacing {
+            vsync_requested,
+            max_fps,
+        };
+        assert_eq!(cap_deadline(last, now, &pacing), expected);
+    }
+}
+
+#[test]
+fn a_changed_cap_uses_the_last_deadline_without_accumulating_debt() {
+    let start = Instant::now();
+    for (fps, deadline_ms) in [(50, Some(20)), (100, Some(10)), (200, Some(5)), (0, None)] {
+        let pacing = PresentPacing {
+            vsync_requested: false,
+            max_fps: fps,
+        };
+        assert_eq!(
+            cap_deadline(Some(start), start + Duration::from_millis(5), &pacing),
+            deadline_ms.map(|ms| start + Duration::from_millis(ms)),
+        );
+    }
+}
+
 fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
     PresentPacket {
         seq,
