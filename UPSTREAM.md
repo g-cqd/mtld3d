@@ -1,6 +1,8 @@
 # Keeping this fork current
 
-The upstream `main` branch stays unchanged. Local NFSMW patches live on `nfsmw-macos`. The pinned base and verification limits are documented alongside the patches.
+`main` is the single working branch for this fork. It contains the NFSMW patches and the other development branch histories. Historical branches remain available as references; new work belongs on `main`.
+
+The `upstream` remote tracks athei/mtld3d independently of the fork's working branch.
 
 ## Clone once
 
@@ -8,26 +10,19 @@ The upstream `main` branch stays unchanged. Local NFSMW patches live on `nfsmw-m
 git clone git@github.com:g-cqd/mtld3d.git
 cd mtld3d
 git remote add upstream https://github.com/athei/mtld3d.git
-git fetch origin
-git switch --track origin/nfsmw-macos
+git switch main
 ```
 
-## Test an upstream update
+## Integrate an upstream update
 
-Start with a clean working tree. Choose a new branch name for each attempt.
+Start with a clean working tree, then merge without rewriting the fork's history:
 
 ```sh
 git fetch upstream --tags
-git switch -c nfsmw-upstream-update origin/nfsmw-macos
-git rebase upstream/main
+git switch main
+git merge --no-commit --no-ff upstream/main
 ```
 
-Resolve each conflict and run the project's build and test gates, including the NFSMW regressions, before trying the updated runtime in a disposable player folder. Update the pinned revision and verification notes. `git rebase --abort` returns an interrupted rebase to its starting point.
+Resolve conflicts and run the repository's build and test gates, including the NFSMW regressions, before committing the merge. `git merge --abort` returns an interrupted merge to its starting point. Keep installed game runtimes separate from validation builds.
 
-Push the tested candidate as a new branch for review:
-
-```sh
-git push -u origin nfsmw-upstream-update
-```
-
-Keep the existing `nfsmw-macos` branch and installed runtime available until the candidate is verified. Replacing the patch branch after a rebase rewrites history; coordinate with other users and use `--force-with-lease` only for that deliberate replacement. Never force-push the upstream `main` branch.
+Push verified changes to `origin/main` with a normal push. Do not force-push or delete the historical branches as part of an update.

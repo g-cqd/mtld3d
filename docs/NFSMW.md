@@ -1,6 +1,6 @@
 # NFSMW macOS patches
 
-This branch rebases the four NFSMW patch and documentation commits onto athei/mtld3d 1b0bf1f40c8bfeecb4b0c5a2c8182ef6893edd76. It contains the source changes used by the local NFSMW macOS preview on 2026-09-26. No game data is included.
+The working `main` branch combines the NFSMW patch branches with athei/mtld3d 1b0bf1f40c8bfeecb4b0c5a2c8182ef6893edd76. It contains the source changes used by the local NFSMW macOS preview on 2026-09-26. No game data is included.
 
 ## Immediate presentation pacing
 
@@ -20,4 +20,4 @@ A 120 FPS limit is supported. Sustained 120 FPS racing has not been achieved. Th
 
 ## Upstream refresh
 
-The `nfsmw-upstream-update` candidate contains the retained-stencil correction, test-window shutdown correction and regression benchmark harness from upstream. The original `nfsmw-macos` branch remains available. This update has not been shown to increase game FPS.
+The merged `nfsmw-upstream-update` history contains the retained-stencil correction, test-window shutdown correction and regression benchmark harness from upstream. Both NFSMW branch histories are preserved in `main`. This update has not been shown to increase game FPS.
