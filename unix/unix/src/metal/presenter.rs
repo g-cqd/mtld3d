@@ -37,7 +37,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use block2::RcBlock;
@@ -57,7 +57,7 @@ use objc2_quartz_core::CAMetalLayer;
 use super::{
     command::{self, PresentEncode, diagnostics},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
-    macdrv::attachment,
+    macdrv::{PresentPacing, attachment},
     record::DeviceRecord,
     texture,
 };
@@ -704,13 +704,50 @@ fn presenter_main(record: &Arc<DeviceRecord>, queue: MetalHandle<MTLCommandQueue
         log::error!(target: LOG_TARGET, "presenter: queue retain failed (handle={queue:#x})");
         return;
     };
-    while objc2::rc::autoreleasepool(|_| present_frame(record, &queue)) {}
+    let mut last_deadline = None;
+    while objc2::rc::autoreleasepool(|_| present_frame(record, &queue, &mut last_deadline)) {}
+}
+
+/// Next CPU pacing deadline, preserving cadence through timer overshoot.
+///
+/// Late frames restart at `now` instead of accumulating catch-up work.
+/// Vsync and an unlimited rate clear the schedule; the first frame is immediate.
+fn cap_deadline(
+    last_deadline: Option<Instant>,
+    now: Instant,
+    pacing: &PresentPacing,
+) -> Option<Instant> {
+    if pacing.vsync_requested || pacing.max_fps == 0 {
+        return None;
+    }
+    let interval = Duration::from_secs_f64(1.0 / f64::from(pacing.max_fps));
+    Some(last_deadline.map_or(now, |last| (last + interval).max(now)))
+}
+
+/// Wait for the cap without holding a drawable or blocking shutdown's state lock.
+fn wait_for_cap(state: &PresentState, deadline: Instant) {
+    let mut inner = state.lock();
+    while !inner.flags.contains(PresenterFlags::STOP) {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            break;
+        }
+        (inner, _) = state
+            .presenter_cv
+            .wait_timeout(inner, wait)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+    drop(inner);
 }
 
 /// One presenter iteration: take the front packet through to its commit.
 ///
 /// `false` once the state is stopped and every packet dropped.
-fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLCommandQueue>) -> bool {
+fn present_frame(
+    record: &Arc<DeviceRecord>,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    last_deadline: &mut Option<Instant>,
+) -> bool {
     let state = record.present();
     let (seq, layer, view, gate) = {
         let inner = state.lock();
@@ -761,6 +798,15 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
         drop_front(state, seq);
         return true;
+    }
+    *last_deadline = attachment
+        .as_ref()
+        .and_then(|att| cap_deadline(*last_deadline, Instant::now(), &att.pacing()));
+    if let Some(deadline) = *last_deadline {
+        wait_for_cap(state, deadline);
+        if state.lock().flags.contains(PresenterFlags::STOP) {
+            return true;
+        }
     }
     let Some(layer) = IntoRetainedLayer::into_retained(layer) else {
         drop_front(state, seq);

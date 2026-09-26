@@ -980,14 +980,11 @@ pub fn encode_present(
     }
 
     mtld3d_shared::crumb!("submit:present", args.drawable_wait_ns);
-    // Throttle presents to `1/panel_max_hz` when the guest asked
-    // for vsync (PE-side `D3DPRESENT_INTERVAL_*` mapping). On a
-    // ProMotion panel the system adapts the panel rate to whatever
-    // sub-max cadence we sustain under the cap, so fractional
-    // production rates display at their actual rate. `0.0` means
-    // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
+    // A minimum on-screen duration waits for display refresh even when
+    // displaySyncEnabled is false. The presenter paces immediate presents
+    // on the CPU so a user cap above the panel rate stays independent of it.
     let drawable_obj = ProtocolObject::from_ref(drawable);
-    let min_duration = attachment.map_or(0.0, |att| att.min_present_duration_sec());
+    let min_duration = attachment.map_or(0.0, |att| att.drawable_present_duration_sec());
     if min_duration > 0.0 {
         cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
     } else {

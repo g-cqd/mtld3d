@@ -376,6 +376,22 @@ impl Attachment {
         f64::from_bits(self.min_present_duration_bits.load(Ordering::Relaxed))
     }
 
+    /// Minimum on-screen duration for vsync; immediate presents use CPU pacing instead.
+    #[must_use]
+    pub fn drawable_present_duration_sec(&self) -> f64 {
+        if self.pacing().vsync_requested {
+            self.min_present_duration_sec()
+        } else {
+            0.0
+        }
+    }
+
+    /// The guest's current vsync request and effective frame-rate cap.
+    #[must_use]
+    pub fn pacing(&self) -> super::PresentPacing {
+        super::unpack_pacing(self.pacing_bits())
+    }
+
     pub fn set_min_present_duration(&self, seconds: f64) {
         self.min_present_duration_bits
             .store(seconds.to_bits(), Ordering::Relaxed);
