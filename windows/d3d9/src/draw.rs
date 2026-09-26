@@ -15,7 +15,7 @@ use mtld3d_core::{
     async_compile::{ClearPlanes, DeferredState, JobTicket, LibrarySlot, Resolution},
     convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
-    dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
+    dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range, vertex_read_size},
     dxso::{
         FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
     },
@@ -2580,7 +2580,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     enc.note_buffer_draw_range(
                         b.buffer_id.raw(),
                         range_off,
-                        range_size,
+                        vertex_read_size(
+                            range_size,
+                            layout.stride,
+                            attrs.extents[b.stream as usize],
+                        ),
                         logical_len,
                     );
                 }

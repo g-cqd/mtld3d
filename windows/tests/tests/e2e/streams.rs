@@ -258,6 +258,68 @@ fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
     );
 }
 
+/// Overlapping vertex layouts preserve their spacing and prior draw contents.
+///
+/// A colour beyond the stride is still part of each vertex's read range.
+/// Refilling those colours in the same frame must retain the first draw's data.
+#[test]
+fn stride_below_consumed_extent_preserves_fetch_and_prior_draw() {
+    let h = Harness::new();
+    let elements = [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            offset: 64,
+            ..element(0, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR)
+        },
+        end(),
+    ];
+    let decl = h.create_vertex_declaration(&elements);
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), D3D_OK);
+    assert_eq!(h.set_vertex_shader(&vs), D3D_OK);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+
+    // Offset 16, StartVertex 1: positions begin at byte 28, colours at 92.
+    let mut words = [0_u32; 128];
+    for (i, p) in centered_triangle().iter().enumerate() {
+        let base = 7 + i * 3;
+        words[base..base + 3].copy_from_slice(&[p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
+        words[23 + i * 3] = GREEN;
+    }
+    let vb = h.create_vertex_buffer(512, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&words);
+    assert_eq!(h.set_stream_source(0, &vb, 16, 12), D3D_OK);
+    h.render_once(BLUE, |d| {
+        let viewport = |x| mtld3d_types::D3DVIEWPORT9 {
+            x,
+            y: 0,
+            width: 300,
+            height: 480,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        assert_eq!(d.set_viewport(&viewport(0)), D3D_OK);
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 1, 1), D3D_OK);
+        for i in 0..3 {
+            words[23 + i * 3] = RED;
+        }
+        vb.lock(92, 28, 0).write(&words[23..30]);
+        assert_eq!(d.set_viewport(&viewport(320)), D3D_OK);
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 1, 1), D3D_OK);
+    });
+    assert_eq!(
+        h.read_pixel(150, 280),
+        GREEN,
+        "prior draw keeps its colours"
+    );
+    assert_eq!(
+        h.read_pixel(470, 280),
+        RED,
+        "partial refill reaches the later draw"
+    );
+}
+
 /// A zero stride feeds every vertex the element at the stream offset.
 ///
 /// D3D9 defines a `SetStreamSource` stride of 0 as one element for the whole

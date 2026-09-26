@@ -6,7 +6,7 @@
 //! a buffer a later upload corrupts, and the exact non-indexed range must not reach past the
 //! bytes read. Start overflow falls back to the whole tail, size overflow keeps the exact start.
 
-use super::{DirtyRange, indexed_vb_range_lower_bound, nonindexed_vb_range};
+use super::{DirtyRange, indexed_vb_range_lower_bound, nonindexed_vb_range, vertex_read_size};
 
 const LEN: u32 = 4096;
 
@@ -204,4 +204,28 @@ fn nonindexed_range_covers_exactly_what_the_draw_reads() {
     // One byte before and after the read span do not.
     assert!(!d.overlaps(575, 576));
     assert!(!d.overlaps(3776, 3777));
+}
+
+#[test]
+fn consumed_extent_covers_the_last_vertex_without_changing_spacing() {
+    let (offset, size) = nonindexed_vb_range(16, 12, 1, 3).unwrap();
+    let mut range = DirtyRange::empty();
+    range.conjoin(offset, vertex_read_size(size, 12, 68), 512);
+    assert_eq!(range.span(), Some((28, 120)));
+    assert!(range.overlaps(116, 120));
+    assert!(!range.overlaps(120, 124));
+}
+
+#[test]
+fn consumed_extent_preserves_whole_tail_and_checks_overflow() {
+    for (size, stride, extent, expected) in [
+        (36, 12, 8, 36),
+        (36, 12, 12, 36),
+        (12, 12, 44, 44),
+        (0, 12, 44, 0),
+        (u32::MAX - 32, 12, 44, u32::MAX),
+        (u32::MAX - 31, 12, 44, 0),
+    ] {
+        assert_eq!(vertex_read_size(size, stride, extent), expected);
+    }
 }
