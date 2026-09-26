@@ -104,13 +104,31 @@ impl DirtyRange {
     }
 }
 
+/// Extend a stride-based read size to cover the final consumed attribute.
+///
+/// `read_size` already covers every element's stride. When the declaration
+/// extent exceeds that stride, the final element reads additional bytes.
+/// Zero retains its whole-tail meaning for [`DirtyRange::conjoin`]; overflow
+/// also returns zero, so tracking never misses an overlapping upload.
+#[must_use]
+pub const fn vertex_read_size(read_size: u32, stride: u32, extent: u32) -> u32 {
+    if read_size == 0 {
+        return 0;
+    }
+    match read_size.checked_add(extent.saturating_sub(stride)) {
+        Some(size) => size,
+        None => 0,
+    }
+}
+
 /// The vertex-buffer byte sub-range a non-indexed draw reads, as `(offset, size)`.
 ///
 /// For [`DirtyRange::conjoin`] (`size == 0` = to end of buffer). `None`
 /// means the draw reads nothing — skip recording.
 ///
-/// Exact: vertices `[start_vertex, start_vertex + vertex_count)` at
-/// `stride` bytes each, from `stream_offset`. The range may over-cover
+/// Vertices `[start_vertex, start_vertex + vertex_count)` at `stride` bytes
+/// each, from `stream_offset`. Apply [`vertex_read_size`] when consumed
+/// attributes extend beyond one stride. The range may over-cover
 /// but must never under-cover — a missed overlap reuses a buffer a later
 /// upload corrupts — so any arithmetic overflow falls back to the
 /// conservative whole-tail `[stream_offset, end)`.

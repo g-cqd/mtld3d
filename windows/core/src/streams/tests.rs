@@ -136,11 +136,11 @@ fn non_zero_stride_steps_per_frequency_word() {
 }
 
 #[test]
-fn layout_stride_widens_below_the_consumed_extent() {
+fn layout_stride_preserves_nonzero_vertex_spacing() {
     assert_eq!(layout_stride(48, 36), 48);
     assert_eq!(layout_stride(36, 36), 36);
-    // A stride below the consumed extent is unencodable in Metal: widened.
-    assert_eq!(layout_stride(16, 28), 28);
+    assert_eq!(layout_stride(12, 44), 12);
+    assert_eq!(layout_stride(16, 28), 16);
     // Zero is the declaration extent for the inline (UP) path.
     assert_eq!(layout_stride(0, 28), 28);
 }
