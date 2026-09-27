@@ -323,7 +323,9 @@ mod source;
 /// `78` turns `pos_fixup` into the `PosFixup` struct and adds the
 /// `D3DRS_DEPTHBIAS` offset to the position epilogue, changing the MSL of
 /// every vertex shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 78;
+/// `79` adds fixed-function `COLORARG0` and `ALPHAARG0` to the pixel key and
+/// emits the D3D9 ternary texture operations from those fields.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 79;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

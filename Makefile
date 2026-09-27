@@ -437,9 +437,13 @@ install-windows-i686: $(if $(STAGE),,windows-i686)
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/i386-windows ; \
 		cp -c $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$tree/i386-windows/ ; \
+		cp -c $(OUT_i386)/d3d8.dll    $(OUT_i386)/d3d8.pdb    $$tree/i386-windows/ ; \
 		cp -c $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$tree/i386-windows/ ; \
+		$(WINEBUILD) --builtin $$tree/i386-windows/d3d8.dll ; \
 		$(WINEBUILD) --builtin $$tree/i386-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -f $$dir/lib/wine/i386-windows/d3d8.pdb ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/d3d8.dll   -m32 --dll $$tree/i386-windows/d3d8.dll ; \
 			rm -f $$dir/lib/wine/i386-windows/d3d9.pdb $$dir/lib/wine/i386-windows/mtld3d.pdb ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/d3d9.dll   -m32 --dll $$tree/i386-windows/d3d9.dll ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/mtld3d.dll -m32 --dll $$tree/i386-windows/mtld3d.dll ; \
@@ -451,9 +455,13 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/x86_64-windows ; \
 		cp -c $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$tree/x86_64-windows/ ; \
+		cp -c $(OUT_x64)/d3d8.dll     $(OUT_x64)/d3d8.pdb     $$tree/x86_64-windows/ ; \
 		cp -c $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$tree/x86_64-windows/ ; \
+		$(WINEBUILD) --builtin $$tree/x86_64-windows/d3d8.dll ; \
 		$(WINEBUILD) --builtin $$tree/x86_64-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -f $$dir/lib/wine/x86_64-windows/d3d8.pdb ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d8.dll   -m64 --dll $$tree/x86_64-windows/d3d8.dll ; \
 			rm -f $$dir/lib/wine/x86_64-windows/d3d9.pdb $$dir/lib/wine/x86_64-windows/mtld3d.pdb ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d9.dll   -m64 --dll $$tree/x86_64-windows/d3d9.dll ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/mtld3d.dll -m64 --dll $$tree/x86_64-windows/mtld3d.dll ; \
@@ -548,8 +556,10 @@ bundle: all
 	mkdir -p $(BUNDLE_STAGE)/prefix-markers/syswow64
 	mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32
 	cp -c $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
+	cp -c $(OUT_i386)/d3d8.dll             $(BUNDLE_STAGE)/wine/i386-windows/
 	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/wine/i386-windows/
 	cp -c $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
+	cp -c $(OUT_x64)/d3d8.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	# Markers live outside wine/, and already carry the name they need in the
 	# prefix, so both routes are a plain copy into the matching system dir with
@@ -560,10 +570,14 @@ bundle: all
 	cp -c $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
+	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d8.dll
+	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d8.dll
 	cp -c $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
 	cp -c $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
 	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
 	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
+	cp -c $(OUT_i386)/d3d8.dll             $(BUNDLE_STAGE)/native/i386-windows/
+	cp -c $(OUT_x64)/d3d8.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
 	cp -c $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
@@ -590,8 +604,10 @@ bundle: all
 	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)
 	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
 	cp -c $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
+	cp -c $(OUT_i386)/d3d8.pdb             $(DEBUG_STAGE)/i386-windows/
 	cp -c $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
 	cp -c $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
+	cp -c $(OUT_x64)/d3d8.pdb              $(DEBUG_STAGE)/x86_64-windows/
 	cp -c $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
 	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
@@ -610,9 +626,11 @@ stage: all
 	mkdir -p $(STAGE_DIR)/e2e/x86_64 $(STAGE_DIR)/e2e/arm64
 	mkdir -p $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
 	cp -c $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
-		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
+		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb \
+		$(OUT_i386)/d3d8.dll $(OUT_i386)/d3d8.pdb $(STAGE_DIR)/i386-windows/
 	cp -c $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
-		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb $(STAGE_DIR)/x86_64-windows/
+		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb \
+		$(OUT_x64)/d3d8.dll $(OUT_x64)/d3d8.pdb $(STAGE_DIR)/x86_64-windows/
 	cp -c $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
 	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
 	cp -c $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/

@@ -11,10 +11,10 @@
 
 use mtld3d_types::{
     AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, D3DTA_CURRENT, D3DTA_DIFFUSE,
-    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_LERP, D3DTOP_MULTIPLYADD,
-    D3DTOP_PREMODULATE, D3DTOP_SELECTARG1, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps,
-    LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps,
-    VtxpCaps, d3dps_version, d3dvs_version,
+    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_LERP, D3DTOP_PREMODULATE,
+    D3DTOP_SELECTARG1, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps, LineCaps,
+    PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps, VtxpCaps,
+    d3dps_version, d3dvs_version,
 };
 
 use super::{FF_TEXTURE_STAGES, apply_advertise_all, fill_default, unimplemented_texture_op};
@@ -248,7 +248,9 @@ fn texture_op_caps_match_emitter() {
         | TexOpCaps::BLENDTEXTUREALPHAPM
         | TexOpCaps::BLENDFACTORALPHA
         | TexOpCaps::BLENDCURRENTALPHA
-        | TexOpCaps::DOTPRODUCT3;
+        | TexOpCaps::DOTPRODUCT3
+        | TexOpCaps::MULTIPLYADD
+        | TexOpCaps::LERP;
     assert_eq!(filled().texture_op_caps, expected.bits());
 }
 
@@ -265,9 +267,11 @@ fn one_stage_ps(color_op: u32, alpha_op: u32) -> String {
     }; 8];
     stages[0] = FfStage {
         color_op: narrow(color_op),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(alpha_op),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::empty(),
@@ -314,8 +318,6 @@ fn unimplemented_texture_op_names_the_operation() {
         (D3DTOP_PREMODULATE, "PREMODULATE"),
         (D3DTOP_BUMPENVMAP, "BUMPENVMAP"),
         (D3DTOP_BUMPENVMAPLUMINANCE, "BUMPENVMAPLUMINANCE"),
-        (D3DTOP_MULTIPLYADD, "MULTIPLYADD"),
-        (D3DTOP_LERP, "LERP"),
     ] {
         assert_eq!(unimplemented_texture_op(op), Some(name), "D3DTOP {op}");
     }

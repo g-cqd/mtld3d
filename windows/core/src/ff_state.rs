@@ -26,11 +26,12 @@ use mtld3d_types::{
     D3DRS_POINTSPRITEENABLE, D3DRS_RANGEFOGENABLE, D3DRS_SPECULARENABLE,
     D3DRS_SPECULARMATERIALSOURCE, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTA_ALPHAREPLICATE,
     D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTOP_LERP,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_ALPHAARG0, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
     D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_CONSTANT,
-    D3DTSS_RESULTARG, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED,
-    RENDER_STATE_COUNT, StateBlockType, TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DTSS_CONSTANT, D3DTSS_RESULTARG, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
+    D3DTTFF_PROJECTED, RENDER_STATE_COUNT, StateBlockType, TEXTURE_STAGE_STATE_COUNT,
+    texture_stage_state_defaults,
 };
 
 use crate::{
@@ -1284,9 +1285,11 @@ impl FfState {
             let index = u8::try_from(i).expect("stage index ≤ 7 fits u8");
             let to_u8 = |ty: u32| stage_enum_value(s, index, ty);
             stage.color_op = to_u8(D3DTSS_COLOROP);
+            stage.color_arg0 = to_u8(D3DTSS_COLORARG0);
             stage.color_arg1 = to_u8(D3DTSS_COLORARG1);
             stage.color_arg2 = to_u8(D3DTSS_COLORARG2);
             stage.alpha_op = to_u8(D3DTSS_ALPHAOP);
+            stage.alpha_arg0 = to_u8(D3DTSS_ALPHAARG0);
             stage.alpha_arg1 = to_u8(D3DTSS_ALPHAARG1);
             stage.alpha_arg2 = to_u8(D3DTSS_ALPHAARG2);
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
@@ -1986,7 +1989,8 @@ fn stage_enum_value(stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT], stage: u8, 
     let in_space = match ty {
         D3DTSS_RESULTARG => matches!(value, D3DTA_CURRENT | D3DTA_TEMP),
         D3DTSS_COLOROP | D3DTSS_ALPHAOP => fits && (D3DTOP_DISABLE..=D3DTOP_LERP).contains(&value),
-        D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
+        D3DTSS_COLORARG0 | D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG0
+        | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
             fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT
         }
         other => {
@@ -2313,14 +2317,16 @@ enum TssClass {
 
 const fn tss_classify(ty: u32) -> TssClass {
     match ty {
-        // Consumed by mtld3d. The first ten feed the FF VS + PS keys; the
+        // Consumed by mtld3d. The first twelve feed the FF VS + PS keys; the
         // bump-environment matrix and luminance slots feed the SM1
         // `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`), not
         // the FF keys.
         D3DTSS_COLOROP
+        | D3DTSS_COLORARG0
         | D3DTSS_COLORARG1
         | D3DTSS_COLORARG2
         | D3DTSS_ALPHAOP
+        | D3DTSS_ALPHAARG0
         | D3DTSS_ALPHAARG1
         | D3DTSS_ALPHAARG2
         | D3DTSS_CONSTANT

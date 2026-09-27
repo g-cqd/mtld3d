@@ -12,6 +12,8 @@ pub const D3D_OK: i32 = 0;
 /// a failure: both are success codes.
 pub const S_FALSE: i32 = 1;
 pub const E_FAIL: i32 = 0x8000_4005_u32.cast_signed();
+/// `E_OUTOFMEMORY`: storage required to complete the operation could not be allocated.
+pub const E_OUTOFMEMORY: i32 = 0x8007_000E_u32.cast_signed();
 pub const E_NOINTERFACE: i32 = 0x8000_4002_u32.cast_signed();
 /// `E_NOTIMPL` — "not implemented".
 ///
@@ -31,6 +33,9 @@ pub const D3DERR_MOREDATA: i32 = 0x8876_0867_u32.cast_signed();
 pub const D3DERR_NOTFOUND: i32 = 0x8876_0866_u32.cast_signed();
 /// `D3DERR_DEVICENOTRESET`: a failed `Reset` must be retried before rendering resumes.
 pub const D3DERR_DEVICENOTRESET: i32 = 0x8876_0869_u32.cast_signed();
+
+/// `D3DERR_DEVICELOST`: device resources prevent rendering or a successful reset.
+pub const D3DERR_DEVICELOST: i32 = 0x8876_0868_u32.cast_signed();
 /// `D3DOK_NOAUTOGEN` — a *success* code (`SUCCEEDED` is true).
 ///
 /// The format is valid but cannot auto-generate mipmaps because it is not

@@ -90,6 +90,14 @@ pub struct Mtld3dConfig {
     /// an Intel/AMD Mac. Default: `false`. File key:
     /// `intel.linearAlign256`.
     pub linear_align256: bool,
+    /// Include host-enumerated 4:3 display modes beside the panel's modes.
+    ///
+    /// Keeps the same bounded menu and desktop dimension limits. Wine may
+    /// letterbox these modes. The process-wide display table latches this
+    /// option at the first factory or an earlier Win32 mode enumeration,
+    /// so changing it requires a restart. Default:
+    /// `false`. File key: `display.legacy4By3`.
+    pub display_legacy_4_by_3: bool,
     /// Enable HDR present pipeline on EDR-capable displays.
     ///
     /// The display gates this, not the value: the present pipeline only
@@ -284,6 +292,13 @@ pub struct Mtld3dConfig {
     /// spatial-upscaler integration guides prescribe. Nothing changes at the
     /// identity. File key: `render.lodBias`.
     pub render_lod_bias: bool,
+    /// Preserve back-buffer colour across `Present` under the discard swap effect.
+    ///
+    /// Compatibility for applications that draw over the previous frame without
+    /// clearing colour. Explicit clears still replace the pixels; depth,
+    /// stencil and other render targets keep their existing policies. Default:
+    /// `false`. File key: `render.preserveDiscardBackbuffer`.
+    pub preserve_discard_backbuffer: bool,
     /// Present the adapter as a well-known GPU vendor.
     ///
     /// D3D9-era engines pick vendor-specific render paths (a depth copy
@@ -358,6 +373,7 @@ impl Default for Mtld3dConfig {
             deny_float32_filtering: false,
             managed_memory: false,
             linear_align256: false,
+            display_legacy_4_by_3: false,
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
@@ -385,6 +401,7 @@ impl Default for Mtld3dConfig {
             present_max_fps: 0,
             render_scale_percent: 100,
             render_lod_bias: true,
+            preserve_discard_backbuffer: false,
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
         }
@@ -486,6 +503,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: intel.linearAlign256 = {}", cfg.linear_align256
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: display.legacy4By3 = {}", cfg.display_legacy_4_by_3
+    );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
     info!(
         target: crate::LOG_TARGET,
@@ -566,6 +587,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(target: crate::LOG_TARGET, "config: render.lodBias = {}", cfg.render_lod_bias);
     info!(
         target: crate::LOG_TARGET,
+        "config: render.preserveDiscardBackbuffer = {}", cfg.preserve_discard_backbuffer
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: adapter.spoof = {}",
         adapter_spoof_label(cfg.adapter_spoof)
     );
@@ -609,6 +634,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "intel.managedMemory" => assign_bool(source, key, value, &mut cfg.managed_memory),
         "intel.linearAlign256" => assign_bool(source, key, value, &mut cfg.linear_align256),
+        "display.legacy4By3" => assign_bool(source, key, value, &mut cfg.display_legacy_4_by_3),
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
@@ -637,6 +663,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
+        "render.preserveDiscardBackbuffer" => {
+            assign_bool(source, key, value, &mut cfg.preserve_discard_backbuffer);
+        }
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         _ => log_once_warn!(

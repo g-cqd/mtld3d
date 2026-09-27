@@ -963,6 +963,30 @@ pub const fn linear_row_pitch(width: u32, bytes_per_pixel: u32) -> u32 {
     width.saturating_mul(bytes_per_pixel).next_multiple_of(4)
 }
 
+/// Checked byte size of a D3D8 surface descriptor.
+///
+/// Uses the shared source-format block geometry and four-byte linear row alignment.
+/// Returns `None` for unsupported formats, empty extents, or a size exceeding the ABI's `u32`.
+#[must_use]
+pub fn d3d8_surface_size(format: u32, width: u32, height: u32) -> Option<u32> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let bytes_per_pixel = if let Some(mapping) = lookup_d3d_format(format) {
+        if mapping.is_compressed() {
+            return width
+                .div_ceil(mapping.block_width)
+                .checked_mul(mapping.block_bytes)?
+                .checked_mul(height.div_ceil(mapping.block_height));
+        }
+        mapping.bytes_per_pixel
+    } else {
+        depth_format_bytes_per_pixel(format)?
+    };
+    let row_pitch = width.checked_mul(bytes_per_pixel)?.checked_add(3)? & !3;
+    row_pitch.checked_mul(height)
+}
+
 /// Mip dimensions, staging byte size and row stride for one mip level.
 ///
 /// An uncompressed level strides by [`linear_row_pitch`], the one row pitch

@@ -5,6 +5,31 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 [README](../README.md#tested-games); the end-to-end suite's coverage is in
 [`COVERAGE.md`](../windows/tests/COVERAGE.md).
 
+## Direct3D 8
+
+The Rust `d3d8.dll` frontend uses mtld3d's D3D9 objects and shared core. It
+implements the factory, device, surface, texture, cube, volume, vertex/index
+buffer and additional swap-chain interfaces with D3D8 identities and layouts.
+Shader handles and D3D8 declarations use D3D9 shader/declaration objects.
+Declaration and shader DEF constants load global registers on each bind;
+subsequent API writes override them until the next bind. Sampler state, base vertex, state blocks,
+resource descriptors, CopyRects and Reset use the D3D8 contract.
+
+Integration tests cover creation, FVF and shader pixels, state restoration,
+resource locks and identity, child lifetimes, copies, adapter enumeration,
+and lost-device transitions. This is not a declaration of complete D3D8
+compatibility. Tessellator declarations and N-patch levels above one are
+rejected. Software vertex processing currently preserves the D3D8 state
+selection without providing a CPU vertex pipeline. Z bias uses a normalized
+16-bit depth step; exact native-driver bias behavior remains unverified.
+The renderer's D3D9 limitations below also apply.
+
+Additional swap chains own separate color storage and retain their back
+buffers through application and binding references. Presentation selects
+the chain's image without changing the main back buffer. Multiple-window
+presentation, source/destination rectangles and dirty regions remain
+unimplemented. Earlier Direct3D and DirectDraw APIs remain future work.
+
 ## Supported
 
 - Shader models 1.x through 3.0, translated from DXSO to MSL and cached on
@@ -12,7 +37,7 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - The fixed-function pipeline: lighting, texture-coordinate generation
   (camera-space normal, position and reflection vector, and sphere map), the
   texture-stage cascade (CURRENT/TEMP registers, per-stage constants,
-  DOTPRODUCT3 color and alpha, MODULATEALPHA_ADDCOLOR,
+  DOTPRODUCT3 color and alpha, MULTIPLYADD, LERP, MODULATEALPHA_ADDCOLOR,
   MODULATECOLOR_ADDALPHA, MODULATEINVALPHA_ADDCOLOR,
   MODULATEINVCOLOR_ADDALPHA and premultiplied texture-alpha blending),
   vertex blending and range-based

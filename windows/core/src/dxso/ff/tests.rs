@@ -73,9 +73,11 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_BLENDTEXTUREALPHAPM),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE),
         color_arg2: narrow(D3DTA_TFACTOR),
         alpha_op: narrow(D3DTOP_BLENDTEXTUREALPHAPM),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::HAS_TEXTURE,
@@ -115,6 +117,59 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
         explicit_missing.contains("current = float4((current).rgb,"),
         "{explicit_missing}"
     );
+}
+
+#[test]
+fn multiplyadd_and_lerp_read_their_third_arguments_for_colour_and_alpha() {
+    use mtld3d_types::{
+        D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_TFACTOR, D3DTOP_LERP, D3DTOP_MULTIPLYADD,
+    };
+
+    for (op, colour, alpha) in [
+        (
+            D3DTOP_MULTIPLYADD,
+            "saturate(t0 + ps_c[1] * ps_c[0])",
+            "saturate(t0 + ps_c[1] * ps_c[0])",
+        ),
+        (
+            D3DTOP_LERP,
+            "saturate(t0 * ps_c[1] + (1.0 - t0) * ps_c[0])",
+            "saturate(t0 * ps_c[1] + (1.0 - t0) * ps_c[0])",
+        ),
+    ] {
+        let mut key = default_ps_key();
+        key.stages[0] = FfStage {
+            color_op: narrow(op),
+            color_arg0: narrow(D3DTA_TEXTURE),
+            color_arg1: narrow(D3DTA_CONSTANT),
+            color_arg2: narrow(D3DTA_TFACTOR),
+            alpha_op: narrow(op),
+            alpha_arg0: narrow(D3DTA_TEXTURE),
+            alpha_arg1: narrow(D3DTA_CONSTANT),
+            alpha_arg2: narrow(D3DTA_TFACTOR),
+            flags: FfStageFlags::HAS_TEXTURE,
+        };
+        let msl = emit_ps_ff(&key, VariantKey::default());
+        assert!(msl.contains(colour), "colour {op}: {msl}");
+        assert!(msl.contains(&format!("({alpha}).a")), "alpha {op}: {msl}");
+        assert_eq!(key.constant_rows(), 2, "constant arg1 for op {op}");
+        assert!(key.reads_texture_factor(), "TFACTOR arg2 for op {op}");
+    }
+
+    let mut fallback = default_ps_key();
+    fallback.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MULTIPLYADD),
+        color_arg0: narrow(D3DTA_TEXTURE),
+        color_arg1: narrow(D3DTA_CURRENT),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_LERP),
+        alpha_arg0: narrow(D3DTA_CURRENT),
+        alpha_arg1: narrow(D3DTA_CURRENT),
+        alpha_arg2: narrow(D3DTA_TFACTOR),
+        ..FfStage::default()
+    };
+    let msl = emit_ps_ff(&fallback, VariantKey::default());
+    assert!(msl.contains("current = float4((current).rgb,"), "{msl}");
 }
 
 #[test]
@@ -986,9 +1041,11 @@ fn no_pixel_shader_local_is_declared_unread() {
                         let mut ps = default_ps_key();
                         ps.stages[0] = FfStage {
                             color_op: op,
+                            color_arg0: narrow(D3DTA_CURRENT),
                             color_arg1: arg1,
                             color_arg2: arg2,
                             alpha_op: narrow(D3DTOP_MODULATE),
+                            alpha_arg0: narrow(D3DTA_CURRENT),
                             alpha_arg1: narrow(D3DTA_DIFFUSE),
                             alpha_arg2: narrow(D3DTA_CURRENT),
                             flags,
@@ -996,9 +1053,11 @@ fn no_pixel_shader_local_is_declared_unread() {
                         check(&ps, VariantKey::default());
                         ps.stages[0] = FfStage {
                             color_op: narrow(D3DTOP_MODULATE),
+                            color_arg0: narrow(D3DTA_CURRENT),
                             color_arg1: narrow(D3DTA_DIFFUSE),
                             color_arg2: narrow(D3DTA_CURRENT),
                             alpha_op: op,
+                            alpha_arg0: narrow(D3DTA_CURRENT),
                             alpha_arg1: arg1,
                             alpha_arg2: arg2,
                             flags,
@@ -1023,18 +1082,22 @@ fn no_pixel_shader_local_is_declared_unread() {
                             let mut ps = default_ps_key();
                             ps.stages[0] = FfStage {
                                 color_op: narrow(D3DTOP_MODULATE),
+                                color_arg0: narrow(D3DTA_CURRENT),
                                 color_arg1: narrow(D3DTA_TEXTURE),
                                 color_arg2: narrow(D3DTA_CURRENT),
                                 alpha_op: narrow(D3DTOP_SELECTARG1),
+                                alpha_arg0: narrow(D3DTA_CURRENT),
                                 alpha_arg1: narrow(D3DTA_TEXTURE),
                                 alpha_arg2: narrow(D3DTA_CURRENT),
                                 flags: stage_flags(texture, writer_temp),
                             };
                             ps.stages[1] = FfStage {
                                 color_op: op,
+                                color_arg0: narrow(D3DTA_CURRENT),
                                 color_arg1: arg,
                                 color_arg2: narrow(D3DTA_TEMP),
                                 alpha_op: op,
+                                alpha_arg0: narrow(D3DTA_CURRENT),
                                 alpha_arg1: narrow(D3DTA_TEMP),
                                 alpha_arg2: arg,
                                 flags: stage_flags(texture, reader_temp),
@@ -1042,9 +1105,11 @@ fn no_pixel_shader_local_is_declared_unread() {
                             if trailing {
                                 ps.stages[3] = FfStage {
                                     color_op: narrow(D3DTOP_MODULATE),
+                                    color_arg0: narrow(D3DTA_CURRENT),
                                     color_arg1: narrow(D3DTA_TEMP),
                                     color_arg2: narrow(D3DTA_TEXTURE),
                                     alpha_op: narrow(D3DTOP_SELECTARG1),
+                                    alpha_arg0: narrow(D3DTA_CURRENT),
                                     alpha_arg1: narrow(D3DTA_TEMP),
                                     alpha_arg2: narrow(D3DTA_TEXTURE),
                                     flags: stage_flags(true, false),
@@ -1068,9 +1133,11 @@ fn no_pixel_shader_local_is_declared_unread() {
                 for i in 0..count {
                     ps.stages[i] = FfStage {
                         color_op: narrow(D3DTOP_MODULATE),
+                        color_arg0: narrow(D3DTA_CURRENT),
                         color_arg1: narrow(D3DTA_TEXTURE),
                         color_arg2: narrow(D3DTA_CURRENT),
                         alpha_op: narrow(D3DTOP_MODULATE),
+                        alpha_arg0: narrow(D3DTA_CURRENT),
                         alpha_arg1: narrow(D3DTA_TEXTURE),
                         alpha_arg2: narrow(D3DTA_CURRENT),
                         flags: stage_flags(true, temp_result),
@@ -1098,9 +1165,11 @@ fn no_pixel_shader_local_is_declared_unread() {
         let mut ps = default_ps_key();
         ps.stages[0] = FfStage {
             color_op: narrow(color_op),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_TEXTURE),
             color_arg2: narrow(color_arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_TEXTURE),
             alpha_arg2: narrow(D3DTA_CURRENT),
             flags: stage_flags(true, temp_result),
@@ -1250,8 +1319,10 @@ fn d3dta_specular_resolves_to_color1() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_SPECULAR),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -1264,8 +1335,10 @@ fn d3dta_specular_alpha_replicate_broadcasts() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_SPECULAR | D3DTA_ALPHAREPLICATE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -1349,9 +1422,11 @@ fn emits_texture_sample_and_modulate() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATE),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_MODULATE),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1378,9 +1453,11 @@ fn depth_sampler_mask_emits_depth2d_and_sample_compare() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 2,   // SELECTARG1
+        color_arg0: 1, // CURRENT
         color_arg1: 2, // TEXTURE
         color_arg2: 1, // CURRENT
         alpha_op: 2,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1438,9 +1515,11 @@ fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 2,   // SELECTARG1
+        color_arg0: 1, // CURRENT
         color_arg1: 2, // TEXTURE
         color_arg2: 1, // CURRENT
         alpha_op: 2,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1496,9 +1575,11 @@ fn cube_sampler_mask_emits_texturecube_and_xyz_sample() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 2,
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 2,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1724,18 +1805,22 @@ fn multi_stage_modulate() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 2,   // SELECTARG1
+        color_arg0: 1, // CURRENT
         color_arg1: 2, // TEXTURE
         color_arg2: 1, // CURRENT
         alpha_op: 2,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
     };
     ps.stages[1] = FfStage {
         color_op: 4,   // MODULATE
+        color_arg0: 1, // CURRENT
         color_arg1: 2, // TEXTURE
         color_arg2: 1, // CURRENT (stage 0's output)
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1753,9 +1838,11 @@ fn stops_at_first_disabled_stage() {
     // Stage 0 ADD; stage 1 disabled; stage 2 would be MODULATE but must be ignored.
     ps.stages[0] = FfStage {
         color_op: 7,   // ADD
+        color_arg0: 1, // CURRENT
         color_arg1: 0, // DIFFUSE
         color_arg2: 1, // CURRENT
         alpha_op: 2,   // SELECTARG1
+        alpha_arg0: 1, // CURRENT
         alpha_arg1: 0,
         alpha_arg2: 1,
         flags: FfStageFlags::empty(),
@@ -1763,9 +1850,11 @@ fn stops_at_first_disabled_stage() {
     ps.stages[1] = stage_disable();
     ps.stages[2] = FfStage {
         color_op: 4, // MODULATE
+        color_arg0: 1,
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1787,18 +1876,22 @@ fn a_texture_sample_and_a_temporary_nothing_reads_are_not_emitted() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG2),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG2),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::HAS_TEXTURE,
     };
     ps.stages[1] = FfStage {
         color_op: narrow(D3DTOP_MODULATE),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::RESULT_TEMP,
@@ -1828,9 +1921,11 @@ fn a_texture_sample_and_a_temporary_nothing_reads_are_not_emitted() {
     ps.stages[0].alpha_op = narrow(D3DTOP_SELECTARG1);
     ps.stages[2] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEMP),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEMP),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::empty(),
@@ -1877,9 +1972,11 @@ fn tci_passthru_honours_coord_index_override() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 4,
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -1907,9 +2004,11 @@ fn tci_cameraspacereflection_emits_reflection_vector() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 4,
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -2017,9 +2116,11 @@ fn ttff_count2_emits_texture_matrix_mul() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 4,
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -2067,9 +2168,11 @@ fn active_stage_without_input_texcoords_does_not_reference_v4() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 4, // MODULATE
+        color_arg0: 1,
         color_arg1: 2,
         color_arg2: 1,
         alpha_op: 4,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: 2,
         alpha_arg2: 1,
         flags: FfStageFlags::HAS_TEXTURE,
@@ -2637,8 +2740,10 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         flags: FfStageFlags::HAS_TEXTURE,
         ..FfStage::default()
@@ -2727,9 +2832,11 @@ fn dotproduct3_supplies_the_whole_stage_result() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT),
         color_arg2: narrow(D3DTA_TFACTOR),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -2749,9 +2856,11 @@ fn modulate_keeps_separate_color_and_alpha_arguments() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATE),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TFACTOR),
         flags: FfStageFlags::HAS_TEXTURE,
         ..FfStage::default()
@@ -2768,9 +2877,11 @@ fn dotproduct3_unbound_color_keeps_independent_alpha() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TFACTOR),
         ..FfStage::default()
     };
@@ -2789,9 +2900,11 @@ fn premultiplied_alpha_follows_effective_dotproduct3_color() {
         let mut ps = default_ps_key();
         ps.stages[0] = FfStage {
             color_op: narrow(D3DTOP_DOTPRODUCT3),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_DIFFUSE),
             color_arg2: narrow(D3DTA_TFACTOR),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_DIFFUSE),
             alpha_arg2: narrow(D3DTA_TFACTOR),
             flags: if has_texture {
@@ -2859,9 +2972,11 @@ fn unused_temp_operands_and_disabled_stages_emit_no_register() {
     let mut stages = [stage_disable(); 8];
     stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_CURRENT),
         color_arg2: narrow(D3DTA_TEMP),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         alpha_arg2: narrow(D3DTA_TEMP),
         flags: FfStageFlags::empty(),
@@ -2884,50 +2999,19 @@ fn unused_temp_operands_and_disabled_stages_emit_no_register() {
 }
 
 #[test]
-fn packed_stage_preserves_legacy_current_hash_stream_and_key_sizes() {
-    use std::hash::{Hash, Hasher};
-
+fn packed_stage_tracks_ternary_arguments_in_its_hash_and_size() {
     use super::FfStageResult;
-    #[derive(Hash)]
-    struct LegacyStage {
-        color_op: u8,
-        color_arg1: u8,
-        color_arg2: u8,
-        alpha_op: u8,
-        alpha_arg1: u8,
-        alpha_arg2: u8,
-        has_texture: bool,
-    }
-    #[derive(Hash)]
-    struct LegacyKey {
-        stages: [LegacyStage; 8],
-        specular_add: bool,
-        tt_projected_mask: u8,
-    }
-    #[derive(Default)]
-    struct HashWrites(Vec<u8>);
-    impl Hasher for HashWrites {
-        fn finish(&self) -> u64 {
-            0
-        }
-        fn write(&mut self, bytes: &[u8]) {
-            self.0.extend_from_slice(bytes);
-        }
-    }
-    fn writes(value: &impl Hash) -> Vec<u8> {
-        let mut h = HashWrites::default();
-        value.hash(&mut h);
-        h.0
-    }
-    assert_eq!(size_of::<FfStage>(), 7);
-    assert_eq!(size_of::<FfPsKey>(), 58);
+    assert_eq!(size_of::<FfStage>(), 9);
+    assert_eq!(size_of::<FfPsKey>(), 74);
     assert_eq!(align_of::<FfPsKey>(), 1);
     for mask in 0u8..=u8::MAX {
         let stages = std::array::from_fn(|i| FfStage {
             color_op: narrow(D3DTOP_MODULATE),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_TEXTURE),
             color_arg2: narrow(D3DTA_DIFFUSE),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_CURRENT),
             alpha_arg2: narrow(D3DTA_TEXTURE),
             flags: if mask & (1 << i) != 0 {
@@ -2941,28 +3025,16 @@ fn packed_stage_preserves_legacy_current_hash_stream_and_key_sizes() {
             specular_add: mask & 1 != 0,
             tt_projected_mask: mask,
         };
-        let legacy = LegacyKey {
-            stages: key.stages.each_ref().map(|s| LegacyStage {
-                color_op: s.color_op,
-                color_arg1: s.color_arg1,
-                color_arg2: s.color_arg2,
-                alpha_op: s.alpha_op,
-                alpha_arg1: s.alpha_arg1,
-                alpha_arg2: s.alpha_arg2,
-                has_texture: s.has_texture(),
-            }),
-            specular_add: key.specular_add,
-            tt_projected_mask: key.tt_projected_mask,
-        };
-        assert_eq!(writes(&key), writes(&legacy), "CURRENT stream, mask {mask}");
-        assert_eq!(
-            crate::shader_cache::ff_key_hash(&key),
-            crate::shader_cache::ff_key_hash(&legacy)
-        );
         let current = key.clone();
+        key.stages[0].color_arg0 = narrow(D3DTA_TEXTURE);
+        assert_ne!(key, current);
+        assert_ne!(
+            crate::shader_cache::ff_key_hash(&key),
+            crate::shader_cache::ff_key_hash(&current)
+        );
+        key.stages[0].color_arg0 = current.stages[0].color_arg0;
         key.stages[0].set_result(FfStageResult::Temp);
         assert_ne!(key, current);
-        assert_ne!(writes(&key), writes(&current));
         assert_ne!(
             crate::shader_cache::ff_key_hash(&key),
             crate::shader_cache::ff_key_hash(&current)
@@ -2979,9 +3051,11 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
     let mut key = default_ps_key();
     key.stages[0] = FfStage {
         color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         color_arg2: narrow(D3DTA_TFACTOR),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEMP),
         ..FfStage::default()
     };
@@ -2996,9 +3070,11 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
     key.stages[0].set_result(FfStageResult::Temp);
     key.stages[1] = FfStage {
         color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEMP),
         color_arg2: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -3024,9 +3100,11 @@ fn per_stage_constant_extent_follows_effective_operands() {
     let mut key = default_ps_key();
     let active = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         color_arg2: narrow(D3DTA_CONSTANT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_CURRENT),
         alpha_arg2: narrow(D3DTA_CONSTANT),
         flags: FfStageFlags::empty(),
@@ -3077,6 +3155,7 @@ fn per_stage_constant_extent_follows_effective_operands() {
     key.stages = [stage_disable(); 8];
     key.stages[0] = FfStage {
         alpha_op: 255,
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_CONSTANT),
         ..active
     };
@@ -3091,9 +3170,11 @@ fn per_stage_constant_extent_follows_effective_operands() {
 fn modulate_stage_with_alpha_disabled(flags: FfStageFlags) -> FfStage {
     FfStage {
         color_op: narrow(D3DTOP_MODULATE),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_DISABLE),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags,
@@ -3104,8 +3185,10 @@ fn modulate_stage_with_alpha_disabled(flags: FfStageFlags) -> FfStage {
 fn diffuse_stage() -> FfStage {
     FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     }
@@ -3155,8 +3238,10 @@ fn disabled_alpha_keeps_the_temporary_alpha_when_the_stage_writes_temp() {
         key.stages[1].set_result(FfStageResult::Temp);
         key.stages[2] = FfStage {
             color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_TEMP),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_TEMP),
             ..FfStage::default()
         };
@@ -3186,8 +3271,10 @@ fn disabled_alpha_on_a_first_stage_writing_temp_keeps_the_zeroed_temporary_alpha
     key.stages[0].set_result(FfStageResult::Temp);
     key.stages[1] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEMP),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEMP),
         ..FfStage::default()
     };
@@ -3240,9 +3327,11 @@ fn modulate_alpha_add_color_unbound_operands_keep_ordinary_fallback_source() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_MODULATEALPHA_ADDCOLOR),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
@@ -3261,9 +3350,11 @@ fn modulate_alpha_add_color_nontexture_inputs_add_no_sampler_or_uniform() {
     let mut key = default_ps_key();
     key.stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATEALPHA_ADDCOLOR),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -3285,16 +3376,20 @@ fn modulate_alpha_add_color_constant_rows_follow_effective_binary_arguments() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_DIFFUSE),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_DIFFUSE),
             ..FfStage::default()
         };
         key.stages[1] = FfStage {
             color_op: narrow(D3DTOP_MODULATEALPHA_ADDCOLOR),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_CURRENT),
             ..FfStage::default()
         };
@@ -3329,9 +3424,11 @@ fn modulate_color_add_alpha_unbound_operands_keep_ordinary_fallback_source() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
@@ -3350,9 +3447,11 @@ fn modulate_color_add_alpha_nontexture_inputs_add_no_sampler_or_uniform() {
     let mut key = default_ps_key();
     key.stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -3374,16 +3473,20 @@ fn modulate_color_add_alpha_constant_rows_follow_effective_binary_arguments() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_DIFFUSE),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_DIFFUSE),
             ..FfStage::default()
         };
         key.stages[1] = FfStage {
             color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_CURRENT),
             ..FfStage::default()
         };
@@ -3406,9 +3509,11 @@ fn modulate_color_add_alpha_dependency_extent_keeps_alpha_and_factor_policy() {
     let mut key = default_ps_key();
     let stage = FfStage {
         color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_CURRENT),
         ..FfStage::default()
     };
@@ -3452,9 +3557,11 @@ fn modulate_inverse_alpha_add_color_fallback_preserves_source_identity() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_MODULATEINVALPHA_ADDCOLOR),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_TFACTOR),
             ..FfStage::default()
         };
@@ -3474,13 +3581,16 @@ fn modulate_inverse_alpha_add_color_uses_existing_binary_constant_extent() {
         let mut key = default_ps_key();
         key.stages[0] = FfStage {
             color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(D3DTA_DIFFUSE),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_DIFFUSE),
             ..FfStage::default()
         };
         key.stages[1] = FfStage {
             color_op: narrow(D3DTOP_MODULATEINVALPHA_ADDCOLOR),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(if constant_first {
                 D3DTA_CONSTANT
             } else {
@@ -3492,6 +3602,7 @@ fn modulate_inverse_alpha_add_color_uses_existing_binary_constant_extent() {
                 D3DTA_CONSTANT
             }),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_CURRENT),
             ..FfStage::default()
         };
@@ -3539,9 +3650,11 @@ fn modulate_inv_color_add_alpha_unbound_operands_keep_ordinary_fallback_source()
             let mut key = default_ps_key();
             key.stages[0] = FfStage {
                 color_op: narrow(D3DTOP_MODULATEINVCOLOR_ADDALPHA),
+                color_arg0: narrow(D3DTA_CURRENT),
                 color_arg1: narrow(arg1),
                 color_arg2: narrow(arg2),
                 alpha_op: narrow(D3DTOP_SELECTARG1),
+                alpha_arg0: narrow(D3DTA_CURRENT),
                 alpha_arg1: narrow(D3DTA_TFACTOR),
                 ..FfStage::default()
             };
@@ -3561,9 +3674,11 @@ fn modulate_inv_color_add_alpha_nontexture_inputs_add_no_resource() {
     let mut key = default_ps_key();
     key.stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATEINVCOLOR_ADDALPHA),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -3581,8 +3696,10 @@ fn modulate_inv_color_add_alpha_constant_rows_follow_binary_arguments() {
     let mut key = default_ps_key();
     key.stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -3598,9 +3715,11 @@ fn modulate_inv_color_add_alpha_constant_rows_follow_binary_arguments() {
     ] {
         key.stages[1] = FfStage {
             color_op: narrow(D3DTOP_MODULATEINVCOLOR_ADDALPHA),
+            color_arg0: narrow(D3DTA_CURRENT),
             color_arg1: narrow(arg1),
             color_arg2: narrow(arg2),
             alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg0: narrow(D3DTA_CURRENT),
             alpha_arg1: narrow(D3DTA_CURRENT),
             ..FfStage::default()
         };

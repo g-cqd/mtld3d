@@ -3804,8 +3804,10 @@ fn ff_ps_specular_add_msl_compiles_under_metal() {
     }; 8];
     stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: 1,
         color_arg1: narrow(D3DTA_SPECULAR),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: 1,
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
@@ -5282,8 +5284,10 @@ fn ff_temp_register_compiles_with_simultaneous_color_alpha_updates() {
     }; 8];
     stages[0] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: 1,
         color_arg1: narrow(D3DTA_TEMP | D3DTA_ALPHAREPLICATE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: 1,
         alpha_arg1: narrow(D3DTA_TEMP | D3DTA_COMPLEMENT),
         ..FfStage::default()
     };
@@ -5317,9 +5321,11 @@ fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
     }; 8];
     stages[0] = FfStage {
         color_op: narrow(D3DTOP_MODULATE),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEXTURE),
         color_arg2: narrow(D3DTA_CURRENT),
         alpha_op: narrow(D3DTOP_DISABLE),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         alpha_arg2: narrow(D3DTA_CURRENT),
         flags: FfStageFlags::HAS_TEXTURE,
@@ -5327,8 +5333,10 @@ fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
     stages[1] = stages[0];
     stages[2] = FfStage {
         color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg0: narrow(D3DTA_CURRENT),
         color_arg1: narrow(D3DTA_TEMP),
         alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg0: narrow(D3DTA_CURRENT),
         alpha_arg1: narrow(D3DTA_TEMP),
         ..FfStage::default()
     };

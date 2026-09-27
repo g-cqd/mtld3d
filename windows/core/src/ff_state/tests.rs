@@ -14,9 +14,9 @@ use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_BUMPENVMAP, D3DTOP_LERP, D3DTOP_MODULATE,
-    D3DTOP_MULTIPLYADD, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE,
-    D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11,
-    D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
+    D3DTOP_MULTIPLYADD, D3DTSS_ALPHAARG0, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
     D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
@@ -360,17 +360,27 @@ fn fog_color_bytes_two_rows_when_fog_on() {
 
 #[test]
 fn tss_warn_latch_is_per_stage() {
-    // COLORARG0 is NotImplemented (not in the Consumed list), so a
-    // non-default write fires warn_tss_non_default_once. Default for
-    // COLORARG0 is D3DTA_CURRENT; write D3DTA_TEXTURE to stages 0 and 1.
-    // A latch keyed only on `ty` would set tss_warn_fired[ty] on stage 0
-    // and silently swallow stage 1, so the per-stage latch must fire for
-    // both.
+    let unused_slot = usize::try_from(D3DTSS_TEXCOORDINDEX + 1).expect("TSS index fits usize");
+    let mut state = FfState::new();
+
+    state.set_texture_stage_state(0, unused_slot, 1);
+    state.set_texture_stage_state(1, unused_slot, 1);
+
+    assert!(state.tss_warn_fired(0, unused_slot));
+    assert!(state.tss_warn_fired(1, unused_slot));
+}
+
+#[test]
+fn arg0_states_build_the_ff_key_without_an_unconsumed_warning() {
+    // Both ternary operands are consumed state and must survive key construction.
     let mut state = FfState::new();
     state.set_texture_stage_state(0, D3DTSS_COLORARG0 as usize, D3DTA_TEXTURE);
-    state.set_texture_stage_state(1, D3DTSS_COLORARG0 as usize, D3DTA_TEXTURE);
-    assert!(state.tss_warn_fired(0, D3DTSS_COLORARG0 as usize));
-    assert!(state.tss_warn_fired(1, D3DTSS_COLORARG0 as usize));
+    state.set_texture_stage_state(0, D3DTSS_ALPHAARG0 as usize, D3DTA_TEXTURE);
+    assert!(!state.tss_warn_fired(0, D3DTSS_COLORARG0 as usize));
+    assert!(!state.tss_warn_fired(0, D3DTSS_ALPHAARG0 as usize));
+    let key = state.build_ps_key(&rs(), 1);
+    assert_eq!(u32::from(key.stages[0].color_arg0), D3DTA_TEXTURE);
+    assert_eq!(u32::from(key.stages[0].alpha_arg0), D3DTA_TEXTURE);
 }
 
 #[test]
@@ -414,7 +424,7 @@ fn unimplemented_texture_op_write_warns_once_per_slot() {
     assert!(!state.texture_op_warn_fired(alpha, D3DTOP_BUMPENVMAP));
     assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
     state.set_texture_stage_state(2, alpha, D3DTOP_MULTIPLYADD);
-    assert!(state.texture_op_warn_fired(alpha, D3DTOP_MULTIPLYADD));
+    assert!(!state.texture_op_warn_fired(alpha, D3DTOP_MULTIPLYADD));
     assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
     assert!(!state.tss_warn_fired(1, color));
     assert!(!state.tss_warn_fired(2, alpha));

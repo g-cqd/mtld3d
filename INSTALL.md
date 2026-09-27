@@ -10,15 +10,18 @@ and the developer `make install` flow are covered in the source repository's
 ```
 wine/                       lib/wine-shaped tree, every PE builtin-marked
   i386-windows/
+    d3d8.dll                Direct3D 8 frontend (builtin-marked)
     d3d9.dll                Direct3D 9 implementation (builtin-marked)
     mtld3d.dll              PE half of the unix-call bridge (builtin-marked)
-  x86_64-windows/           the same two files, 64-bit
+  x86_64-windows/           the same three files, 64-bit
   x86_64-unix/
     mtld3d.so               Metal-side unix library
   aarch64-unix/
     mtld3d.so               the same library for an arm64 Wine
-native/                     unmarked d3d9.dll for the DLL-override route
+native/                     unmarked frontends for the DLL-override route
+  i386-windows/d3d8.dll
   i386-windows/d3d9.dll
+  x86_64-windows/d3d8.dll
   x86_64-windows/d3d9.dll
 prefix-markers/             for a prefix wineboot never stamped (see below)
   syswow64/mtld3d.dll       stub, copy into the prefix dir of the same name
@@ -158,6 +161,22 @@ Instead of the game directory, the native `d3d9.dll` can go into the prefix —
 64-bit — where it covers every application in the prefix. A game-directory
 copy wins when both exist. The prefix copy survives wineboot prefix updates,
 which only replace placeholder files, never real PEs.
+
+## Direct3D 8
+
+The D3D8 frontend requires mtld3d's matching `d3d9.dll` and the same native
+bridge as D3D9. Complete the D3D9 installation first. For the native-override
+route, copy `native/i386-windows/d3d8.dll` beside the 32-bit game executable
+and add the override in that game's prefix:
+
+```sh
+wine reg add 'HKCU\Software\Wine\DllOverrides' /v d3d8 /d native /f
+```
+
+For a 64-bit application, use `native/x86_64-windows/d3d8.dll`. On CrossOver,
+use the bottle's Wine command described below for both overrides. The
+builtin route installs both frontends when the bundle's complete `wine/`
+tree is copied into the Wine installation.
 
 ## CrossOver
 

@@ -95,6 +95,40 @@ fn adapter_mode_enumeration() {
 }
 
 #[test]
+fn adapter_modes_capture_the_first_factory_configuration() {
+    const CHILD_NAME: &str = "adapter-mode-config.exe";
+    if !running_as(CHILD_NAME) {
+        run_in_private_log_child(
+            CHILD_NAME,
+            "device::adapter_modes_capture_the_first_factory_configuration",
+            "warn,mtld3d::d3d9=info",
+            "display.legacy4By3=false",
+        );
+        return;
+    }
+
+    // The harness restores the environment before either enumeration. The
+    // first factory's policy must survive both that restoration and another
+    // factory resolving the opposite policy; the user32 hook shares one table.
+    let first = Harness::factory_only_with_config("display.legacy4By3=true");
+    let second = Harness::factory_only_with_config("display.legacy4By3=false");
+    let count = first.adapter_mode_count(D3DFMT_X8R8G8B8);
+    assert!(count > 0);
+    assert_eq!(second.adapter_mode_count(D3DFMT_X8R8G8B8), count);
+    drop(first);
+    drop(second);
+
+    // Releasing the last factory flushes the log. This checks the selected
+    // policy even on a host whose mode list contains no extra 4:3 size.
+    let lines = logged_lines("adapter modes: host");
+    assert_eq!(lines.len(), 1, "one process-wide mode table: {lines:?}");
+    assert!(
+        lines[0].contains("legacy4By3=true"),
+        "the table must retain the first factory's configuration: {lines:?}"
+    );
+}
+
+#[test]
 fn the_main_module_enumerates_the_sizes_the_adapter_serves() {
     // The test binary is the process's main module, so its own
     // EnumDisplaySettingsW import is the one d3d9 redirects: the list it
@@ -1163,6 +1197,7 @@ fn reset_flips_the_presentation_interval() {
         PACING_CHILD_NAME,
         "device::reset_flips_the_presentation_interval",
         PRIVATE_LOG_FILTER,
+        "",
     );
 }
 
@@ -1218,6 +1253,7 @@ fn reset_to_a_divided_interval_moves_the_ceiling() {
         CEILING_CHILD_NAME,
         "device::reset_to_a_divided_interval_moves_the_ceiling",
         PRIVATE_LOG_FILTER,
+        "",
     );
 }
 
@@ -1310,8 +1346,9 @@ const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 /// The copy logs under `filter` whatever the suite's filter is, and the
 /// layer writes its log into a directory only that process uses, so a test
 /// that reads its own process log reads its device's lines and nobody
-/// else's. Panics with the child's standard error when the child fails.
-fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+/// else's. `entries` overrides the suite's configuration in the child.
+/// Panics with the child's standard error when the child fails.
+fn run_in_private_log_child(child_name: &str, test: &str, filter: &str, entries: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1338,8 +1375,11 @@ fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
-        .expect("run the workload child");
+    let output = run_child(
+        &mut command,
+        &format!("{entries};log.dir={}", dir.display()),
+    )
+    .expect("run the workload child");
     assert!(
         output.status.success(),
         "workload child {child_name} failed: {}",
@@ -3834,6 +3874,7 @@ fn a_live_child_window_keeps_its_metal_view() {
             LIVE_CHILD_VIEW_CHILD_NAME,
             "device::a_live_child_window_keeps_its_metal_view",
             PRIVATE_LOG_FILTER,
+            "",
         );
         return;
     }
@@ -3877,6 +3918,7 @@ fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
         KEPT_VIEW_CHILD_NAME,
         "device::a_new_window_takes_the_metal_view_a_destroyed_window_left",
         PRIVATE_LOG_FILTER,
+        "",
     );
 }
 
@@ -3935,6 +3977,7 @@ fn device_recreation_releases_every_pipeline_it_built() {
         PIPELINE_CYCLES_CHILD_NAME,
         "device::device_recreation_releases_every_pipeline_it_built",
         "warn,mtld3d::unix=debug",
+        "",
     );
 }
 

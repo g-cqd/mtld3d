@@ -670,6 +670,15 @@ walk further):
   own `ChangeDisplaySettingsW` calls succeed here (test_wndproc 4161/4231,
   test_reset 2234-2238, test_mode_change), since they pick their mode from
   `EnumAdapterModes`.
+- **Legacy aspect opt-in.** The default display-aspect list and its
+  15-size-per-format bound remain unchanged. `display.legacy4By3`, enabled
+  by the Morrowind profile, admits host-enumerated exact 4:3 sizes within the
+  desktop bounds into both the settable list and the served list. After the
+  desktop, served slots alternate largest 4:3 and largest panel sizes so
+  neither list can crowd the other out. The mode request still follows the
+  same user32 mode-set path. Wine's emulated modes may letterbox these
+  non-panel sizes with the desktop visible in the bars; the option does
+  not claim to change that presentation behavior.
 - **The mode contract.** A fullscreen device sets the requested mode
   (2026-08), so the Win32 half of the contract holds: the desktop mode
   follows a create or Reset, `GetSystemMetrics` and the window rect report

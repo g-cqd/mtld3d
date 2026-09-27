@@ -358,7 +358,8 @@ pub struct CompileResult {
 }
 
 enum Outcome {
-    Library(LibraryOutcome),
+    /// The expanded fixed-function key keeps this payload off the shared result queue.
+    Library(Box<LibraryOutcome>),
     /// Boxed for the same reason as [`CompileJob::Pipeline`].
     Pipeline(Box<PipelineOutcome>),
 }
@@ -395,7 +396,7 @@ struct PipelineOutcome {
 fn run_job(ticket: JobTicket, queued: QueuedJob, on_worker: bool) -> CompileResult {
     let QueuedJob { job, enqueued_tsc } = queued;
     let outcome = match job {
-        CompileJob::Library(job) => Outcome::Library(build_library(job)),
+        CompileJob::Library(job) => Outcome::Library(Box::new(build_library(job))),
         CompileJob::Pipeline(job) => Outcome::Pipeline(Box::new(build_pipeline(*job))),
     };
     CompileResult {
@@ -1404,7 +1405,7 @@ impl FrameEncoder {
                     self.compile_stats.record_async_compile();
                 }
                 let function = outcome.handles.map(|handles| handles.func);
-                self.install_library(outcome);
+                self.install_library(*outcome);
                 if !self.deferred.pipelines.is_empty() {
                     self.advance_deferred(|deferred| deferred.on_library(ticket, function));
                 }

@@ -314,6 +314,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtld3d-d3d8"
+version = "0.11.0"
+dependencies = [
+ "log",
+ "mtld3d-core",
+ "mtld3d-d3d8-types",
+ "mtld3d-shared",
+ "mtld3d-types",
+ "rustc-hash",
+]
+
+[[package]]
+name = "mtld3d-d3d8-types"
+version = "0.11.0"
+dependencies = [
+ "mtld3d-types",
+]
+
+[[package]]
 name = "mtld3d-shared"
 version = "0.11.0"
 dependencies = [
@@ -330,6 +349,7 @@ version = "0.11.0"
 dependencies = [
  "bitflags 2.13.1",
  "mtld3d-core",
+ "mtld3d-d3d8-types",
  "mtld3d-shared",
  "mtld3d-types",
  "snmalloc-rs",

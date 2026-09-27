@@ -32,7 +32,8 @@ unix/unix/src/metal/clear_quad.rs
 unix/unix/src/metal/null_texture.rs
 unix/unix/src/metal/present.rs
 unix/unix/src/metal/upload_quad.rs
-unix/unix/src/metal/upscale.rs'
+unix/unix/src/metal/upscale.rs
+windows/d3d9/src/direct3d9.rs'
 
 INLINE_ALWAYS_SITES='unix/shared/src/crumb.rs'
 
@@ -148,8 +149,11 @@ inline_tests() {
 coverage_matrix() {
     rows=$(sed -n 's/^| *`\([^`]*\.rs\)` *|.*/\1/p' "$COVERAGE")
     for file in $(git ls-files "$COVERAGE_TESTS/*.rs" "$COVERAGE_TESTS/e2e/*.rs"); do
-        stem=${file##*/}
         [ "$file" = "$COVERAGE_TESTS/e2e/main.rs" ] && continue
+        stem=${file#"$COVERAGE_TESTS/"}
+        # The existing D3D9 rows use names relative to e2e/. Other binaries'
+        # nested modules keep their path so equal basenames stay distinct.
+        case "$stem" in e2e/*) stem=${stem#e2e/} ;; esac
         printf '%s\n' "$rows" | grep -qxF "$stem" ||
             printf '%s: no row in %s\n' "$file" "$COVERAGE"
     done

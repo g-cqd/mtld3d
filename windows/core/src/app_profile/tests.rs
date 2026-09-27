@@ -106,6 +106,49 @@ fn an_unprofiled_game_resolves_to_nothing() {
 }
 
 #[test]
+fn the_morrowind_profile_matches_vendor_identity_and_preserves_first_use_draws() {
+    let resource = blob(&[
+        ("CompanyName", "Bethesda Softworks"),
+        ("ProductName", "Bethesda Softworks Morrowind"),
+        ("OriginalFilename", "Morrowind.exe"),
+    ]);
+    let id = AppIdentity::new("Morrowind.exe".to_owned(), Some(&resource));
+    let profile = lookup(&id).expect("the Morrowind profile matches its vendor identity");
+    assert_eq!(profile.name(), "morrowind");
+    let cfg = parse(Some(profile), "", None);
+    assert!(cfg.display_legacy_4_by_3);
+    assert!(!cfg.shader_async_compile);
+    assert!(cfg.shader_cache_enable);
+    assert!(cfg.preserve_discard_backbuffer);
+    let without_preservation = parse(
+        Some(profile),
+        "render.preserveDiscardBackbuffer=false",
+        None,
+    );
+    assert_ne!(cfg, without_preservation);
+    assert!(!without_preservation.preserve_discard_backbuffer);
+    assert_eq!(
+        parse(
+            Some(profile),
+            "render.preserveDiscardBackbuffer=false",
+            Some("render.preserveDiscardBackbuffer=true")
+        ),
+        cfg
+    );
+    assert!(parse(None, "", None).shader_async_compile);
+    assert!(parse(Some(profile), "shader.asyncCompile=true", None).shader_async_compile);
+    let overridden = parse(
+        Some(profile),
+        "display.legacy4By3=false",
+        Some("shader.asyncCompile=true"),
+    );
+    assert!(!overridden.display_legacy_4_by_3);
+    assert!(overridden.shader_async_compile);
+    let impostor = AppIdentity::new("Morrowind.exe".to_owned(), None);
+    assert!(lookup(&impostor).is_none());
+}
+
+#[test]
 fn every_profile_is_uniquely_named_and_pins_a_version_field() {
     for profile in PROFILES {
         assert!(!profile.name.is_empty(), "a profile has no name");

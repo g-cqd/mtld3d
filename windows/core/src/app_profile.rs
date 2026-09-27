@@ -25,6 +25,18 @@ use super::LOG_TARGET;
 /// Every entry pins at least one version-resource field, so a rule can never
 /// fire on a same-named program from someone else.
 static PROFILES: &[AppProfile] = &[
+    // Morrowind's in-game resolution menu accepts only exact 4:3 modes.
+    // Keep those alongside the panel's modes, and compile first-use shaders
+    // synchronously so a frame never loses the draws still being compiled.
+    // UI-only frames draw over the previous back buffer without clearing colour.
+    AppProfile {
+        name: "morrowind",
+        exe: "Morrowind.exe",
+        company: Some("Bethesda Softworks"),
+        product: Some("Bethesda Softworks Morrowind"),
+        original_filename: Some("Morrowind.exe"),
+        settings: "display.legacy4By3=true;shader.asyncCompile=false;render.preserveDiscardBackbuffer=true",
+    },
     // Grand Theft Auto IV. Its renderer branches on the reported adapter
     // vendor, and the ATI identity is the one whose paths it completes; the
     // NVIDIA identity stalls in the game's own identifier parsing. It also

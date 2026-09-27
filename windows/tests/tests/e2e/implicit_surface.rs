@@ -7,10 +7,12 @@
 //! the device so a `Reset` that recreates the backbuffer is reflected without
 //! re-allocating the surface.
 
-use mtld3d_tests::{Harness, HarnessConfig};
+use mtld3d_tests::{Harness, HarnessConfig, RhwVertex};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_R5G6B5,
-    D3DFMT_X8R8G8B8, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3D_OK, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_R5G6B5,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLOCK_READONLY,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_CULLMODE, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DSWAPEFFECT_DISCARD, D3DVIEWPORT9,
 };
 
 fn assert_backbuffer_format(h: &Harness, expected: u32) {
@@ -350,6 +352,348 @@ fn read_only_lock_rect_on_a_non_lockable_backbuffer_reads_the_rendered_pixels() 
         FILL,
         "the read-back must show the cleared backbuffer"
     );
+}
+
+#[test]
+fn lockable_backbuffer_writable_lock_uploads_the_complete_surface() {
+    const FILL: u32 = 0xff20_4080;
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=1",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear_target(0xff00_0000), D3D_OK);
+    let backbuffer = h.back_buffer(0);
+    {
+        let mut locked = backbuffer.lock_rect(0);
+        locked.write_u32_rect(64, 64, &[FILL; 64 * 64]);
+    }
+    for (x, y) in [(0, 0), (31, 32), (63, 63)] {
+        assert_eq!(h.read_pixel(x, y), FILL, "uploaded pixel ({x}, {y})");
+    }
+    assert_eq!(backbuffer.unlock_rect(), D3DERR_INVALIDCALL);
+}
+
+#[test]
+fn unlock_rect_preserves_cpu_pixels_across_a_partial_draw() {
+    assert_cpu_pixels_survive_partial_draw(false);
+}
+
+#[test]
+fn release_dc_preserves_cpu_pixels_across_a_partial_draw() {
+    assert_cpu_pixels_survive_partial_draw(true);
+}
+
+#[test]
+fn discard_preservation_keeps_scene_pixels_under_transition_ui() {
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        depth_format: Some(mtld3d_types::D3DFMT_D24S8),
+        config_entries: "render.scale=1;shader.asyncCompile=false;render.preserveDiscardBackbuffer=true",
+        ..HarnessConfig::default()
+    });
+    assert_transition_frames_preserve_color(&h, 64);
+    let (hr, mut pp) = h.implicit_swapchain().present_parameters();
+    assert_eq!(hr, D3D_OK);
+    pp.back_buffer_width = 80;
+    pp.back_buffer_height = 80;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK);
+    assert_transition_frames_preserve_color(&h, 80);
+}
+
+fn assert_transition_frames_preserve_color(h: &Harness, width: u16) {
+    use mtld3d_types::{
+        D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER,
+        D3DRS_DESTBLEND, D3DRS_SRCBLEND,
+    };
+
+    const BACKGROUND: u32 = 0xff20_4080;
+    let size = usize::from(width);
+    let (hr, pp) = h.implicit_swapchain().present_parameters();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(pp.swap_effect, D3DSWAPEFFECT_DISCARD);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        D3D_OK
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+        D3D_OK
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), D3D_OK);
+    assert_eq!(h.clear_target(BACKGROUND), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+
+    let low = f32::from(width) * 0.25;
+    let high = f32::from(width) * 0.75;
+    let quad = [(low, low), (high, low), (low, high), (high, high)].map(|(x, y)| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: 0x8000_ff00,
+    });
+    let backbuffer = h.back_buffer(0);
+    for expected_rgb in [[16_u32, 160, 64], [8, 208, 32], [4, 232, 16]] {
+        // Morrowind's captured door frames clear only depth/stencil, then
+        // alpha-blend UI while relying on the preceding frame's color.
+        assert_eq!(
+            h.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+            D3D_OK
+        );
+        assert_eq!(h.begin_scene(), D3D_OK);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+        assert_eq!(h.end_scene(), D3D_OK);
+        {
+            // This readback does not force Load as GetRenderTargetData can.
+            let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+            assert_eq!(locked.pitch(), i32::from(width) * 4);
+            let pixels = locked.as_u32(size * size);
+            for (x, y) in [(4, 4), (size - 4, 4), (4, size - 4), (size - 4, size - 4)] {
+                assert_eq!(pixels[y * size + x] & 0x00ff_ffff, BACKGROUND & 0x00ff_ffff);
+            }
+            let center = pixels[(size / 2) * size + size / 2];
+            for (shift, expected) in [16, 8, 0].into_iter().zip(expected_rgb) {
+                let actual = (center >> shift) & 0xff;
+                assert!(
+                    actual.abs_diff(expected) <= 2,
+                    "blended channel {shift}: {actual}, expected {expected}"
+                );
+            }
+        }
+        assert_eq!(h.present(), D3D_OK);
+    }
+}
+
+fn assert_cpu_pixels_survive_partial_draw(use_dc: bool) {
+    const GREEN: u32 = 0xff00_ff00;
+    let background = if use_dc { 0xffff_0000 } else { 0xff00_00ff };
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=1;shader.asyncCompile=false",
+        ..HarnessConfig::default()
+    });
+    let (hr, pp) = h.implicit_swapchain().present_parameters();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(pp.swap_effect, D3DSWAPEFFECT_DISCARD);
+    assert_eq!(
+        h.set_viewport(&D3DVIEWPORT9 {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            min_z: 0.0,
+            max_z: 1.0,
+        }),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), D3D_OK);
+    assert_eq!(h.clear_texture(0), D3D_OK);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), D3D_OK);
+
+    // Start a fresh DISCARD frame. None of its expected pixels come from
+    // this clear: the CPU explicitly initializes every pixel afterwards.
+    assert_eq!(h.clear_target(0xff00_0000), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let backbuffer = h.back_buffer(0);
+    if use_dc {
+        let dc = backbuffer.dc();
+        dc.fill_block(64, 0x0000_00ff);
+        assert_eq!(dc.release(), D3D_OK);
+    } else {
+        let mut locked = backbuffer.lock_rect(0);
+        locked.write_u32_rect(64, 64, &[background; 64 * 64]);
+    }
+
+    let quad = [(16.0, 16.0), (48.0, 16.0), (16.0, 48.0), (48.0, 48.0)].map(|(x, y)| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: GREEN,
+    });
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+    assert_eq!(h.end_scene(), D3D_OK);
+    // GetRenderTargetData marks the target read before submission, which
+    // can force Load and hide a missing CPU-upload dependency. Read through
+    // the backbuffer's own lock API instead.
+    let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+    assert_eq!(locked.pitch(), 64 * 4);
+    let pixels = locked.as_u32(64 * 64);
+    assert_eq!(
+        pixels[32 * 64 + 32],
+        GREEN,
+        "the partial draw reaches the GPU"
+    );
+    for (x, y) in [(4, 4), (60, 4), (4, 60), (60, 60)] {
+        // X8R8G8B8 has no alpha contract, and GDI writes zero in that byte.
+        assert_eq!(
+            pixels[y * 64 + x] & 0x00ff_ffff,
+            background & 0x00ff_ffff,
+            "CPU-written pixel ({x}, {y}) outside the draw, use_dc={use_dc}"
+        );
+    }
+}
+
+#[test]
+fn lockable_backbuffer_writable_subrect_preserves_surrounding_pixels() {
+    const BACKGROUND: u32 = 0xff20_4080;
+    const FILL: u32 = 0xff80_4020;
+    for scale in ["render.scale=1", "render.scale=0.75"] {
+        let h = Harness::create(&HarnessConfig {
+            width: 64,
+            height: 64,
+            present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+            config_entries: scale,
+            ..HarnessConfig::default()
+        });
+        assert_eq!(h.clear_target(BACKGROUND), D3D_OK);
+        assert_eq!(
+            h.clear_target_rects(
+                0xffff_ffff,
+                &[D3DRECT {
+                    x1: 0,
+                    y1: 24,
+                    x2: 8,
+                    y2: 40
+                }]
+            ),
+            D3D_OK
+        );
+        let untouched_edge = [6, 7, 8, 9].map(|x| h.read_pixel(x, 32));
+        let backbuffer = h.back_buffer(0);
+        {
+            let mut locked = backbuffer.lock_rect_partial(&[16, 16, 48, 48], 0);
+            assert_eq!(locked.as_u32(1)[0], BACKGROUND, "read before write");
+            locked.write_u32_rect(32, 32, &[FILL; 32 * 32]);
+        }
+        assert_eq!(h.read_pixel(32, 32), FILL, "subrectangle center, {scale}");
+        for (x, before) in [6, 7, 8, 9].into_iter().zip(untouched_edge) {
+            assert_eq!(
+                h.read_pixel(x, 32),
+                before,
+                "edge outside the written rectangle at x={x}, {scale}"
+            );
+        }
+        for (x, y) in [(4, 4), (60, 4), (4, 60), (60, 60)] {
+            assert_eq!(
+                h.read_pixel(x, y),
+                BACKGROUND,
+                "unmodified pixel ({x}, {y}), {scale}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lockable_backbuffer_readonly_locks_do_not_resample_the_surface() {
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear_target(0xff00_0000), D3D_OK);
+    assert_eq!(
+        h.clear_target_rects(
+            0xffff_ffff,
+            &[D3DRECT {
+                x1: 0,
+                y1: 0,
+                x2: 31,
+                y2: 64
+            }]
+        ),
+        D3D_OK
+    );
+    let backbuffer = h.back_buffer(0);
+    let before = {
+        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(locked.pitch(), 64 * 4);
+        locked.as_u32(64 * 64).to_vec()
+    };
+    for _ in 0..2 {
+        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.as_u32(64 * 64),
+            before,
+            "a read-only unlock must not upload and resample the edge"
+        );
+    }
+}
+
+#[test]
+fn lockable_backbuffer_rejects_a_second_lock_without_replacing_the_mapping() {
+    const FILL: u32 = 0xff20_4080;
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=1",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear_target(FILL), D3D_OK);
+    let backbuffer = h.back_buffer(0);
+    let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+    let (result, bits_null) = backbuffer.lock_rect_probe(D3DLOCK_READONLY);
+    assert_eq!(result, D3DERR_INVALIDCALL, "a second lock is rejected");
+    assert!(
+        !bits_null,
+        "the rejected lock does not clear its output pointer"
+    );
+    assert_eq!(locked.as_u32(1)[0], FILL, "the first mapping remains live");
+}
+
+#[test]
+fn lockable_backbuffer_lock_and_dc_keep_exclusive_snapshot_ownership() {
+    const FILL: u32 = 0xff20_4080;
+    let h = Harness::create(&HarnessConfig {
+        width: 64,
+        height: 64,
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=1",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear_target(FILL), D3D_OK);
+    let backbuffer = h.back_buffer(0);
+    {
+        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+        let sentinel = core::ptr::without_provenance_mut(0xdead_beef);
+        let (result, output) = backbuffer.get_dc(sentinel);
+        assert_eq!(result, D3DERR_INVALIDCALL, "GetDC during LockRect");
+        assert_eq!(output, sentinel, "rejected GetDC preserves its output");
+        assert_eq!(locked.as_u32(1)[0], FILL, "LockRect still owns its page");
+    }
+    let dc = backbuffer.dc();
+    assert_eq!(
+        backbuffer.unlock_rect(),
+        D3D_OK,
+        "UnlockRect during GetDC is a no-op"
+    );
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        0x0080_4020,
+        "GetDC still owns its page"
+    );
+    assert_eq!(dc.release(), D3D_OK);
+    assert_eq!(h.read_pixel(32, 32), FILL);
 }
 
 #[test]

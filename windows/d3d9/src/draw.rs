@@ -433,7 +433,7 @@ impl VsSourcePtr {
 
 /// Cached pointer to a scratch-allocated [`PsSource`].
 ///
-/// Same rationale as [`VsSourcePtr`] — keeps the ~56-byte `FfPsKey` out of
+/// Same rationale as [`VsSourcePtr`]: keeps the 74-byte `FfPsKey` out of
 /// the per-draw wrapper memcpy.
 #[derive(Clone, Copy)]
 pub struct PsSourcePtr(pub NonNull<PsSource>);

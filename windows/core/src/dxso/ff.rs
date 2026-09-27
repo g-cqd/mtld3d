@@ -37,9 +37,10 @@ use mtld3d_types::{
     D3DTA_SPECULAR, D3DTA_TEMP, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED,
     D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA,
     D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE,
-    D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X,
+    D3DTOP_DOTPRODUCT3, D3DTOP_LERP, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X,
     D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_MODULATECOLOR_ADDALPHA, D3DTOP_MODULATEINVALPHA_ADDCOLOR,
-    D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
+    D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_MULTIPLYADD, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2,
+    D3DTOP_SUBTRACT,
 };
 
 use super::emit::{
@@ -322,7 +323,7 @@ pub const fn tt_projected(flags: u8) -> bool {
 
 bitflags::bitflags! {
     /// Texture presence and result destination share one byte in the stage key.
-    // Copy keeps the existing seven-byte FfStage value semantics.
+    // Copy keeps the compact stage-key value semantics.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct FfStageFlags: u8 {
         const HAS_TEXTURE = 1 << 0;
@@ -350,9 +351,11 @@ pub enum FfStageResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FfStage {
     pub color_op: u8,
+    pub color_arg0: u8,
     pub color_arg1: u8,
     pub color_arg2: u8,
     pub alpha_op: u8,
+    pub alpha_arg0: u8,
     pub alpha_arg1: u8,
     pub alpha_arg2: u8,
     pub flags: FfStageFlags,
@@ -385,14 +388,26 @@ impl FfStage {
         let color = if self.color_uses_unbound_fallback() {
             selector == D3DTA_CURRENT
         } else {
-            op_reads_argument(self.color_op, self.color_arg1, self.color_arg2, selector)
+            op_reads_argument(
+                self.color_op,
+                self.color_arg0,
+                self.color_arg1,
+                self.color_arg2,
+                selector,
+            )
         };
         color
             || (!self.color_writes_alpha()
                 && if self.alpha_uses_unbound_fallback() {
                     selector == D3DTA_CURRENT
                 } else {
-                    op_reads_argument(self.alpha_op, self.alpha_arg1, self.alpha_arg2, selector)
+                    op_reads_argument(
+                        self.alpha_op,
+                        self.alpha_arg0,
+                        self.alpha_arg1,
+                        self.alpha_arg2,
+                        selector,
+                    )
                 })
     }
 
@@ -402,11 +417,23 @@ impl FfStage {
     }
 
     fn color_uses_unbound_fallback(self) -> bool {
-        !self.has_texture() && op_reads_texture(self.color_op, self.color_arg1, self.color_arg2)
+        !self.has_texture()
+            && op_reads_texture(
+                self.color_op,
+                self.color_arg0,
+                self.color_arg1,
+                self.color_arg2,
+            )
     }
 
     fn alpha_uses_unbound_fallback(self) -> bool {
-        !self.has_texture() && op_reads_texture(self.alpha_op, self.alpha_arg1, self.alpha_arg2)
+        !self.has_texture()
+            && op_reads_texture(
+                self.alpha_op,
+                self.alpha_arg0,
+                self.alpha_arg1,
+                self.alpha_arg2,
+            )
     }
 
     fn color_writes_alpha(self) -> bool {
@@ -419,8 +446,11 @@ impl FfStage {
             || u32::from(self.alpha_op) == D3DTOP_BLENDFACTORALPHA
             || selects_factor(self.color_arg1)
             || selects_factor(self.color_arg2)
+            || (op_uses_arg0(u32::from(self.color_op)) && selects_factor(self.color_arg0))
             || (u32::from(self.alpha_op) != D3DTOP_DISABLE
-                && (selects_factor(self.alpha_arg1) || selects_factor(self.alpha_arg2)))
+                && (selects_factor(self.alpha_arg1)
+                    || selects_factor(self.alpha_arg2)
+                    || (op_uses_arg0(u32::from(self.alpha_op)) && selects_factor(self.alpha_arg0))))
     }
 }
 
@@ -1919,9 +1949,14 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
     let color_expr = if stage.color_uses_unbound_fallback() {
         "current".to_string()
     } else {
+        let c0 = if op_uses_arg0(u32::from(stage.color_op)) {
+            resolve_arg(stage.color_arg0, i, stage.has_texture())
+        } else {
+            String::new()
+        };
         let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture());
         let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
-        apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
+        apply_op(stage.color_op, &c0, &c1, &c2, i, stage.has_texture())
     };
     let alpha = if stage.color_writes_alpha() {
         StageAlpha::FromColor
@@ -1930,10 +1965,16 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
     } else if stage.alpha_uses_unbound_fallback() {
         StageAlpha::Op("current".to_string())
     } else {
+        let a0 = if op_uses_arg0(u32::from(stage.alpha_op)) {
+            resolve_arg(stage.alpha_arg0, i, stage.has_texture())
+        } else {
+            String::new()
+        };
         let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
         let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
         StageAlpha::Op(apply_op_scalar(
             stage.alpha_op,
+            &a0,
             &a1,
             &a2,
             i,
@@ -1970,20 +2011,25 @@ fn names_local(expr: &str, name: &str) -> bool {
 /// ignores arg1) does not consume the unread one. Used to detect a texture
 /// stage referencing an unbound texture so it can be rewritten to
 /// SELECTARG1(CURRENT) — the D3D9 default for an unbound-texture stage.
-fn op_reads_texture(op: u8, arg1: u8, arg2: u8) -> bool {
-    op_reads_argument(op, arg1, arg2, D3DTA_TEXTURE)
+fn op_reads_texture(op: u8, arg0: u8, arg1: u8, arg2: u8) -> bool {
+    op_reads_argument(op, arg0, arg1, arg2, D3DTA_TEXTURE)
 }
 
 /// Does `op` consume an argument naming `selector`?
 ///
 /// `D3DTOP_DISABLE` consumes none: a disabled colour operation ends the
 /// cascade, and a disabled alpha operation keeps the register's alpha.
-fn op_reads_argument(op: u8, arg1: u8, arg2: u8, selector: u32) -> bool {
+fn op_reads_argument(op: u8, arg0: u8, arg1: u8, arg2: u8, selector: u32) -> bool {
     let op = u32::from(op);
     let selected = |a: u8| u32::from(a) & D3DTA_SELECTMASK == selector;
     op != D3DTOP_DISABLE
-        && ((selected(arg1) && op != D3DTOP_SELECTARG2)
-            || (selected(arg2) && op != D3DTOP_SELECTARG1))
+        && (selected(arg1) && op != D3DTOP_SELECTARG2
+            || selected(arg2) && op != D3DTOP_SELECTARG1
+            || op_uses_arg0(op) && selected(arg0))
+}
+
+const fn op_uses_arg0(op: u32) -> bool {
+    matches!(op, D3DTOP_MULTIPLYADD | D3DTOP_LERP)
 }
 
 fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
@@ -2028,7 +2074,7 @@ fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
     expr
 }
 
-fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
+fn apply_op(op: u8, c: &str, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
     match u32::from(op) {
         D3DTOP_SELECTARG1 => a.to_string(),
         D3DTOP_SELECTARG2 => b.to_string(),
@@ -2072,6 +2118,8 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
         D3DTOP_DOTPRODUCT3 => {
             format!("float4(saturate(4.0 * dot(({a}).rgb - 0.5, ({b}).rgb - 0.5)))")
         }
+        D3DTOP_MULTIPLYADD => format!("saturate({c} + {a} * {b})"),
+        D3DTOP_LERP => format!("saturate({c} * {a} + (1.0 - {c}) * {b})"),
         other => {
             mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "ff-fallback texture-op unhandled={other} → SELECTARG1");
             a.to_string()
@@ -2079,9 +2127,9 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
     }
 }
 
-fn apply_op_scalar(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
+fn apply_op_scalar(op: u8, c: &str, a: &str, b: &str, stage: usize, has_texture: bool) -> String {
     // Same algebra — MSL handles float4 and scalar uniformly; we take .a below.
-    apply_op(op, a, b, stage, has_texture)
+    apply_op(op, c, a, b, stage, has_texture)
 }
 
 #[cfg(test)]

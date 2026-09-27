@@ -82,9 +82,12 @@ pub const PANEL_ASPECT_TOLERANCE: f64 = 0.005;
 /// aspects further than [`ASPECT_TOLERANCE`] from the desktop's. The result is
 /// never empty: a list that filters down to nothing holds the desktop mode
 /// alone. [`served_mode_sizes`] bounds what games enumerate from it.
+/// `legacy_4_by_3` also admits exact 4:3 candidates within the desktop's bounds,
+/// for games whose resolution menus reject every other aspect.
 pub fn select_mode_sizes(
     current: (u32, u32),
     candidates: impl IntoIterator<Item = (u32, u32)>,
+    legacy_4_by_3: bool,
 ) -> Vec<(u32, u32)> {
     let (host_w, host_h) = current;
     let host_aspect = aspect(current);
@@ -93,40 +96,63 @@ pub fn select_mode_sizes(
         if w == 0 || h == 0 || w > host_w || h > host_h || sizes.contains(&(w, h)) {
             continue;
         }
-        if aspect_off((w, h), host_aspect) <= ASPECT_TOLERANCE {
+        if aspect_off((w, h), host_aspect) <= ASPECT_TOLERANCE
+            || (legacy_4_by_3 && is_four_by_three((w, h)))
+        {
             sizes.push((w, h));
         }
     }
     sizes
 }
 
-/// The sizes `EnumAdapterModes` serves: the settable sizes of the panel's aspect, bounded to `max`.
+/// The sizes `EnumAdapterModes` serves, bounded to `max` with the desktop first.
 ///
 /// The desktop (the first entry, which doubles as the adapter display mode)
 /// comes first, then the other sizes of the panel's own aspect (within
 /// [`PANEL_ASPECT_TOLERANCE`] of the desktop's), largest first, at most
-/// `max` in all; ties keep their enumeration order. Only that aspect fills
-/// the display: under Wine's `EmulateModeset` any other is letterboxed by
-/// win32u's uniform scale with the desktop showing in the bars, and a menu
-/// is no place to offer that. Every other settable size stays settable for a
-/// game's own config, since this never touches [`select_mode_sizes`]' list.
+/// `max` in all; ties keep their enumeration order. With `legacy_4_by_3`, the
+/// remaining slots alternate largest exact 4:3 and largest panel sizes,
+/// starting with 4:3 so a short list cannot exclude the game's only aspect.
+/// Once either group is exhausted, the other fills the remaining slots.
+/// Each size belongs to one group; exact 4:3 sizes take the legacy slots.
+///
+/// Non-panel aspects are opt-in: Wine's `EmulateModeset` letterboxes them
+/// with the desktop visible in the bars. Every other settable size remains
+/// available to a game's own config; this never changes the settable list.
 /// A `max` of 0 still serves the desktop.
 #[must_use]
-pub fn served_mode_sizes(settable: &[(u32, u32)], max: usize) -> Vec<(u32, u32)> {
+pub fn served_mode_sizes(
+    settable: &[(u32, u32)],
+    max: usize,
+    legacy_4_by_3: bool,
+) -> Vec<(u32, u32)> {
     let Some((&desktop, rest)) = settable.split_first() else {
         return Vec::new();
     };
     let desktop_aspect = aspect(desktop);
-    let mut panel: Vec<(u32, u32)> = rest
+    let is_panel = |size| aspect_off(size, desktop_aspect) <= PANEL_ASPECT_TOLERANCE;
+    let mut eligible: Vec<(u32, u32)> = rest
         .iter()
         .copied()
-        .filter(|&size| aspect_off(size, desktop_aspect) <= PANEL_ASPECT_TOLERANCE)
+        .filter(|&size| is_panel(size) || (legacy_4_by_3 && is_four_by_three(size)))
         .collect();
-    panel.sort_by_key(|&size| Reverse(pixels(size)));
-    core::iter::once(desktop)
-        .chain(panel)
-        .take(max.max(1))
-        .collect()
+    eligible.sort_by_key(|&size| Reverse(pixels(size)));
+    let is_legacy = |size| legacy_4_by_3 && is_four_by_three(size);
+    let mut panel = eligible.iter().copied().filter(|&size| !is_legacy(size));
+    let mut legacy = eligible.iter().copied().filter(|&size| is_legacy(size));
+    let limit = max.max(1).min(settable.len());
+    let mut served = Vec::with_capacity(limit);
+    served.push(desktop);
+    while served.len() < limit {
+        let next = if served.len().is_multiple_of(2) {
+            panel.next().or_else(|| legacy.next())
+        } else {
+            legacy.next().or_else(|| panel.next())
+        };
+        let Some(size) = next else { break };
+        served.push(size);
+    }
+    served
 }
 
 /// The positions in a mode list of the modes whose size is served.
@@ -159,4 +185,8 @@ fn aspect_off(size: (u32, u32), reference: f64) -> f64 {
 
 fn pixels((w, h): (u32, u32)) -> u64 {
     u64::from(w) * u64::from(h)
+}
+
+fn is_four_by_three((w, h): (u32, u32)) -> bool {
+    w != 0 && h != 0 && u64::from(w) * 3 == u64::from(h) * 4
 }

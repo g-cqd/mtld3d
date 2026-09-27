@@ -4,8 +4,8 @@ use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex};
 use mtld3d_types::{
     D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRS_LIGHTING,
     D3DRS_TEXTUREFACTOR, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP,
+    D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -922,6 +922,84 @@ fn texturefactor_as_color_source() {
     assert!(
         px.r < 40 && px.g < 40 && px.b > 200,
         "tfactor blue, got {px:?}"
+    );
+}
+
+#[test]
+fn multiplyadd_uses_colorarg0_and_alphaarg0() {
+    use mtld3d_types::{D3DTOP_MULTIPLYADD, D3DTSS_ALPHAARG0, D3DTSS_COLORARG0};
+
+    let h = Harness::new();
+    let texture = solid_texture(&h, 0x4040_8020);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x8040_80C0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_texture(0, &texture), 0);
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_MULTIPLYADD),
+        (D3DTSS_COLORARG0, D3DTA_TEXTURE),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_COLORARG2, D3DTA_TFACTOR),
+        (D3DTSS_ALPHAOP, D3DTOP_MULTIPLYADD),
+        (D3DTSS_ALPHAARG0, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAARG2, D3DTA_TFACTOR),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0x2030_1020)),
+            0
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        px.r.abs_diff(76) <= 2 && px.g.abs_diff(136) <= 2 && px.b.abs_diff(56) <= 2,
+        "MULTIPLYADD RGB = Arg0 + Arg1 * Arg2, got {px:?}"
+    );
+    assert!(
+        px.a.abs_diff(80) <= 2,
+        "MULTIPLYADD alpha must use ALPHAARG0, got {px:?}"
+    );
+}
+
+#[test]
+fn lerp_uses_colorarg0_and_alphaarg0() {
+    use mtld3d_types::{D3DTOP_LERP, D3DTSS_ALPHAARG0, D3DTSS_COLORARG0};
+
+    let h = Harness::new();
+    let texture = solid_texture(&h, 0x40_40_80_C0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x20E0_6020), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_texture(0, &texture), 0);
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_LERP),
+        (D3DTSS_COLORARG0, D3DTA_TFACTOR),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_LERP),
+        (D3DTSS_ALPHAARG0, D3DTA_TFACTOR),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAARG2, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0xA0_20_A0_E0)),
+            0
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        px.r.abs_diff(60) <= 2 && px.g.abs_diff(148) <= 2 && px.b.abs_diff(220) <= 2,
+        "LERP RGB = Arg0 * Arg1 + (1 - Arg0) * Arg2, got {px:?}"
+    );
+    assert!(
+        px.a.abs_diff(148) <= 2,
+        "LERP alpha must use ALPHAARG0, got {px:?}"
     );
 }
 

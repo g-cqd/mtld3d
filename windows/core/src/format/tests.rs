@@ -1474,3 +1474,43 @@ fn legacy_bump_map_queries_answer_no_for_every_format() {
         ));
     }
 }
+
+#[test]
+fn d3d8_descriptor_size_matches_linear_and_block_storage() {
+    use mtld3d_types::{D3DFMT_A8, D3DFMT_DXT5};
+    for (format, width, height, expected) in [
+        (D3DFMT_A8R8G8B8, 64, 64, 16_384),
+        (D3DFMT_R8G8B8, 3, 2, 24),
+        (D3DFMT_R5G6B5, 3, 2, 16),
+        (D3DFMT_A8, 3, 2, 8),
+        (D3DFMT_DXT1, 5, 7, 32),
+        (D3DFMT_DXT5, 1, 1, 16),
+        (D3DFMT_D16, 3, 2, 16),
+        (D3DFMT_D24S8, 3, 2, 24),
+    ] {
+        assert_eq!(
+            super::d3d8_surface_size(format, width, height),
+            Some(expected),
+            "format={format}, {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn d3d8_descriptor_size_rejects_invalid_extents_and_overflow() {
+    use mtld3d_types::{D3DFMT_A8, D3DFMT_DXT5};
+    for (format, width, height) in [
+        (D3DFMT_A8R8G8B8, 0, 64),
+        (D3DFMT_A8R8G8B8, 64, 0),
+        (D3DFMT_A8R8G8B8, u32::MAX, 1),
+        (D3DFMT_A8, u32::MAX, 1),
+        (D3DFMT_DXT5, u32::MAX, u32::MAX),
+        (0, 4, 4),
+    ] {
+        assert_eq!(
+            super::d3d8_surface_size(format, width, height),
+            None,
+            "format={format}, {width}x{height}"
+        );
+    }
+}

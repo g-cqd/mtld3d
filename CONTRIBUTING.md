@@ -80,7 +80,7 @@ that touches `docs/CONVENTIONS.md`.
 
 ## Reading a test run
 
-The end-to-end suite is four test binaries per architecture, and the runner
+The end-to-end suite is five test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
 `JOBS` threads of that process (four at a time by default; the Makefile says
 what that assumes of the Wine it runs under). It prints one

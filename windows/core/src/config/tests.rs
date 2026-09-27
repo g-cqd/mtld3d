@@ -19,6 +19,56 @@ fn empty_input_returns_defaults() {
 }
 
 #[test]
+fn legacy_display_mode_option_is_opt_in_and_can_be_overridden() {
+    let enabled = parse(None, "display.legacy4By3=true", None);
+    assert!(enabled.display_legacy_4_by_3);
+    assert_ne!(enabled, Mtld3dConfig::default());
+    assert_eq!(
+        parse(
+            None,
+            "display.legacy4By3=true",
+            Some("display.legacy4By3=false")
+        ),
+        Mtld3dConfig::default()
+    );
+    assert_eq!(
+        parse(
+            None,
+            "display.legacy4By3=true\ndisplay.legacy4By3=invalid",
+            None
+        ),
+        enabled
+    );
+}
+
+#[test]
+fn discard_backbuffer_preservation_is_opt_in_and_can_be_overridden() {
+    let enabled = parse(None, "render.preserveDiscardBackbuffer=true", None);
+    assert!(enabled.preserve_discard_backbuffer);
+    assert_ne!(enabled, Mtld3dConfig::default());
+    assert_eq!(
+        parse(None, "render.preserveDiscardBackbuffer=false", None),
+        Mtld3dConfig::default()
+    );
+    assert_eq!(
+        parse(
+            None,
+            "render.preserveDiscardBackbuffer=true",
+            Some("render.preserveDiscardBackbuffer=false")
+        ),
+        Mtld3dConfig::default()
+    );
+    assert_eq!(
+        parse(
+            None,
+            "render.preserveDiscardBackbuffer=true\nrender.preserveDiscardBackbuffer=invalid",
+            None
+        ),
+        enabled
+    );
+}
+
+#[test]
 fn defaults_match_documented_values() {
     let d = Mtld3dConfig::default();
     assert!(!d.caps_all);
@@ -27,6 +77,7 @@ fn defaults_match_documented_values() {
     assert!(!d.deny_float32_filtering);
     assert!(!d.managed_memory);
     assert!(!d.linear_align256);
+    assert!(!d.display_legacy_4_by_3);
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
@@ -44,6 +95,7 @@ fn defaults_match_documented_values() {
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     assert_eq!(d.present_max_fps, 0);
     assert_eq!(d.render_scale_percent, 100);
+    assert!(!d.preserve_discard_backbuffer);
 }
 
 /// The advertised video-memory ceiling defaults by guest width.

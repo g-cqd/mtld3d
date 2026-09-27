@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use std::{
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, OnceLock},
 };
 
 use log::{error, info, trace, warn};
@@ -45,15 +45,24 @@ use super::{
 };
 
 // The display-mode table behind GetAdapterModeCount / EnumAdapterModes /
-// GetAdapterDisplayMode and the fullscreen mode-set. Built once, on the first
-// enumeration call or the first fullscreen device, from the Win32 mode list
+// GetAdapterDisplayMode and the fullscreen mode-set. Built once, by the first
+// factory or an earlier Win32 enumeration, from the Win32 mode list
 // (`EnumDisplaySettingsW`, see `build_adapter_modes`): a fullscreen device
 // sets the mode a game picks through user32, so the list a game picks from
 // has to be the list user32 validates against. The first entry is the
 // desktop mode at the time the table was built and doubles as the current
 // adapter display mode, which is why the table is forced before the first
-// mode-set.
-static ADAPTER_MODES: LazyLock<AdapterModes> = LazyLock::new(build_adapter_modes);
+// mode-set. The display policy is latched here too: the process-wide user32
+// import hook has no interface whose configuration it could borrow. OnceLock
+// accepts the configuration already resolved by the first factory.
+static ADAPTER_MODES: OnceLock<AdapterModes> = OnceLock::new();
+
+fn adapter_modes() -> &'static AdapterModes {
+    // An import hook can run before the first factory. Only that path needs
+    // to resolve the process configuration here; later queries borrow the
+    // table initialized from the factory's captured configuration.
+    ADAPTER_MODES.get_or_init(|| build_adapter_modes(crate::config::load().display_legacy_4_by_3))
+}
 
 // Adapter color formats enumerated. X8R8G8B8 = "32-bit" in most game UIs
 // (32-bit container, 24 useful color bits), R5G6B5 = "16-bit".
@@ -74,7 +83,7 @@ const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
 ///
 /// A windowed back buffer requested as `D3DFMT_UNKNOWN` resolves to this.
 pub fn adapter_display_format() -> u32 {
-    ADAPTER_MODES.served[0].format
+    adapter_modes().served[0].format
 }
 
 /// The adapter's display mode right now, as `GetAdapterDisplayMode` reports it.
@@ -85,7 +94,7 @@ pub fn adapter_display_format() -> u32 {
 /// rect from. The format is the table's, the one colour format the desktop
 /// is advertised at; a failed query falls back to the table's desktop entry.
 pub fn current_adapter_display_mode() -> D3DDISPLAYMODE {
-    let desktop = ADAPTER_MODES.served[0];
+    let desktop = adapter_modes().served[0];
     crate::fullscreen::current_display_mode().map_or(desktop, |mode| D3DDISPLAYMODE {
         width: mode.width,
         height: mode.height,
@@ -109,7 +118,7 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
         let refresh_rate = if pp.full_screen_refresh_rate_in_hz != 0 {
             pp.full_screen_refresh_rate_in_hz
         } else {
-            ADAPTER_MODES.served[0].refresh_rate
+            adapter_modes().served[0].refresh_rate
         };
         D3DDISPLAYMODE {
             width: pp.back_buffer_width,
@@ -142,10 +151,10 @@ struct AdapterModes {
 
 /// The sizes games enumerate, desktop first.
 pub fn served_sizes() -> &'static [(u32, u32)] {
-    &ADAPTER_MODES.served_sizes
+    &adapter_modes().served_sizes
 }
 
-fn build_adapter_modes() -> AdapterModes {
+fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
     // Both the host mode and the candidates come from the Win32 view
     // (`EnumDisplaySettingsW` → win32u), NOT from `NSScreen` or a table of
     // our own: win32u validates a fullscreen device's `ChangeDisplaySettingsW`
@@ -172,8 +181,8 @@ fn build_adapter_modes() -> AdapterModes {
         .iter()
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
         .map(|mode| (mode.width, mode.height));
-    let settable = select_mode_sizes((host_w, host_h), candidates);
-    let sizes = served_mode_sizes(&settable, MAX_SERVED_SIZES);
+    let settable = select_mode_sizes((host_w, host_h), candidates, legacy_4_by_3);
+    let sizes = served_mode_sizes(&settable, MAX_SERVED_SIZES, legacy_4_by_3);
     if enumerated.is_empty() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -197,7 +206,7 @@ fn build_adapter_modes() -> AdapterModes {
     info!(
         target: LOG_TARGET,
         "adapter modes: host {host_w}x{host_h}@{host_hz}Hz aspect={host_aspect:.3}; {} sizes \
-         settable of {} enumerated modes, {} served ({} entries)",
+         settable of {} enumerated modes, {} served ({} entries), legacy4By3={legacy_4_by_3}",
         settable.len(),
         enumerated.len(),
         sizes.len(),
@@ -274,6 +283,7 @@ impl Drop for Direct3D9Inner {
 
 impl Direct3D9 {
     pub fn new(config: Arc<Mtld3dConfig>) -> Self {
+        ADAPTER_MODES.get_or_init(|| build_adapter_modes(config.display_legacy_4_by_3));
         Self {
             vtbl: &raw const DIRECT3D9_VTBL,
             refcount: 1,
@@ -764,7 +774,7 @@ extern "system" fn d3d9_get_adapter_mode_count(
         return 0;
     }
     let count = u32::try_from(
-        ADAPTER_MODES
+        adapter_modes()
             .served
             .iter()
             .filter(|m| m.format == format)
@@ -793,7 +803,7 @@ extern "system" fn d3d9_enum_adapter_modes(
         );
         return D3DERR_INVALIDCALL;
     }
-    let Some(entry) = ADAPTER_MODES
+    let Some(entry) = adapter_modes()
         .served
         .iter()
         .filter(|m| m.format == format)
@@ -1276,14 +1286,14 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// `true` when `width`x`height` is a mode `EnumAdapterModes` serves.
+/// `true` when `width`x`height` belongs to the adapter's settable mode list.
 ///
 /// The membership test behind the fullscreen honor-or-follow split in
 /// [`resolve_backbuffer_dims`]. Answered against every settable size, not
 /// only the bounded list games enumerate: a game's own config may name a
 /// mode its menu no longer lists, and user32 accepts it all the same.
 pub fn is_settable_mode(width: u32, height: u32) -> bool {
-    ADAPTER_MODES.settable.contains(&(width, height))
+    adapter_modes().settable.contains(&(width, height))
 }
 
 /// Resolve the back buffer's *logical* size.
@@ -1637,7 +1647,10 @@ extern "system" fn d3d9_create_device(
             backbuffer_height: pp.back_buffer_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
             render_scale,
-            backbuffer_contents: BackbufferContents::from_swap_effect(pp.swap_effect),
+            backbuffer_contents: BackbufferContents::from_swap_effect(
+                pp.swap_effect,
+                cfg.preserve_discard_backbuffer,
+            ),
             depth_texture: depth_handle,
             depth_has_stencil: depth_format_has_stencil(pp.auto_depth_stencil_format),
         }),

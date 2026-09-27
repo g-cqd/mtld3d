@@ -554,19 +554,21 @@ fn viewport_applied_to_new_pass_start() {
 #[test]
 fn first_use_colour_dontcare_is_the_back_buffer_alone() {
     let rt = tex(0x3000);
-    // Rule A: the back buffer's first use in a frame, with no pending
-    // clear, gets DontCare, since `Present` left it undefined. A game
-    // render target keeps last frame's contents, so its first use loads.
-    // Depth is shared so it's first-use in A and re-use (Load) in B.
-    let mut s = fresh();
-    s.emit_command(dummy_draw()); // pass A on backbuffer() + depth()
-    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw()); // pass B on rt + depth()
-    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
-    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
-    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
-    // depth() is seen-already (pass A used it), so Load this time.
-    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    for (preserve, color_load) in [(false, ColorLoad::DontCare), (true, ColorLoad::Load)] {
+        let mut s = PassState::new();
+        reset_frame_with_backbuffer_contents(
+            &mut s,
+            BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD, preserve),
+        );
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].color_load(), color_load);
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+        assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+        assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+        assert_eq!(s.is_discarded_back_buffer(backbuffer()), !preserve);
+    }
 }
 
 /// A frame on the default surfaces whose back buffer starts with `contents`.
@@ -589,7 +591,7 @@ fn reset_frame_with_backbuffer_contents(s: &mut PassState, contents: BackbufferC
 }
 
 #[test]
-fn first_use_colour_dontcare_needs_the_discard_swap_effect() {
+fn first_use_colour_dontcare_needs_an_undefined_back_buffer() {
     // Under COPY or FLIP the back buffer keeps its contents across
     // `Present`, so a game redrawing part of the frame without clearing
     // relies on the rest surviving: its first use loads. The depth plane
@@ -608,20 +610,45 @@ fn first_use_colour_dontcare_needs_the_discard_swap_effect() {
 }
 
 #[test]
-fn only_the_discard_swap_effect_leaves_the_back_buffer_undefined() {
+fn only_unpreserved_discard_leaves_the_back_buffer_undefined() {
     assert!(matches!(
-        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD),
+        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD, false),
         BackbufferContents::Undefined
+    ));
+    assert!(matches!(
+        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD, true),
+        BackbufferContents::Preserved
     ));
     for swap_effect in [
         mtld3d_types::D3DSWAPEFFECT_FLIP,
         mtld3d_types::D3DSWAPEFFECT_COPY,
     ] {
-        assert!(matches!(
-            BackbufferContents::from_swap_effect(swap_effect),
-            BackbufferContents::Preserved
-        ));
+        for preserve in [false, true] {
+            assert!(matches!(
+                BackbufferContents::from_swap_effect(swap_effect, preserve),
+                BackbufferContents::Preserved
+            ));
+        }
     }
+}
+
+#[test]
+fn depth_stencil_clear_keeps_preserved_backbuffer_color() {
+    let mut s = PassState::new();
+    reset_frame_with_backbuffer_contents(
+        &mut s,
+        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD, true),
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    let z = 1.0_f32.to_bits();
+    assert_eq!(s.clear_depth(z), DepthClearOutcome::Folded);
+    assert_eq!(s.clear_stencil(0), StencilClearOutcome::Folded);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 1);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_load(), ColorLoad::Load);
+    assert_eq!(pass.depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(pass.stencil_load(), StencilLoad::Clear { value: 0 });
 }
 
 #[test]
@@ -1368,23 +1395,26 @@ fn debug_guard_tracks_every_vertex_stream_slot() {
 
 #[test]
 fn rule_a_fresh_frame_clear_color_only_keeps_clear() {
-    // Pending color clear must beat the first-use DontCare branch;
-    // depth still falls through to DontCare since no depth clear
-    // was issued.
-    let mut s = fresh();
-    s.clear_color(1, 2, 3, 4);
-    s.emit_command(dummy_draw());
-    assert_eq!(s.passes().len(), 1);
-    assert_eq!(
-        s.passes()[0].color_load(),
-        ColorLoad::Clear {
-            r: 1,
-            g: 2,
-            b: 3,
-            a: 4
-        }
-    );
-    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    for preserve in [false, true] {
+        let mut s = PassState::new();
+        reset_frame_with_backbuffer_contents(
+            &mut s,
+            BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD, preserve),
+        );
+        s.clear_color(1, 2, 3, 4);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes().len(), 1);
+        assert_eq!(
+            s.passes()[0].color_load(),
+            ColorLoad::Clear {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 4
+            }
+        );
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    }
 }
 
 #[test]
@@ -8581,7 +8611,7 @@ fn a_presented_multisampled_back_buffer_resolves_without_storing_its_samples() {
 }
 
 #[test]
-fn the_multisampled_back_buffer_keeps_its_samples_unless_presented_under_discard() {
+fn the_multisampled_back_buffer_keeps_its_samples_unless_presented_under_unpreserved_discard() {
     let mut flush = fresh_multisampled();
     flush.emit_command(dummy_draw());
     flush.end_current_pass("test");
@@ -8592,30 +8622,34 @@ fn the_multisampled_back_buffer_keeps_its_samples_unless_presented_under_discard
         "a mid-frame flush: a later pass may load the samples"
     );
 
-    let mut preserved = PassState::new();
-    preserved.reset_frame(&FrameReset {
-        backbuffer: backbuffer(),
-        backbuffer_srgb: backbuffer_srgb(),
-        backbuffer_msaa: msaa_backbuffer(),
-        backbuffer_msaa_srgb: msaa_backbuffer_srgb(),
-        backbuffer_sample_count: 4,
-        backbuffer_size: BB_SIZE,
-        backbuffer_format: BB_FORMAT,
-        backbuffer_contents: BackbufferContents::Preserved,
-        depth_texture: depth(),
-        depth_size: BB_SIZE,
-        depth_has_stencil: false,
-        render_scale: RenderScale::IDENTITY,
-        continues_frame: false,
-    });
-    preserved.emit_command(dummy_draw());
-    preserved.end_current_pass("test");
-    preserved.finalize_store_actions(false);
-    assert_eq!(
-        preserved.passes()[0].color_store(),
-        StoreAction::Store,
-        "a copy or flip swap effect keeps the back buffer across Present"
-    );
+    for (swap_effect, preserve) in [
+        (mtld3d_types::D3DSWAPEFFECT_COPY, false),
+        (mtld3d_types::D3DSWAPEFFECT_FLIP, false),
+        (mtld3d_types::D3DSWAPEFFECT_DISCARD, true),
+    ] {
+        let mut preserved = PassState::new();
+        preserved.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_srgb: backbuffer_srgb(),
+            backbuffer_msaa: msaa_backbuffer(),
+            backbuffer_msaa_srgb: msaa_backbuffer_srgb(),
+            backbuffer_sample_count: 4,
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            backbuffer_contents: BackbufferContents::from_swap_effect(swap_effect, preserve),
+            depth_texture: depth(),
+            depth_size: BB_SIZE,
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        preserved.emit_command(dummy_draw());
+        preserved.end_current_pass("test");
+        preserved.finalize_store_actions(false);
+        assert_eq!(preserved.passes()[0].color_load(), ColorLoad::Load);
+        assert_eq!(preserved.passes()[0].color_resolve_texture(), backbuffer());
+        assert_eq!(preserved.passes()[0].color_store(), StoreAction::Store);
+    }
 
     let rt = tex(0x3400);
     let mut offscreen = fresh();

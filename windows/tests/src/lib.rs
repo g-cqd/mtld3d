@@ -1,12 +1,13 @@
 //! Shared support library for the mtld3d end-to-end test suite.
 //!
-//! Every integration test under `tests/` drives the real `d3d9.dll` through a
-//! [`Harness`]: one factory + window + device, with safe wrappers around the
+//! Integration tests drive the real frontend DLLs through [`Harness`] or
+//! [`D3D8Harness`]: one factory + window + device, with safe wrappers around the
 //! COM vtables and RAII `resource` handles. All FFI and `unsafe` live here so
 //! the test files read as plain D3D9 call sequences with pixel/`HRESULT`
 //! assertions. D3D9 constants come from `mtld3d_types`; nothing is restated.
 
 mod check;
+mod d3d8;
 mod ffi;
 mod harness;
 mod in_flight;
@@ -18,6 +19,9 @@ mod vertex;
 mod vtbl;
 mod win32;
 
+/// Typed D3D8 resource wrappers for frontend integration tests.
+pub use d3d8::resources;
+pub use d3d8::{D3D8Harness, D3D8Surface, D3D8SwapChain, D3D8Texture};
 pub use harness::{
     DrawIndexedUpParams, Harness, HarnessConfig, config_value, config_var,
     render_scale_is_identity, run_child,

@@ -315,8 +315,8 @@ pub struct BlitSide {
 ///
 /// `GetDC` and `LockRect` hand their bytes out at the extent D3D9 reports, so
 /// under a `render.scale` below 100% the page the caller wrote is larger than
-/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and a
-/// lockable render target's `UnlockRect`. Built by `surface.rs` on the API
+/// the texture it belongs in. Serves writable backbuffer and render-target
+/// locks and device contexts. Built by `surface.rs` on the API
 /// thread, which is where the device's scale and the surface's extent are both
 /// reachable.
 pub struct ResampledUpload {
@@ -328,6 +328,10 @@ pub struct ResampledUpload {
     pub logical: (u32, u32),
     /// Extent of the destination texture, at or below `logical`.
     pub texture: (u32, u32),
+    /// Rectangle of the logical snapshot that the caller may have changed.
+    pub source_region: StretchRegion,
+    /// Matching rectangle in the destination texture; outside pixels are preserved.
+    pub destination_region: StretchRegion,
     /// Row stride of the source rows, which need not be the tight one.
     pub bytes_per_row: u32,
     /// Multisampled companion of the destination, null when single-sampled.
@@ -7798,10 +7802,11 @@ impl FrameEncoder {
     /// host-visible surface store uses. Copies the rows into a fresh
     /// page-aligned `PageBox` (padding each row up to
     /// `min_linear_texture_align` if the source stride is below it), wraps
-    /// that in a transient `MTLBuffer`, appends a `CopyBufferToTexture` to the
-    /// frame's leading blit pass, and retires both after the GPU retires this
-    /// frame. The bytes are *copied* here (the caller's staging is not aliased
-    /// across the API/encoder boundary).
+    /// that in a transient `MTLBuffer`, and queues a `CopyBufferToTexture`
+    /// after earlier clears and draws. The destination is tracked as written
+    /// so the next render pass loads the uploaded pixels. Both allocations
+    /// retire after the GPU retires this frame. The bytes are *copied* here
+    /// (the caller's staging is not aliased across the API/encoder boundary).
     pub fn upload_bytes_to_color_handle(
         &mut self,
         color_handle: u64,
@@ -7887,9 +7892,10 @@ impl FrameEncoder {
             depth: 1,
             bytes_per_image: bytes_per_row.saturating_mul(height),
         };
-        self.frame_blit_commands
-            .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.pass_state.push_leading_blit_after_clears(
+            BlitCommand::copy_buffer_to_texture(&info),
+            "upload_bytes_to_color_handle",
+        );
         self.perf.bump_texture_blit_upload();
 
         // Retire the wrapper + PageBox after the GPU retires this frame — the
@@ -7913,11 +7919,11 @@ impl FrameEncoder {
     /// The resizing counterpart of [`Self::upload_bytes_to_color_handle`], for
     /// the back buffer's `ReleaseDC` write-back and a lockable render target's
     /// `UnlockRect` under a `render.scale` below 100%. The rows land in a
-    /// scratch texture at the extent they describe,
-    /// which the blit-quad pipeline then samples across the destination with a
-    /// linear filter, the same resample a scaling `StretchRect` runs. The
-    /// upload rides the frame's leading blit pass and the quad is a render pass
-    /// after it, so the two are ordered without a barrier of their own.
+    /// scratch texture at the extent they describe. The blit-quad pipeline
+    /// samples the source region into the destination region with a linear
+    /// filter, preserving pixels outside it, as a scaling `StretchRect` does. The
+    /// upload precedes the quad in the ordered pass stream, so an earlier
+    /// resample reads the scratch before a later upload replaces its pixels.
     ///
     /// Declines, once, when the scratch cannot be created: the destination
     /// keeps the pixels the GPU already holds, which is what an unresampled
@@ -7925,7 +7931,14 @@ impl FrameEncoder {
     pub fn upload_bytes_resampled(&mut self, target: &ResampledUpload, rows: &[u8]) {
         let (src_w, src_h) = target.logical;
         let (dst_w, dst_h) = target.texture;
-        if target.color_handle == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        if target.color_handle == 0
+            || src_w == 0
+            || src_h == 0
+            || dst_w == 0
+            || dst_h == 0
+            || target.destination_region.w == 0
+            || target.destination_region.h == 0
+        {
             return;
         }
         let scratch = self.ensure_dc_write_back_scratch(src_w, src_h, target.format);
@@ -7940,12 +7953,7 @@ impl FrameEncoder {
         self.upload_bytes_to_color_handle(scratch, rows, src_w, src_h, target.bytes_per_row);
         let src = BlitSide {
             handle: scratch,
-            rect: StretchRegion {
-                x: 0,
-                y: 0,
-                w: src_w,
-                h: src_h,
-            },
+            rect: target.source_region,
             dims: (src_w, src_h),
             mip: 0,
             slice: None,
@@ -7955,12 +7963,7 @@ impl FrameEncoder {
         };
         let dst = BlitSide {
             handle: target.color_handle,
-            rect: StretchRegion {
-                x: 0,
-                y: 0,
-                w: dst_w,
-                h: dst_h,
-            },
+            rect: target.destination_region,
             dims: (dst_w, dst_h),
             mip: 0,
             slice: None,
@@ -8593,6 +8596,8 @@ pub struct FrameData {
     device_handle: MetalHandle<MTLDeviceKind>,
     record_handle: DeviceRecordHandle,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// Image submitted to the presenter; additional chains can select their own storage.
+    present_texture: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of the back buffer; see `FrameInit`.
     backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     /// Multisampled companion of `backbuffer_handle`, NULL when there is none.
@@ -8626,7 +8631,7 @@ pub struct FrameData {
     /// `PassState::reset_frame` so the initial pass's pipeline cache key has
     /// the right format before any `SetRenderTarget`.
     backbuffer_format: PixelFormat,
-    /// Whether the back buffer starts the frame undefined; see `FrameInit`.
+    /// Resolved back-buffer preservation policy; see `FrameInit`.
     backbuffer_contents: BackbufferContents,
     depth_texture: MetalHandle<MTLTextureKind>,
     /// Per-frame boolean state (`DEPTH_HAS_STENCIL` / `NO_PRESENT`).
@@ -8765,10 +8770,10 @@ pub struct FrameInit {
     /// Forwarded to `PassState::reset_frame`, which is the single place the
     /// logical and render coordinate spaces are reconciled.
     pub render_scale: RenderScale,
-    /// Whether the back buffer starts each frame undefined, from the swap effect.
+    /// Whether the back buffer starts each frame undefined, from swap effect and configuration.
     ///
     /// Forwarded to `PassState::reset_frame`: Rule A discards the back buffer
-    /// on first use only under `D3DSWAPEFFECT_DISCARD`.
+    /// on first use only under `D3DSWAPEFFECT_DISCARD` without compatibility preservation.
     pub backbuffer_contents: BackbufferContents,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     /// `true` when the frame's default depth attachment is a combined depth+stencil format.
@@ -8788,6 +8793,7 @@ impl FrameData {
             device_handle: init.device_handle,
             record_handle: init.record_handle,
             backbuffer_handle: init.backbuffer_handle,
+            present_texture: init.backbuffer_handle,
             backbuffer_srgb_handle: init.backbuffer_srgb_handle,
             backbuffer_msaa_handle: init.backbuffer_msaa_handle,
             backbuffer_msaa_srgb_handle: init.backbuffer_msaa_srgb_handle,
@@ -8856,6 +8862,11 @@ impl FrameData {
     /// `D3DFMT_*`.
     pub const fn backbuffer_format(&self) -> PixelFormat {
         self.backbuffer_format
+    }
+
+    /// Selects the image to present without changing this frame's render attachments.
+    pub const fn set_present_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        self.present_texture = texture;
     }
 
     pub const fn perf(&self) -> &FramePerfPayload {
@@ -9844,7 +9855,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         present_texture: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
-            frame.backbuffer_handle
+            frame.present_texture
         },
         submit_seq: frame.submit_seq,
         coherent_seq_ptr: frame.coherent_seq_ptr,

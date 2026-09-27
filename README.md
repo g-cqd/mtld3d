@@ -5,9 +5,11 @@ Direct3D 9 for Wine on macOS, backed by Metal.
 mtld3d replaces Wine's `d3d9.dll`. The PE side implements the D3D9 API and
 translates it into Metal command buffers that a native library executes on the
 host. The goal is the fastest Direct3D 9 implementation for Wine on macOS.
-Direct3D 8 on the same core is planned. Every other Direct3D version is a
-non-goal: D3D10 and later are already served on macOS by Apple's D3DMetal and
-by DXMT.
+A Rust Direct3D 8 frontend now shares the renderer through mtld3d's D3D9
+objects and shared core. Its current coverage and remaining gaps are listed
+in [the status document](docs/STATUS.md#direct3d-8).
+This fork prioritizes D3D8 and D3D9, followed by older APIs. D3D10 and later
+remain outside its scope.
 
 Conformance serves speed rather than defining it: where matching D3D9 exactly
 would cost frame time, speed wins as long as no game breaks. Those trades are
@@ -63,6 +65,18 @@ in. A profile only supplies starting values, which the file and the
 environment override key by key; `RUST_LOG=mtld3d::d3d9=info` names the
 profile that matched. See [`app_profile.rs`](windows/core/src/app_profile.rs)
 for the profiles, their settings, and the reason behind each option.
+
+Morrowind's profile enables `display.legacy4By3` so its Video menu can list
+host-supported 4:3 resolutions alongside the panel modes offered to other
+callers. The display list keeps its existing limit and latches the option
+at the first Direct3D factory or an earlier Win32 mode enumeration, so changes
+require restarting the process. The profile also disables
+`shader.asyncCompile`: first-use compilation can pause, but it does not
+omit draws while a shader compiles. The shader cache stays enabled.
+`render.preserveDiscardBackbuffer` keeps the previous frame's colour for
+Morrowind's UI-only frames even with the DISCARD swap effect. Explicit colour
+clears still replace it; depth, stencil and other render targets keep their
+existing policies. This compatibility option defaults to off for other games.
 
 ## Fullscreen
 

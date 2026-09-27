@@ -100,8 +100,9 @@ impl ClearedTargets {
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
 /// On the colour side only the back buffer qualifies, and only under
-/// `D3DSWAPEFFECT_DISCARD`: its contents are undefined after `Present`, so its
-/// first pass of a frame has nothing to load. Under `FLIP` and `COPY` the back
+/// `D3DSWAPEFFECT_DISCARD` without compatibility preservation: its contents
+/// are undefined after `Present`, so its first pass has nothing to load.
+/// Under `FLIP` and `COPY` the back
 /// buffer's contents are defined after `Present`, and every other colour
 /// target keeps its contents across `Present` in D3D9; a game may draw over
 /// last frame's pixels without clearing, so their first use loads. The depth
@@ -1451,26 +1452,27 @@ bitflags::bitflags! {
     }
 }
 
-/// What the back buffer holds when a frame starts, as the swap effect defines it.
+/// What the back buffer retains across `Present`, from the swap effect and compatibility policy.
 ///
 /// `D3DSWAPEFFECT_DISCARD` leaves the back buffer undefined after `Present`,
 /// which is what lets Rule A discard it on first use. `FLIP` and `COPY` define
 /// its contents after `Present`; the one back-buffer texture keeps the pixels
 /// the previous frame left, the closest match, so a game that redraws only
-/// part of the frame without clearing keeps the rest.
+/// part of the frame without clearing keeps the rest. The compatibility
+/// option extends that preservation to a discard-effect back buffer.
 #[derive(Clone, Copy)]
 pub enum BackbufferContents {
-    /// `D3DSWAPEFFECT_DISCARD`: undefined after `Present`.
+    /// `D3DSWAPEFFECT_DISCARD` without compatibility preservation: undefined after `Present`.
     Undefined,
-    /// `D3DSWAPEFFECT_FLIP` or `D3DSWAPEFFECT_COPY`: the pixels carry over.
+    /// The pixels carry over, from the swap effect or compatibility preservation.
     Preserved,
 }
 
 impl BackbufferContents {
-    /// The contents a swap chain created with `swap_effect` starts each frame with.
+    /// Resolve the swap effect and the opt-in preservation of discard-effect back buffers.
     #[must_use]
-    pub const fn from_swap_effect(swap_effect: u32) -> Self {
-        if swap_effect == D3DSWAPEFFECT_DISCARD {
+    pub const fn from_swap_effect(swap_effect: u32, preserve_discard: bool) -> Self {
+        if swap_effect == D3DSWAPEFFECT_DISCARD && !preserve_discard {
             Self::Undefined
         } else {
             Self::Preserved
@@ -1667,8 +1669,8 @@ pub struct PassState {
     /// Whether `backbuffer_texture` starts the frame undefined, seeded in `reset_frame`.
     ///
     /// Rule A discards the back buffer on first use only when it is
-    /// [`BackbufferContents::Undefined`], the discard swap effect; under `FLIP`
-    /// and `COPY` its first use loads, like any other colour target.
+    /// [`BackbufferContents::Undefined`], the discard swap effect without
+    /// compatibility preservation; otherwise its first use loads.
     backbuffer_contents: BackbufferContents,
     /// Fraction of the logical resolution the back buffer is rasterized at.
     ///
@@ -2206,8 +2208,8 @@ impl PassState {
 
     /// Whether `texture` is this frame's back buffer and the frame started it undefined.
     ///
-    /// True under the discard swap effect only: under `FLIP` and `COPY` the
-    /// back buffer keeps its contents into the next frame, like any other
+    /// True under the discard swap effect without compatibility preservation:
+    /// otherwise the back buffer keeps its contents into the next frame, like any other
     /// target. A multisampled back buffer is bound through its companion but
     /// keeps the resolve target as its identity, so the companion answers
     /// through the base handle too.
@@ -3459,9 +3461,8 @@ impl PassState {
     /// `DontCare` instead of `Load`. Saves the TBDR tile-fill cost on
     /// passes that will fully overwrite undefined contents anyway. On the
     /// colour side only the back buffer's contents are undefined at the
-    /// start of a frame, and only under the discard swap effect; any other
-    /// colour target still holds what the previous frame left in it, so it
-    /// loads.
+    /// start of a frame, and only under the discard swap effect without
+    /// compatibility preservation; every other colour target loads.
     ///
     /// A pass that leaves render target 0 out ([`CurrentAttachmentFlags::RT0_DROPPED`])
     /// first lands a pending colour clear in a colour-only pass of its own,
@@ -3535,7 +3536,7 @@ impl PassState {
         // first-use predicate is evaluated per attachment. Only the back
         // buffer qualifies, and only when `Present` under the discard swap
         // effect left it undefined; every other target, and the back buffer
-        // under `FLIP` or `COPY`, keeps its contents into the next frame.
+        // under `FLIP`, `COPY` or compatibility preservation, keeps its contents.
         let backbuffer = self.backbuffer_texture;
         let backbuffer_undefined =
             matches!(self.backbuffer_contents, BackbufferContents::Undefined);
@@ -6052,7 +6053,8 @@ impl PassState {
     /// A read that happens between two passes of the same submission is
     /// covered by [`Self::note_msaa_read`] instead.
     ///
-    /// On a presenting submit (`presenting`) under the discard swap effect,
+    /// On a presenting submit (`presenting`) under the discard swap effect
+    /// without compatibility preservation,
     /// the back buffer's resolving pass also drops its multisampled samples
     /// (store `DontCare`, so the descriptor carries `MultisampleResolve`).
     /// D3D9 allows a multisampled back buffer only with

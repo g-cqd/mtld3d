@@ -69,9 +69,9 @@ use mtld3d_types::{
     D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DFOG_LINEAR,
     D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_TEXTURE,
     D3DTOP_ADD, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_MODULATE,
-    D3DTOP_MODULATE2X, D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
-    texture_stage_state_defaults,
+    D3DTOP_MODULATE2X, D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG0,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_COLORARG0, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, texture_stage_state_defaults,
 };
 
 /// Wall time a measurement runs for at least when `--iters` is not given.
@@ -985,9 +985,11 @@ fn ps_key(cascade: &[[u32; 6]], specular_add: bool) -> FfPsKey {
             && [color_arg1, color_arg2, alpha_arg1, alpha_arg2].contains(&D3DTA_TEXTURE);
         FfStage {
             color_op: narrow(color_op),
+            color_arg0: narrow(state(D3DTSS_COLORARG0)),
             color_arg1: narrow(color_arg1),
             color_arg2: narrow(color_arg2),
             alpha_op: narrow(alpha_op),
+            alpha_arg0: narrow(state(D3DTSS_ALPHAARG0)),
             alpha_arg1: narrow(alpha_arg1),
             alpha_arg2: narrow(alpha_arg2),
             flags: if textured {

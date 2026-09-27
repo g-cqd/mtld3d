@@ -28,6 +28,17 @@ struct IUnknownHeadVtbl {
     release: unsafe extern "system" fn(*mut c_void) -> u32,
 }
 
+/// Releases one owned COM reference without assuming a resource interface.
+///
+/// # Safety
+/// `pointer` must own a live COM reference whose vtable begins with `IUnknown`.
+pub unsafe fn release_unknown(pointer: *mut c_void) {
+    // SAFETY: the caller guarantees the standard three-slot COM prefix.
+    let vtable = unsafe { deref_vtbl::<IUnknownHeadVtbl>(pointer) };
+    // SAFETY: the pointer owns the reference consumed by Release.
+    unsafe { (vtable.release)(pointer) };
+}
+
 // ── Private data ──
 
 /// `SetPrivateData(guid, blob, len, 0)` through a resource's own thunk.

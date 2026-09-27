@@ -1488,7 +1488,7 @@ impl DeviceInner {
     /// `flush_current_frame_blocking`. A pending `PresentationInterval` change
     /// is not put here but on the frame `stamp_and_swap` hands to the encoder,
     /// so it rides the next submission rather than the one after it.
-    pub const fn fresh_frame(&self) -> FrameData {
+    pub fn fresh_frame(&self) -> FrameData {
         FrameData::new(&FrameInit {
             device_handle: self.device_handle,
             record_handle: self.record_handle,
@@ -1508,6 +1508,7 @@ impl DeviceInner {
             render_scale: self.render_scale,
             backbuffer_contents: BackbufferContents::from_swap_effect(
                 self.present_params.swap_effect,
+                self.config.preserve_discard_backbuffer,
             ),
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
@@ -1951,6 +1952,10 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
+        self.present_image(None)
+    }
+
+    fn present_image(&mut self, texture: Option<MetalHandle<MTLTextureKind>>) -> i32 {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
@@ -1968,7 +1973,10 @@ impl DeviceInner {
         }
         self.apply_upload_answers();
         let new_frame = self.fresh_frame();
-        let (frame, seq) = self.stamp_and_swap(new_frame, false);
+        let (mut frame, seq) = self.stamp_and_swap(new_frame, false);
+        if let Some(texture) = texture {
+            frame.set_present_texture(texture);
+        }
 
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
@@ -4110,6 +4118,9 @@ extern "system" fn device_create_additional_swap_chain(
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     null_out(swap_chain);
+    if swap_chain.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
     // SAFETY: vtable in/out-param; `present_params` is *mut D3DPRESENT_PARAMETERS
     // per the IDirect3DDevice9 ABI — read for the request, written back with the
     // resolved dimensions/count.
@@ -4159,6 +4170,15 @@ extern "system" fn device_create_additional_swap_chain(
     // SAFETY: `sc_ptr` is a freshly created, live additional swapchain at
     // refcount 1.
     unsafe { crate::com_ref::com_register_child(sc_ptr) };
+    // SAFETY: the registered chain has not been published and owns its create reference.
+    let result = unsafe { crate::swapchain::Direct3DSwapChain9::initialize_backbuffer(sc_ptr) };
+    if result < 0 {
+        // SAFETY: creation failed before publication; release the sole chain reference.
+        unsafe {
+            crate::com_ref::com_release::<crate::swapchain::Direct3DSwapChain9>(sc_ptr.cast())
+        };
+        return result;
+    }
     // SAFETY: vtable out-param; `swap_chain` is *mut *mut c_void per the ABI.
     unsafe { OutPtr::write_opt(swap_chain, sc_ptr.cast::<c_void>()) };
     D3D_OK
@@ -6264,6 +6284,42 @@ fn create_color_target_surface(
     // surface at refcount 1.
     unsafe { crate::com_ref::com_register_child(surf_ptr) };
     Some(surf_ptr)
+}
+
+/// Allocates an additional chain's color storage with the render-target validation path.
+///
+/// # Errors
+/// Returns the creation HRESULT when the format, sample count, or allocation is rejected.
+pub fn create_swapchain_backbuffer(
+    device: &Direct3DDevice9,
+    parameters: &D3DPRESENT_PARAMETERS,
+) -> Result<*mut Direct3DSurface9, i32> {
+    let mut surface = core::ptr::null_mut();
+    let status = device_create_render_target(
+        core::ptr::from_ref(device).cast_mut().cast(),
+        parameters.back_buffer_width,
+        parameters.back_buffer_height,
+        parameters.back_buffer_format,
+        parameters.multi_sample_type,
+        parameters.multi_sample_quality,
+        i32::from(parameters.flags & mtld3d_types::D3DPRESENTFLAG_LOCKABLE_BACKBUFFER != 0),
+        &raw mut surface,
+        core::ptr::null_mut(),
+    );
+    if status < 0 {
+        Err(status)
+    } else {
+        Ok(surface.cast())
+    }
+}
+
+/// Presents an additional chain's color storage without changing the main back buffer.
+pub fn present_swapchain_backbuffer(device: &Direct3DDevice9, surface: &Direct3DSurface9) -> i32 {
+    if device.inner().needs_reset() {
+        return mtld3d_types::D3DERR_DEVICENOTRESET;
+    }
+    // SAFETY: the API lock serializes this call and the chain keeps its device live.
+    unsafe { &mut *device.inner_ptr() }.present_image(Some(surface.metal_color_handle()))
 }
 
 extern "system" fn device_create_render_target(
