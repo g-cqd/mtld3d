@@ -30,10 +30,8 @@
 use std::ops::DerefMut;
 #[cfg(perf_tracking)]
 use std::{
-    cell::RefCell,
     fmt::{Display, Write as _},
-    rc::Rc,
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
 };
 
 #[cfg(perf_tracking)]
@@ -433,11 +431,13 @@ pub enum OpSubDetail {
 /// Counter storage retained by the device and every enabled API timer.
 ///
 /// The device may be destroyed inside a nested Release. The last timer
-/// owns the counters until its writeback finishes. Access stays under the
-/// device's API lock, and borrows never span nested entry points.
+/// owns the counters until its writeback finishes. A game may enter the API
+/// from several threads, so the counters sit behind a mutex that is held only
+/// for one update and never across a nested entry point. Timing attributed to
+/// nested calls from different threads is approximate; memory safety is not.
 pub struct ApiPerfStorage {
     #[cfg(perf_tracking)]
-    state: Rc<RefCell<ApiPerfState>>,
+    state: Arc<Mutex<ApiPerfState>>,
     #[cfg(not(perf_tracking))]
     state: ApiPerfState,
 }
@@ -453,7 +453,7 @@ impl ApiPerfStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Rc::new(RefCell::new(ApiPerfState::new())),
+            state: Arc::new(Mutex::new(ApiPerfState::new())),
         }
     }
 
@@ -465,11 +465,11 @@ impl ApiPerfStorage {
         }
     }
 
-    /// Borrow counters only for the update, never across a nested API call.
+    /// Lock counters only for the update, never across a nested API call.
     pub fn state_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
         #[cfg(perf_tracking)]
         {
-            self.state.borrow_mut()
+            lock_state(&self.state)
         }
         #[cfg(not(perf_tracking))]
         {
@@ -480,13 +480,20 @@ impl ApiPerfStorage {
     /// Stable backing for subtimers nested inside an owning API timer.
     #[cfg(perf_tracking)]
     pub fn as_ptr(&mut self) -> *mut ApiPerfState {
-        self.state.as_ptr()
+        let mut guard = lock_state(&self.state);
+        &raw mut *guard
     }
 
     #[cfg(not(perf_tracking))]
     pub const fn as_ptr(&mut self) -> *mut ApiPerfState {
         core::ptr::null_mut()
     }
+}
+
+/// Lock the counters; a poisoned lock still holds consistent plain counters.
+#[cfg(perf_tracking)]
+fn lock_state(state: &Mutex<ApiPerfState>) -> MutexGuard<'_, ApiPerfState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// RAII guard that measures TSC cycles spent inside a D3D9 COM vtable entry point.
@@ -509,7 +516,7 @@ impl ApiPerfStorage {
 #[cfg(perf_tracking)]
 pub struct ApiTimer {
     start: u64,
-    state: Option<Rc<RefCell<ApiPerfState>>>,
+    state: Option<Arc<Mutex<ApiPerfState>>>,
     category: ApiCategory,
     /// Set on `Device`-category timers built via `start_device`.
     ///
@@ -551,11 +558,11 @@ impl ApiTimer {
     /// (returns 0) when disabled.
     #[cfg(perf_tracking)]
     #[inline]
-    fn enter_scope(state: Option<&Rc<RefCell<ApiPerfState>>>) -> u64 {
+    fn enter_scope(state: Option<&Arc<Mutex<ApiPerfState>>>) -> u64 {
         let Some(state) = state else {
             return 0;
         };
-        let mut perf = state.borrow_mut();
+        let mut perf = lock_state(state);
         let saved = perf.active_child_cycles;
         perf.active_child_cycles = 0;
         perf.timer_depth = perf.timer_depth.saturating_add(1);
@@ -570,7 +577,7 @@ impl ApiTimer {
 
     #[cfg(perf_tracking)]
     fn new(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
-        let state = storage.map(|s| Rc::clone(&s.state));
+        let state = storage.map(|s| Arc::clone(&s.state));
         let saved_child_cycles = Self::enter_scope(state.as_ref());
         let start = if state.is_some() { rdtsc() } else { 0 };
         Self {
@@ -691,7 +698,7 @@ impl Drop for ApiTimer {
             return;
         };
         let elapsed = rdtsc() - self.start;
-        let mut perf = state.borrow_mut();
+        let mut perf = lock_state(state);
         // Exclusive (self) time: subtract the cycles consumed by nested
         // timers (delegated D3D9 entry points) so their interval lands
         // in their own bucket, not double-counted into ours too. Then

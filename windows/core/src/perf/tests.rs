@@ -1340,17 +1340,17 @@ fn exclusive_exit_saturates_when_children_exceed_elapsed() {
 #[test]
 fn api_timer_storage_outlives_nested_device_release() {
     let mut storage = ApiPerfStorage::new();
-    let weak = Rc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.state);
     let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture);
     let inner = ApiTimer::new(Some(&storage), ApiCategory::Device);
     storage.state_mut().bump_texture_rename();
-    assert_eq!(storage.state.borrow().timer_depth, 2);
+    assert_eq!(storage.state.lock().unwrap().timer_depth, 2);
     drop(storage);
     assert_eq!(weak.strong_count(), 2);
     drop(inner);
     {
         let retained = weak.upgrade().expect("outer timer owns the state");
-        let state = retained.borrow();
+        let state = retained.lock().unwrap();
         assert_eq!(state.timer_depth, 1);
         assert_eq!(state.counters.texture_renames, 1);
         assert_eq!(
@@ -1365,7 +1365,7 @@ fn api_timer_storage_outlives_nested_device_release() {
 #[test]
 fn api_timer_storage_outlives_direct_device_release() {
     let storage = ApiPerfStorage::new();
-    let weak = Rc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.state);
     let timer = ApiTimer::new(Some(&storage), ApiCategory::Device);
     drop(storage);
     assert_eq!(weak.strong_count(), 1);
@@ -1380,7 +1380,7 @@ fn api_timer_nested_writeback_balances_depth_and_counts() {
     let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
     drop(inner);
     drop(outer);
-    let state = storage.state.borrow();
+    let state = storage.state.lock().unwrap();
     assert_eq!(state.timer_depth, 0);
     assert_eq!(state.active_child_cycles, 0);
     assert_eq!(
@@ -1398,9 +1398,9 @@ fn api_timer_disabled_does_not_retain_storage() {
     // Unit tests install no logger, so the runtime gate remains disabled.
     assert!(!perf_enabled());
     let storage = ApiPerfStorage::new();
-    let weak = Rc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.state);
     let timer = ApiTimer::start_device(Some(&storage), DeviceSubCategory::Misc);
-    assert_eq!(storage.state.borrow().timer_depth, 0);
+    assert_eq!(storage.state.lock().unwrap().timer_depth, 0);
     assert_eq!(weak.strong_count(), 1);
     drop(storage);
     assert!(weak.upgrade().is_none());
@@ -1410,7 +1410,7 @@ fn api_timer_disabled_does_not_retain_storage() {
 #[test]
 fn api_perf_storage_without_timers_is_reclaimed() {
     let storage = ApiPerfStorage::new();
-    let weak = Rc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.state);
     drop(storage);
     assert!(weak.upgrade().is_none());
 }
@@ -1648,4 +1648,35 @@ fn sections_above_keys_keep_the_rest_from_the_sampled_draws() {
     assert_eq!(w.draw_snapshot_keys_resid_sum(), 32_000);
     let grid = Summary::render_with_ansi(&w, &sample_caches(), 2.0, false);
     assert!(grid.contains("└─ rest"), "the rest row renders: {grid}");
+}
+
+/// Games call D3D from several threads at once; the shared counters must stay sound and balanced.
+#[test]
+fn api_timers_from_many_threads_stay_balanced_without_panicking() {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 20_000;
+    let storage = ApiPerfStorage::new();
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..ITERATIONS {
+                    let outer = ApiTimer::new(Some(&storage), ApiCategory::Device);
+                    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+                    drop(inner);
+                    drop(outer);
+                }
+            });
+        }
+    });
+    let state = storage.state.lock().unwrap();
+    assert_eq!(state.timer_depth, 0);
+    let total = u32::try_from(THREADS * ITERATIONS).unwrap();
+    assert_eq!(
+        state.counters.api_call_counts_by_category[ApiCategory::Device as usize],
+        total
+    );
+    assert_eq!(
+        state.counters.api_call_counts_by_category[ApiCategory::Texture as usize],
+        total
+    );
 }
