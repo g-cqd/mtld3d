@@ -60,9 +60,10 @@ use mtld3d_core::{
         VsSamplerKinds,
     },
     shader_cache::{
-        CACHE_FORMAT_VERSION, CacheEntry, CachedKind, SHADER_CACHE_SCHEMA_VERSION,
-        SHADER_EMITTER_VERSION, ShaderSource, read_header, read_records,
+        CACHE_FORMAT_VERSION, CacheEntry, SHADER_CACHE_SCHEMA_VERSION, SHADER_EMITTER_VERSION,
+        ShaderSource, read_header, read_records,
     },
+    shader_key::CachedKind,
 };
 use mtld3d_types::{
     D3DCMP_GREATEREQUAL, D3DDECLUSAGE_BLENDINDICES, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_FOG,
@@ -849,6 +850,7 @@ fn vs_key(shape: &VsShape) -> FfVsKey {
         tex
     };
     let mut key = FfVsKey {
+        reserved: 0,
         flags,
         input_tex_coord_count: sets,
         tex_coord_count: tex,

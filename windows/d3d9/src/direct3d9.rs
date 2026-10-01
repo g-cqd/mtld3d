@@ -8,7 +8,10 @@ use log::{error, info, trace, warn};
 use mtld3d_core::{
     caps,
     config::{CursorScale, Mtld3dConfig},
-    display_mode::{MAX_SERVED_SIZES, ModeRequest, select_mode_sizes, served_mode_sizes},
+    display_mode::{
+        MAX_SERVED_SIZES, ModeRequest, drop_unscalable_sizes, physical_extent, select_mode_sizes,
+        served_mode_sizes,
+    },
     format_probe::FormatProbeKey,
     multisample,
     passes::BackbufferContents,
@@ -135,8 +138,9 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
 struct AdapterModes {
     /// Every size a fullscreen request may set, desktop first.
     ///
-    /// Win32's list under [`select_mode_sizes`]' filters, the set user32
-    /// accepts a mode-set for.
+    /// Win32's list under [`select_mode_sizes`]' filters, less the sizes
+    /// [`drop_unscalable_sizes`] leaves out: a subset of what user32 accepts
+    /// a mode-set for.
     settable: Vec<(u32, u32)>,
     /// The sizes games enumerate: the settable ones bounded to [`MAX_SERVED_SIZES`].
     ///
@@ -172,7 +176,6 @@ fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
         .filter(|&hz| hz > 0)
         .unwrap_or(60);
     let host_bpp = host.map(|mode| mode.bits_per_pel);
-    let host_aspect = f64::from(host_w) / f64::from(host_h);
 
     // Win32 lists every size once per colour depth; the desktop's depth is
     // the one a game gets, so the others only repeat sizes.
@@ -181,8 +184,26 @@ fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
         .iter()
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
         .map(|mode| (mode.width, mode.height));
-    let settable = select_mode_sizes((host_w, host_h), candidates, legacy_4_by_3);
-    let sizes = served_mode_sizes(&settable, MAX_SERVED_SIZES, legacy_4_by_3);
+    let physical = physical_extent((host_w, host_h), candidates.clone());
+    let mut settable = select_mode_sizes((host_w, host_h), candidates);
+    // After a mode-set win32u rescales the monitor by a ratio whose terms it
+    // packs into 16 bits each, and some Wine builds abort the process when a
+    // term does not fit. Those builds cannot be told apart from here, so the
+    // sizes are left out on every Wine: a fullscreen request for one follows
+    // the window rather than setting the mode.
+    let dpi = crate::fullscreen::system_dpi();
+    let unscalable = drop_unscalable_sizes(&mut settable, physical, dpi);
+    if !unscalable.is_empty() {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "adapter modes: {} sizes left out, win32u cannot represent the scale from them onto \
+             the {}x{} display at {dpi} dpi in 16 bits: {unscalable:?}",
+            unscalable.len(),
+            physical.0,
+            physical.1
+        );
+    }
+    let sizes = served_mode_sizes(&settable, physical, MAX_SERVED_SIZES, legacy_4_by_3);
     if enumerated.is_empty() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -205,8 +226,11 @@ fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
 
     info!(
         target: LOG_TARGET,
-        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz aspect={host_aspect:.3}; {} sizes \
-         settable of {} enumerated modes, {} served ({} entries), legacy4By3={legacy_4_by_3}",
+        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz on a {}x{} display; {} sizes \
+         settable of {} enumerated modes, {} served ({} entries), \
+         legacy4By3={legacy_4_by_3}: {sizes:?}",
+        physical.0,
+        physical.1,
         settable.len(),
         enumerated.len(),
         sizes.len(),
@@ -266,9 +290,9 @@ pub struct Direct3D9 {
 
 /// What an `IDirect3D9` owns: the configuration it resolved at `Direct3DCreate9`.
 ///
-/// Shared with every device the interface creates and with the threads a
-/// device spawns, so it is reference counted rather than borrowed from the
-/// interface, whose `Release` can come before those threads exit.
+/// Shared with every device the interface creates, so it is reference
+/// counted rather than borrowed from the interface, whose `Release` can come
+/// before a device's.
 pub struct Direct3D9Inner {
     config: Arc<Mtld3dConfig>,
 }
@@ -1286,12 +1310,15 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// `true` when `width`x`height` belongs to the adapter's settable mode list.
+/// `true` when `width`x`height` is a mode a fullscreen device may set.
 ///
 /// The membership test behind the fullscreen honor-or-follow split in
 /// [`resolve_backbuffer_dims`]. Answered against every settable size, not
 /// only the bounded list games enumerate: a game's own config may name a
-/// mode its menu no longer lists, and user32 accepts it all the same.
+/// mode its menu no longer lists, and user32 accepts it all the same. The
+/// sizes [`drop_unscalable_sizes`] leaves out answer `false` although user32
+/// lists them: `CrossOver` 27's win32u would abort the process on a mode-set
+/// to one.
 pub fn is_settable_mode(width: u32, height: u32) -> bool {
     adapter_modes().settable.contains(&(width, height))
 }
@@ -1306,13 +1333,19 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 ///   viewports, scissors and mouse coordinates all live in one space; the
 ///   display keeps its own size and present resolves the difference at the
 ///   drawable (`MetalFX` when enlarging), the same resample `render.scale`
-///   rides. When user32 refused the mode-set the request still stands under
-///   a monitor-sized client rect, which the log line below records. A
+///   rides. The request still stands in the two cases where the client rect
+///   reads another size: user32 refused the mode-set and the window covers
+///   the monitor, or the window is DPI-unaware on a desktop whose system DPI
+///   is not 96 and user32 answers its client rect scaled. The info line below
+///   reports the two sizes, and `warn_if_dpi_scaled` names the second case. A
 ///   request that is *not* a settable mode is one native would reject
 ///   outright, so no game can depend on it being honored; such games carry
 ///   their window size into the request and size their rendering and input
 ///   from the window, so the client rect wins there, the lenient answer that
-///   keeps the window, back buffer and mouse in one space.
+///   keeps the window, back buffer and mouse in one space. The same holds
+///   for a size user32 lists but the mode table leaves out because
+///   `CrossOver` 27's win32u would abort on it: the device sets no mode and
+///   the back buffer follows the window.
 /// - **Maximized window**: the window manager sizes the window, not the game,
 ///   so the client area wins and the requested resolution is ignored;
 ///   `render.scale` is the resolution control in that mode.
@@ -1325,22 +1358,26 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 /// dimension still zero afterwards is rejected by the caller.
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
     if pp.windowed == 0 {
+        crate::fullscreen::warn_if_dpi_scaled(hwnd as *mut c_void);
         // Callers reject a zero-dimension fullscreen request before the window
         // moves, so the request is always concrete here.
         let client = client_rect_dims(hwnd as *mut c_void);
         if is_settable_mode(pp.back_buffer_width, pp.back_buffer_height) {
-            // With the mode set the client rect is the request; this line
-            // only fires for the fallback where user32 refused the mode, and
-            // is the breadcrumb tying an upscaled frame with monitor-space
-            // mouse input back to the size the game asked for. A client rect
-            // that cannot be read only costs the line.
+            // With the mode set the client rect is the request. It reads
+            // otherwise when user32 refused the mode and the window covers
+            // the monitor, and when the window is DPI-unaware on a desktop
+            // whose system DPI is not 96, where user32 answers a scaled
+            // client rect. The line reports both sizes, which ties mouse
+            // input in the client rect's space back to the size the game
+            // asked for. A client rect that cannot be read only costs the
+            // line.
             if let Some((client_w, client_h)) = client
                 && (pp.back_buffer_width != client_w || pp.back_buffer_height != client_h)
             {
                 mtld3d_shared::log_once_info!(
                     target: LOG_TARGET,
-                    "fullscreen device: honoring the requested {}x{} back buffer without a \
-                     mode-set; the window covers the monitor ({}x{}) and present scales the frame",
+                    "fullscreen device: honoring the requested {}x{} back buffer although the \
+                     window's client area reads {}x{}",
                     pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
                 );
             }
@@ -1352,8 +1389,9 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
         if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "fullscreen device: requested {}x{} is no display mode user32 accepts, so the \
-                 back buffer follows the window ({}x{}) instead",
+                "fullscreen device: requested {}x{} is no settable display mode (user32 does not \
+                 list it, or CrossOver 27's win32u would abort on it), so the back buffer \
+                 follows the window ({}x{}) instead",
                 pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
             );
         }
@@ -1394,7 +1432,9 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
-    crate::USED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !crate::USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::pin_image();
+    }
 
     if adapter != 0 || device.is_null() {
         return D3DERR_INVALIDCALL;
@@ -1605,9 +1645,26 @@ extern "system" fn d3d9_create_device(
         render_states[mtld3d_types::D3DRS_ZENABLE as usize] = 0;
     }
 
+    let encoder = match spawn_native_encoder(&cq_params, cfg) {
+        Ok(encoder) => encoder,
+        Err(result) => {
+            if !depth_handle.is_null() {
+                let handles = [depth_handle.raw()];
+                let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                    kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                    pad0: 0,
+                    handles_ptr: handles.as_ptr() as u64,
+                    count: 1,
+                    pad1: 0,
+                };
+                unix_call(&mut destroy);
+            }
+            destroy_partial_device(&cq_params, layer_params.view_handle, Some(&bb_params));
+            restore_from_fullscreen(fullscreen.as_ref());
+            return result;
+        }
+    };
     addref_parent_direct3d9(this);
-    spawn_tsc_warmup();
-    let (encoder, prewarm) = spawn_encoder_and_prewarm(&cq_params, cfg);
 
     let dev = Direct3DDevice9::new(crate::device::DeviceCreateInfo {
         device_handle: cq_params.device_handle,
@@ -1630,7 +1687,6 @@ extern "system" fn d3d9_create_device(
         backbuffer_height: pp.back_buffer_height,
         render_scale,
         encoder,
-        prewarm,
         current_frame: FrameData::new(&FrameInit {
             device_handle: cq_params.device_handle,
             record_handle: cq_params.record_handle,
@@ -1780,51 +1836,19 @@ fn addref_parent_direct3d9(this: *mut c_void) {
     }
 }
 
-/// Warm the TSC calibration in the background.
-///
-/// The encoder thread's first 2-second-window check then finds a ready
-/// `tsc_hz()` value instead of paying the 50 ms calibration sleep itself.
-/// Deliberately not spawned from `DllMain` or `Direct3DCreate9`: mod /
-/// launcher DLLs commonly probe-call `Direct3DCreate9` early enough that the
-/// spawned thread's stdlib thread-entry (TLS, `env_logger` lazy init) still
-/// races the host process's own init and can blow a 2 MB Wine stack or fault
-/// with a corrupt TEB. `CreateDevice` runs past all of that.
-/// `tsc_hz()` is internally latched by a `OnceLock`, so a second
-/// `CreateDevice` call just returns the cached value.
-fn spawn_tsc_warmup() {
-    let _ = std::thread::Builder::new()
-        .name("mtld3d-tsc-warmup".into())
-        .spawn(|| {
-            let _ = mtld3d_shared::tsc::tsc_hz();
-        });
-}
-
-/// Spawn the encoder thread plus the shader-cache pre-warm thread.
-///
-/// Reads `<host-exe-dir>/mtld3d_shaders.bin`, compiles every cached MSL
-/// via the existing `CompileShaderLibrary` thunk, and ships the
-/// `MTLLibrary` handles to the encoder over the dedicated prewarm
-/// channel. The encoder blocks on that channel before draining its first
-/// `EncoderMessage`, so live miss-compiles can never race the prewarm.
-/// Cold launch (no file) sends an empty payload — that's still the
-/// "cache file is fresh, you may start writing" signal the encoder needs
-/// to flip `cache_ready`.
-fn spawn_encoder_and_prewarm(
+/// Create native encoder, submit, compile and shader-cache prewarm workers.
+fn spawn_native_encoder(
     cq: &CreateCommandQueueParams,
     cfg: &Arc<Mtld3dConfig>,
-) -> (EncoderThread, mtld3d_core::shader_prewarm::PrewarmHandle) {
-    // The only place the snapshot is built: the `intel.*` overrides fold in
-    // here so the encoder and `DeviceInner::gpu_caps()` see one answer.
+) -> Result<EncoderThread, i32> {
+    // Resolve overrides once so both runtime sides use identical GPU capabilities.
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
         unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
         device_caps: device_caps_flags(),
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
-    let (prewarm, prewarm_rx) =
-        crate::shader_prewarm::spawn(cq.device_handle, cfg.shader_cache_enable);
-    let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg), prewarm_rx);
-    (encoder, prewarm)
+    EncoderThread::spawn(cq.device_handle, cq.record_handle, gpu_caps, cfg)
 }
 
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.

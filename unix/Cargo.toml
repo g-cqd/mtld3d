@@ -17,6 +17,7 @@ homepage = "https://github.com/athei/mtld3d"
 [workspace.dependencies]
 bitflags = "2"
 block2 = "0.6"
+cc = "1"
 mtld3d-shared = { path = "shared" }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 libc = "0.2"
@@ -54,6 +55,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-foundation = { version = "0.3", features = [
+    "NSException",
     "NSString",
     "NSURL",
     "NSProcessInfo",
@@ -85,6 +87,9 @@ objc2-metal = { version = "0.3", features = [
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
 rustc-hash = "2"
+# The global allocator of the native dylib, the same pinned revision and `build_cc`
+# configuration the PE side ships (windows/Cargo.toml).
+snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f94f3ec1c10c0a29f910e17c1f30978", features = ["build_cc"] }
 strum = { version = "0.28", default-features = false }
 
 [profile.dev]
@@ -111,6 +116,31 @@ debug = 1
 # back off below.
 debug-assertions = true
 overflow-checks = true
+
+# snmalloc-sys 0.7's build.rs reads cargo's `DEBUG` env var (set when the
+# package's debuginfo is enabled) and then compiles its C++ with `-g` and
+# reports a `Debug` build. Keep it a release build of the allocator in every
+# profile, as windows/Cargo.toml does, since dev defaults to `debug = 2`.
+# `NDEBUG` is not this override's job: production gets it for every C and C++
+# object from the Makefile (docs/CONVENTIONS.md, "Production carries no debug
+# assertions"), and `release` keeps snmalloc's checks with the rest.
+[profile.release.package.snmalloc-sys]
+debug = 0
+
+[profile.dev.package.snmalloc-sys]
+debug = 0
+
+# zstd-sys's C objects would otherwise carry `-g` for the same reason. Under
+# LTO rustc links the dylib against a filtered copy of each rlib in a temporary
+# directory it deletes after the link, so the debug map names those objects by
+# a path that no longer exists: `dsymutil` warns once per object and gathers no
+# DWARF from them. Building them without debug info leaves nothing to point at.
+# dev gets the same override so the two profiles agree, as for snmalloc-sys.
+[profile.release.package.zstd-sys]
+debug = 0
+
+[profile.dev.package.zstd-sys]
+debug = 0
 
 # Shipped builds — fat cross-crate LTO + a single codegen unit so the
 # linker can inline and DCE across the whole dylib. Inherits panic, debug,

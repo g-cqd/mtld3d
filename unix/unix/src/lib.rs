@@ -4,10 +4,15 @@ use mtld3d_shared::Thunks;
 use strum::{EnumCount, VariantArray};
 
 mod crash;
+mod draw;
+mod encoder;
+mod encoder_service;
 mod handlers;
 mod log_file;
 mod main_thread_checker;
 mod metal;
+mod shader_prewarm;
+mod shader_programs;
 
 /// `log` target used by every call inside this crate.
 ///
@@ -27,6 +32,19 @@ pub static __wine_unix_call_wow64_funcs: [UnixCallFn; Thunks::COUNT] = DISPATCH_
 type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
+
+/// Every native Rust allocation goes through snmalloc, the allocator the PE side uses.
+///
+/// Process-wide resource: a dylib has one global allocator. The native encoder,
+/// submit and worker threads allocate and free per packet, and the default
+/// macOS allocator cost the encoder about 5.5 us per packet more than snmalloc
+/// in a matched streaming measurement. Only Rust's allocation calls change:
+/// snmalloc exports `sn_rust_*` entry points, not `malloc` or `free`, so memory
+/// Objective-C or C allocate is still freed by them, and no buffer this crate
+/// hands to Metal is freed by Metal (`bytesNoCopy` wrappers carry no
+/// deallocator).
+#[global_allocator]
+static ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 /// Wrap a handler in an `@autoreleasepool` so every dispatch call drains on return.
 ///
@@ -52,41 +70,27 @@ macro_rules! arp {
 
 const fn dispatch(code: Thunks) -> UnixCallFn {
     match code {
+        Thunks::CreateShaderProgram => arp!(shader_programs::create_handler),
+        Thunks::CancelShaderProgram => arp!(shader_programs::cancel_handler),
+        Thunks::SubmitEncoderFrame => arp!(encoder_service::submit_handler),
+        Thunks::EncoderControl => arp!(encoder_service::control_handler),
+        Thunks::CreateEncoder => arp!(encoder_service::create_handler),
+        Thunks::DestroyEncoder => arp!(encoder_service::destroy_handler),
         Thunks::InitLogger => arp!(handlers::init_logger_handler),
         Thunks::GetDeviceInfo => arp!(handlers::get_device_info_handler),
         Thunks::CreateCommandQueue => arp!(handlers::create_command_queue_handler),
         Thunks::AttachMetalLayer => arp!(handlers::attach_metal_layer_handler),
         Thunks::DestroyCommandQueue => arp!(handlers::destroy_command_queue_handler),
         Thunks::CreateBackbuffer => arp!(handlers::create_backbuffer_handler),
-        Thunks::CreateRenderPipeline => arp!(handlers::create_render_pipeline_handler),
-        Thunks::SubmitFrame => arp!(handlers::submit_frame_handler),
         Thunks::CreateDepthTexture => arp!(handlers::create_depth_texture_handler),
         Thunks::CreateColorTarget => arp!(handlers::create_color_target_handler),
-        Thunks::CreateDepthStencilState => arp!(handlers::create_depth_stencil_state_handler),
-        Thunks::CreateTexturesBatch => arp!(handlers::create_textures_batch_handler),
-        Thunks::CreateSamplerState => arp!(handlers::create_sampler_state_handler),
-        Thunks::CompileShaderLibrary => arp!(handlers::compile_shader_library_handler),
-        Thunks::CreateBuffersBatch => arp!(handlers::create_buffers_batch_handler),
         Thunks::BlitTextureToBuffer => arp!(handlers::blit_texture_to_buffer_handler),
-        Thunks::SetDisplaySyncEnabled => arp!(handlers::set_display_sync_enabled_handler),
         Thunks::DestroyResourcesBulk => arp!(handlers::destroy_resources_bulk_handler),
-        Thunks::WaitForGpuRetire => arp!(handlers::wait_for_gpu_retire_handler),
-        Thunks::StartGpuCapture => arp!(handlers::start_gpu_capture_handler),
-        Thunks::StopGpuCapture => arp!(handlers::stop_gpu_capture_handler),
-        Thunks::EnsureClearQuadPipeline => arp!(handlers::ensure_clear_quad_pipeline_handler),
-        Thunks::CreateDepthTransferPipeline => {
-            arp!(handlers::create_depth_transfer_pipeline_handler)
-        }
-        Thunks::EnsureBlitPipeline => arp!(handlers::ensure_blit_pipeline_handler),
-        Thunks::CreateTextureSliceView => arp!(handlers::create_texture_slice_view_handler),
-        Thunks::GetTaskFaults => arp!(handlers::get_task_faults_handler),
         Thunks::WriteLog => arp!(handlers::write_log_handler),
         Thunks::OpenLog => arp!(handlers::open_log_handler),
         Thunks::SetCursorOverlay => arp!(handlers::set_cursor_overlay_handler),
-        Thunks::SetGammaRamp => arp!(handlers::set_gamma_ramp_handler),
         Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
         Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
-        Thunks::WaitForPresentIdle => arp!(handlers::wait_for_present_idle_handler),
     }
 }
 

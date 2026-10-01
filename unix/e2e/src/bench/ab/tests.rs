@@ -7,6 +7,7 @@ fn spec(stamp: &str) -> LegSpec {
         wine: PathBuf::from("/wine"),
         prefix: PathBuf::from("/prefix"),
         stamp: stamp.to_owned(),
+        config: None,
     }
 }
 
@@ -140,10 +141,32 @@ fn each_file_goes_to_the_benchmark_it_names() {
 fn the_run_directory_is_appended_as_the_last_log_dir() {
     let dir = Path::new("/ab/base/0");
     assert_eq!(
-        run_config("shaderCache.enable=false;log.dir=Z:/elsewhere", dir),
+        run_config(
+            "shaderCache.enable=false;log.dir=Z:/elsewhere",
+            &spec("v1"),
+            dir
+        ),
         "shaderCache.enable=false;log.dir=Z:/elsewhere;log.dir=Z:/ab/base/0"
     );
-    assert_eq!(run_config("", dir), "log.dir=Z:/ab/base/0");
+    assert_eq!(run_config("", &spec("v1"), dir), "log.dir=Z:/ab/base/0");
+}
+
+#[test]
+fn leg_config_replaces_shared_entries_and_keeps_the_run_log_directory() {
+    let dir = Path::new("/ab/cand/0");
+    let shared = "shaderCache.enable=false;shader.asyncCompile=false";
+    let mut leg = spec("v1");
+    assert_eq!(
+        run_config(shared, &leg, dir),
+        format!("{shared};log.dir=Z:/ab/cand/0")
+    );
+    leg.config = Some("shader.asyncCompile=true;log.dir=Z:/elsewhere".to_owned());
+    assert_eq!(
+        run_config(shared, &leg, dir),
+        "shader.asyncCompile=true;log.dir=Z:/elsewhere;log.dir=Z:/ab/cand/0"
+    );
+    leg.config = Some(String::new());
+    assert_eq!(run_config(shared, &leg, dir), "log.dir=Z:/ab/cand/0");
 }
 
 #[test]
@@ -183,6 +206,7 @@ fn fake_wine(tag: &str, version: &str, server: &str) -> LegSpec {
         wine,
         prefix: dir.join("prefix"),
         stamp: "v1".to_owned(),
+        config: None,
     }
 }
 
@@ -415,4 +439,176 @@ fn a_selection_notes_each_unmatched_filter_once_and_needs_something_to_compare()
         check_selection(&patterns(&["dynamic_buffer_churn", "host"]), &churn, true),
         Ok(Vec::new())
     );
+}
+
+#[test]
+fn benchmark_children_override_hostile_inherited_logging() {
+    for (pe, unix) in [
+        (Some("warn"), Some("off")),
+        (Some("off"), Some("mtld3d::perf=off")),
+        (None, Some("off")),
+        (Some("mtld3d=off"), None),
+    ] {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child.args([
+            "--exact",
+            "bench::ab::tests::benchmark_log_environment_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for (key, value) in [("RUST_LOG", pe), ("__CX_UNIX_RUST_LOG", unix)] {
+            if let Some(value) = value {
+                child.env(key, value);
+            } else {
+                child.env_remove(key);
+            }
+        }
+        let result = child.output().expect("run fixture with inherited filters");
+        assert!(
+            result.status.success(),
+            "{pe:?}/{unix:?}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+/// A separate test process owns the hostile environment, so parallel tests cannot race it.
+#[test]
+#[ignore = "spawned with inherited filters by the parent regression test"]
+fn benchmark_log_environment_fixture() {
+    let common = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("resolve primary checkout");
+    assert!(common.status.success());
+    let common = PathBuf::from(String::from_utf8(common.stdout).unwrap().trim());
+    let dir = common
+        .parent()
+        .expect("git directory parent")
+        .join(".codex/evidence/benchmark-log-environment/tests")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("logging.sh");
+    fs::write(
+        &script,
+        "printf '%s|%s: test\n' \"${RUST_LOG-unset}\" \"${__CX_UNIX_RUST_LOG-unset}\"\n",
+    )
+    .unwrap();
+    let expected_inherited = format!(
+        "{}|{}",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "unset".to_owned()),
+        std::env::var("__CX_UNIX_RUST_LOG").unwrap_or_else(|_| "unset".to_owned())
+    );
+    let timeout = Duration::from_secs(5);
+    let mut ordinary = WineLauncher::new(
+        Path::new("/bin/sh"),
+        &script,
+        Some(&dir),
+        timeout,
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    assert_eq!(ordinary.list().unwrap(), [expected_inherited]);
+    for name in ["base", "cand"] {
+        let mut leg = spec(name);
+        leg.wine = PathBuf::from("/bin/sh");
+        leg.prefix = dir.join(name);
+        for filter in ["info", SHAPE_RUST_LOG] {
+            let mut launcher = leg_launcher(&leg, &script, Some(&dir), timeout, filter).unwrap();
+            assert_eq!(launcher.list().unwrap(), [format!("{filter}|{filter}")]);
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_layout_comparison_runs_one_commit_in_two_layouts() {
+    let layouts = |base: (&str, &str), cand: (&str, &str)| Layouts {
+        base: compare::Layout {
+            runtime: base.0.to_owned(),
+            variant: base.1.to_owned(),
+        },
+        cand: compare::Layout {
+            runtime: cand.0.to_owned(),
+            variant: cand.1.to_owned(),
+        },
+    };
+    let sdk = fake_wine("layout-sdk", "wine-11.0", "server-a");
+    let arm64 = fake_wine("layout-arm64", "wine-10.0", "server-b");
+    let two_runtimes = layouts(("sdk", "x86_64"), ("arm64", "x86_64"));
+    let wine = check_layouts(&sdk, &arm64, &two_runtimes).unwrap();
+    assert!(
+        wine.starts_with("base wine-11.0 (") && wine.contains("cand wine-10.0 ("),
+        "{wine}"
+    );
+
+    let one_runtime = layouts(("arm64", "x86_64"), ("arm64", "arm64x"));
+    let reason = check_layouts(&sdk, &arm64, &one_runtime).unwrap_err();
+    assert!(reason.contains("different Wines"), "{reason}");
+
+    let same = layouts(("arm64", "x86_64"), ("arm64", "x86_64"));
+    let reason = check_layouts(&arm64, &arm64, &same).unwrap_err();
+    assert!(reason.contains("needs two"), "{reason}");
+
+    let mut other_commit = fake_wine("layout-other", "wine-10.0", "server-b");
+    other_commit.stamp = "v2".to_owned();
+    let reason = check_layouts(&arm64, &other_commit, &one_runtime).unwrap_err();
+    assert!(reason.contains("one commit"), "{reason}");
+
+    for spec in [sdk, arm64, other_commit] {
+        let _ = fs::remove_dir_all(spec.wine.parent().unwrap());
+    }
+}
+
+#[test]
+fn valid_perf_logs_and_external_timing_fallback_remain_accepted() {
+    let path = Path::new("/ab/cand/0/e2e-42.log");
+    for text in [
+        "",
+        "perf: no mtld3d::perf window\n",
+        "[INFO] perf-kv: frame_us=12\n",
+    ] {
+        assert!(check_measurement_log(path, text).is_ok());
+    }
+}
+
+#[test]
+fn invalid_calibration_rejects_metrics_even_when_reported_at_shutdown() {
+    let path = Path::new("/ab/cand/0/e2e-42.log");
+    for marker in [
+        "perf-invalid: calibration failed; rendering continues",
+        "perf-invalid: final reason=calibration incomplete, retained_samples=1, rejected_samples=0",
+    ] {
+        let text = format!("[INFO] perf-kv: frame_us=12\n[ERROR] {marker}\n");
+        let reason = check_measurement_log(path, &text).unwrap_err();
+        assert!(reason.contains("e2e-42.log:2:"), "{reason}");
+        assert!(reason.contains(marker), "{reason}");
+    }
+}
+
+#[test]
+fn round_scan_checks_child_and_retained_failed_process_logs() {
+    let dir = std::env::temp_dir().join(format!("mtld3d-bench-invalid-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let metrics = dir.join("bench-b.metrics");
+    fs::write(&metrics, "metric b frame.p50 1 ms lower time\n").unwrap();
+    for name in [
+        "e2e-42.log",
+        "bench-cold_start-child.log",
+        "e2e-43.layer-log",
+    ] {
+        let log = dir.join(name);
+        fs::write(
+            &log,
+            "[ERROR] perf-invalid: final reason=calibration incomplete\n",
+        )
+        .unwrap();
+        let reason = check_measurement_logs(&dir).unwrap_err();
+        assert!(reason.contains(name), "{reason}");
+        fs::remove_file(log).unwrap();
+    }
+    assert!(check_measurement_logs(&dir).is_ok());
+    fs::remove_dir_all(dir).unwrap();
 }

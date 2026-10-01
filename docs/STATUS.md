@@ -1,8 +1,8 @@
 # Status
 
 What mtld3d implements, what it does not yet, what it never will, and the
-divergences from D3D9 it keeps on purpose. The tested games are in the
-[README](../README.md#tested-games); the end-to-end suite's coverage is in
+divergences from D3D9 it keeps on purpose. The tested games are in
+[`GAMES.md`](GAMES.md); the end-to-end suite's coverage is in
 [`COVERAGE.md`](../windows/tests/COVERAGE.md).
 
 ## Direct3D 8
@@ -135,10 +135,14 @@ unless its entry says otherwise.
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
   single-level `D3DOK_NOAUTOGEN` fallback.
-- A 1x1 render target 0 left unwritten over a larger depth surface that
-  `render.scale` reduces keeps render target 0's 1x1 area, warned once. At
-  the identity scale such a pass takes the depth surface's extent, as D3D9
-  does.
+- A colour target smaller than its depth surface under `render.scale`: a
+  whole-surface depth or stencil `Clear` reaches the whole depth surface at
+  any scale, but two cases keep the colour target's extent, each warned
+  once. One is the draws through a 1x1 render target 0 left unwritten over a
+  depth surface that `render.scale` reduces; the other is a depth or stencil
+  `Clear` by rect or by viewport that reaches past the colour target while
+  either surface is scaled. At the identity scale both reach the depth
+  surface, as D3D9 does.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
@@ -181,7 +185,7 @@ unless its entry says otherwise.
   Apple GPU returns the target's contents from before the pass began rather
   than the pixels the pass has written. Depth has this handled: a draw that
   samples the bound depth attachment reads a snapshot copy
-  (`depth_snapshot_for_sampling` in `windows/d3d9/src/encoder.rs`). Colour
+  (`depth_snapshot_for_sampling` in `unix/unix/src/encoder.rs`). Colour
   has no equivalent. DXVK detects the bind and resolves it; it is not built
   here because no known title needs it.
 
@@ -191,7 +195,7 @@ unless its entry says otherwise.
   behind it. It maps a D3D9 device onto a D3D12 device, which has no
   counterpart here.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
-  README's [Fullscreen](../README.md#fullscreen) section.
+  [Fullscreen](../INSTALL.md#fullscreen) section of `INSTALL.md`.
 - Device loss: no exclusive mode is taken, so nothing is ever lost, and
   `TestCooperativeLevel` reports `D3D_OK` across focus changes.
 - Software paths: no reference rasterizer, no software vertex processing, no
@@ -223,7 +227,15 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
 - A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
-  `D3DLOCK_READONLY` returns a pointer an upload may still read. No knob.
+  `D3DLOCK_READONLY` returns a pointer an upload may still read. Under an
+  upload from an earlier frame, or one a GPU operation has seen, only two
+  writes land in place: this partial lock, and any write into a level the game
+  holds mapped by a lock or a device context. Every other CPU writer renames
+  the level's staging first. Under an upload of the frame being recorded that
+  no draw or other GPU operation has seen, it writes in place, which no draw
+  can tell apart. Writes into a render-target or depth texture
+  and read-backs from the GPU always rename when an upload still reads the
+  level. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.
@@ -231,6 +243,14 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- The adapter mode list leaves out every display size win32u cannot scale
+  the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
+  for one follows the window instead of setting the mode. The list describes
+  the primary display only and serves first the sizes that fill it (a bar
+  of less than one physical pixel once win32u has scaled them onto it), then
+  the standard sizes of another shape that user32 lists for it (2560x1440
+  down to 640x480), which win32u letterboxes in fullscreen, and nothing else
+  of user32's list. No knob.
 - A windowed device's `SetGammaRamp` is stored and reported back but changes
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.

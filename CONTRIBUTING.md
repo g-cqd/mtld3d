@@ -12,7 +12,9 @@ at it.
 
 | File | What it owns |
 | --- | --- |
-| [`README.md`](README.md) | The goal, the requirements, what plays, and where everything else lives. |
+| [`README.md`](README.md) | The goal, the features, the requirements, and where everything else lives. |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the arm64 Wine switches, benchmarks and the release bundle. |
+| [`docs/GAMES.md`](docs/GAMES.md) | The games tested so far and how far each one gets. |
 | [`docs/STATUS.md`](docs/STATUS.md) | What is implemented, what is not yet, what never will be, and the divergences kept on purpose. |
 | [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The boundary contract: thunk versus command, stable backing for pointers the unix side dereferences, typed wire values, labelling Metal objects, the threading model, the perf counters and how to read them. |
@@ -29,15 +31,34 @@ measured and kept.
 
 Two commands, both green before you commit:
 
-- **`make check`** is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
-  `make audit`, and `make doc`. Only the check legs deny warnings, so a plain
-  `cargo clippy` in an editor reports without failing. Each audit finding names
-  the section of `docs/CONVENTIONS.md` behind it; read that section rather than
-  pattern-matching your way past the grep.
-- **`make test`** is the host-native unit tests plus the end-to-end suite under
+- `make check` is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
+  `make audit`, the Makefile's own tests (`test-isolation` and
+  `test-e2e-discovery`), and `make doc`. Only the check legs deny warnings, so
+  a plain `cargo clippy` in an editor reports without failing. Each audit
+  finding names the section of `docs/CONVENTIONS.md` behind it; read that
+  section rather than pattern-matching your way past the grep.
+- `make test` is the host-native unit tests plus the end-to-end suite under
   Wine, one leg per PE architecture. Conformance is not part of it, on purpose:
   many of its checks fail by design, so it gates on a regression against a
   baseline instead of on zero failures.
+
+Two opt-in switches (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
+add legs that run under an arm64 Wine, the one `WINE_ARM64` names. `ARM64=1`
+adds `test-e2e-i686-arm64` and `test-e2e-x86_64-arm64` to `make test`, the
+shipping builds under that Wine, and `EC=1` adds `test-e2e-arm64x`, the x64
+suite against the ARM64X build, beside a `make check` leg that lints its two
+halves. `make conformance` gets the matching `conformance-*-arm64` and
+`conformance-arm64x` legs (`unix/conformance/CONFORMANCE.md`, "The
+arm64-runtime legs"). Each of them installs into a private clone of
+`WINE_ARM64`, creates a fresh prefix for it (a prefix only knows the builtins
+that were installed when it was made) and runs one test at a time. The
+end-to-end ones leave out two tests with the runner's `--skip`,
+`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`
+and
+`device::concurrent_retargets_deliver_every_window_message_to_its_own_device`,
+which deadlock in that Wine's winemac; the Makefile says why beside the skip.
+The environment variables the legs read are listed in
+[`docs/BUILDING.md`](docs/BUILDING.md#which-target-reads-which-path).
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
 touched, that churn is its own pull request, not a hand-revert and not a passenger
@@ -72,15 +93,16 @@ alone there: its environment may be mid-run, and it is that checkout's own
 `make clean-isolated` to take down. A failing run whose log shows a `d3d9.dll v`
 stamp that is not your checkout's is that collision, not a regression.
 
-Both agent runners configured in this tree already print the conventions digest
-at session start and run `scripts/audit.sh --file` after every edit, so a
-violation surfaces while you write rather than at commit time. The digest at
-`.claude/conventions-digest.md` is generated: regenerate it in the same change
-that touches `docs/CONVENTIONS.md`.
+`scripts/audit.sh --file <path>` runs the per-file subset of the audit, so an
+agent runner or an editor can call it after every edit and surface a violation
+while you write rather than at commit time. Such a hook, and any digest of the
+conventions an agent runner prints at session start, is optional local setup:
+the tree tracks neither, nothing keeps a digest in step with
+`docs/CONVENTIONS.md`, and `make check` is the gate either way.
 
 ## Reading a test run
 
-The end-to-end suite is five test binaries per architecture, and the runner
+The end-to-end suite is seven test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
 `JOBS` threads of that process (four at a time by default; the Makefile says
 what that assumes of the Wine it runs under). It prints one
@@ -163,12 +185,15 @@ window's size, `BGRA8Unorm`, a sample count the device answered for) that
 `AppleParavirtGPUMetal`, is the same runner fault, so re-run the failed jobs.
 A line naming a zero dimension or a null handle is the layer's own bug.
 
-Two things are worth knowing when a test process looks wrong. `d3d9.dll`
-terminates the process from its `DLL_PROCESS_DETACH` once a device exists
-(it cannot survive the allocator's thread-local teardown on Wine's 1 MB
-main-thread stack), so a test binary's exit status is whatever that
-`TerminateProcess` carries: the status the process asked to exit with, and 0
-for a process that never asked. The harness's panic hook
+Two things are worth knowing when a test process looks wrong. Once a device
+has existed, `d3d9.dll` terminates the process from the
+`DLL_PROCESS_DETACH` of its exit (it cannot survive the allocator's
+thread-local teardown on Wine's 1 MB main-thread stack), so a test binary's
+exit status is whatever that `TerminateProcess` carries: the status the
+process asked to exit with, and 0 for a process that never asked. A
+`FreeLibrary` after a device does not reach that detach: the first
+`CreateDevice` pins the image, so it stays mapped and the process carries
+on. The harness's panic hook
 (`windows/tests/src/win32.rs`) does not wait for libtest to reach its own
 exit and terminates with libtest's failure code at the first failed
 assertion, after the default hook has printed the report that names the
@@ -177,7 +202,7 @@ named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: eight is a
+`processes` count in the summary says how many the run took: twelve is a
 clean `make test`.
 
 Explicit test selections, including recovery rounds and filtered initial runs,
@@ -198,6 +223,12 @@ Tests of window-style changes use `HarnessConfig::window_style` with
 choice explicit when a test needs the non-client frame.
 
 ## Benchmarks
+
+The benchmark launchers set `RUST_LOG=info` and `__CX_UNIX_RUST_LOG=info`
+for timed Wine processes, independent of the shell's filters: startup identity
+and perf records are required inputs, even when no warning occurs. Untimed
+shape processes set both variables to the pass-trace filter described below.
+Ordinary test runs keep the caller's logging settings.
 
 The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so
 `make test` lists them as ignored and never runs them. `make bench` runs them
@@ -221,7 +252,31 @@ to 2 with the default five). Before each round's process the run measures
 for half a second the CPU its busiest other processes take, and the report
 warns about every round that started on a busy machine (one other process
 at a quarter of a core, all of them at half, or macOS throttling for heat);
-run those again. It
+run those again. `BENCH_WAIT_IDLE=120` optionally waits up to 120 seconds
+before each timed process for three consecutive quiet half-second CPU
+samples, using those same thresholds. The default `0` keeps advisory
+sampling. A failed CPU sample cannot count as quiet: both process reads
+must succeed and include the sampler itself. Some macOS hosts do not expose
+`kernel_task` to `ps`; its CPU share then remains unavailable, explicitly
+recorded in each idle sample, and only the foreign-process thresholds can
+be checked. Each attempt stays in
+the round's `idle-<binary>/sample-*.txt` files (or `idle-host/`), including
+rejected samples, and `idle-<binary>.txt` records the wait and its outcome.
+The final accepted sample is the ordinary `machine-<binary>.txt` that the
+report reads. A timeout ends the run with exit 2 and no performance verdict,
+preserving completed rounds. This checks the machine before a process
+starts; it cannot promise that background work stays idle during it. The
+runner exposes the same option as `bench-ab --wait-idle <seconds>`, alongside
+its explicit Wine, prefix, stamp and binary paths, so a rebuilt runner can
+compare existing installed product builds without rebuilding those legs.
+`--base-config` and `--cand-config` replace the shared `--config` for the
+named leg, including an explicitly empty value; the other leg keeps the
+shared config. These apply to timed tests and their untimed shape runs,
+with the run's own `log.dir` appended last. For a configuration comparison
+of one clean build, `--allow-same-image` permits the same recorded image
+identities on both legs; use complete config strings and retain their
+runtime logs so the intended difference can be checked. The host emitter
+does not load the renderer and does not use these runtime settings. The runner
 exits 1 on a regression and 2 when the run itself cannot be trusted, which
 includes the two legs running different Wines. The runs and the report stay
 in a directory under the main checkout's `.codex/evidence/bench-ab`, and
@@ -232,6 +287,31 @@ removes the kept base worktrees. The metrics a benchmark writes include the
 layer's own counters, read from the `perf-kv` line of its perf windows as
 `perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
 calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
+
+`ARM64=1` and `EC=1` (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
+move `make bench` and `make bench-ab` onto the arm64 Wine that `WINE_ARM64`
+names: `ARM64=1` runs the `ARCH` build there, `EC=1` the ARM64X build under
+the x86_64 benchmark binary, and each leg of `bench-ab` gets a private clone
+of that Wine with a fresh prefix, the way the arm64 test legs do. A benchmark
+measures one layout, so the two switches are not given together, and
+`EC=1 make bench-ab` needs a `BASE` whose Makefile has `windows-arm64x`: it
+stops with a message naming `BASE` otherwise. `make bench-variants` compares
+layouts instead of commits: this checkout's x86_64 build on the SDK's Wine
+against the same build on `WINE_ARM64` (`x86_64-sdk-vs-arm64`), and with
+`EC=1` the x86_64 build against the ARM64X one on `WINE_ARM64`
+(`x86_64-vs-arm64x`). `ARCH=i686` runs the first pair for the i686 build
+instead (`i686-sdk-vs-arm64`), the path World of Warcraft 1.12 and 3.3.5a
+take on an arm64 Wine, whose x86 translator runs our 32-bit DLLs; there is no
+ARM64X pair for it, since a 32-bit process never loads the ARM64X build. Every
+pair is a `bench-ab` run of its own whose report names each leg's runtime and
+DLL variant. Such a run has one commit in both legs, so a binary the two
+layouts share loads as one image, which the comparison notes instead of
+refusing, and the first pair runs two Wines. Read that first pair with care:
+it changes the host arch and the Wine build at once (the SDK is a patched
+CrossOver 26, `WINE_ARM64` a stock CrossOver 27), so its differences are not
+the arch's alone, for either arch. The ARM64X pair runs one Wine in both legs
+and changes only our DLLs, so it measures what the ARM64X build buys an x64
+game.
 
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
@@ -405,7 +485,8 @@ Each of these rots silently when it is left for later:
 - A new built-in app profile ships with the rationale for every key it sets as
   the comment on its entry in `windows/core/src/app_profile.rs` and a test that
   resolves it from the version strings the shipped binary actually carries.
-  The README links to that file rather than duplicating the profile list.
+  `docs/GAMES.md` names a game's profile in its row; the settings and
+  reasons stay in `app_profile.rs`.
   A profile that pins no version field is not a profile, it is a name collision
   waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
@@ -423,9 +504,11 @@ The full set is in `docs/CONVENTIONS.md`. These are the ones a newcomer trips:
 - No `pub(crate)`, no `mod.rs`, no type aliases, no glob imports, no raw
   Objective-C selectors.
 - Hash maps use `FxHashMap`; content hashing uses xxh3.
-- Pure logic belongs in `mtld3d-core`; `windows/d3d9` is COM wiring. A COM
-  wrapper carries a vtable pointer, a refcount and an opaque inner pointer, and
-  every other field lives on the inner struct.
+- Pure logic belongs in `mtld3d-core`; `windows/d3d9` is COM wiring. Runtime
+  placement follows the Unix-first policy in `docs/ARCHITECTURE.md`; native
+  orchestration reuses core logic. A COM wrapper carries a vtable pointer, a
+  refcount and an opaque inner pointer, and every other field lives on the
+  inner struct.
 - Every integer with symbolic meaning that crosses the boundary is a typed value
   in `unix/shared`, never a bare `u32` and never a locally restated constant.
 - Comments state the invariant, not the history that produced it: no incident

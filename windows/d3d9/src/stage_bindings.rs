@@ -121,6 +121,22 @@ impl StageBindings {
         self.textures[stage].raw()
     }
 
+    /// Whether `tex` is bound on any of the sixteen stages.
+    ///
+    /// Walks only the set bits of `bound_mask`, so a device with no textures
+    /// bound answers without reading a slot.
+    pub fn binds(&self, tex: *const Direct3DTexture9) -> bool {
+        let mut remaining = self.bound_mask;
+        while remaining != 0 {
+            let stage = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            if core::ptr::eq(self.textures[stage].raw(), tex) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Bit `i` set ⇒ slot `i` is bound to a sampleable depth-format texture (shadow map).
     ///
     /// Folded into `VariantKey::depth_sampler_mask` so the PS shader cache
@@ -275,46 +291,65 @@ impl StageBindings {
         self.sampler_states[sampler][type_]
     }
 
-    pub fn set_sampler_state(&mut self, sampler: usize, type_: usize, value: u32) {
+    /// Store one sampler state and return whether it changed.
+    ///
+    /// The silent-write audit sees every write. A write of the stored value
+    /// returns before the store and the Fetch4 update, which would change
+    /// nothing: every writer of a stored `D3DSAMP_MIPMAPLODBIAS` command
+    /// either applies it to the Fetch4 latch here or restores the latch it
+    /// was captured with, and `D3DSAMP_MAGFILTER` sets the point bit from the
+    /// stored value alone.
+    #[inline]
+    pub fn set_sampler_state(&mut self, sampler: usize, type_: usize, value: u32) -> bool {
         self.warn_samp_non_default_once(sampler, type_, value);
+        if self.sampler_states[sampler][type_] == value {
+            return false;
+        }
         self.sampler_states[sampler][type_] = value;
         self.fetch4.set_sampler(sampler, type_, value);
+        true
     }
 
+    /// The silent-write audit of one sampler-state write.
+    ///
+    /// The tests stay inline, so the setter can inline this; the latch mark
+    /// and every log line live in cold functions.
+    #[inline]
     fn warn_samp_non_default_once(&mut self, sampler: usize, type_: usize, value: u32) {
         static SAMP_DEFAULTS: [u32; SAMPLER_STATE_COUNT] = sampler_state_defaults();
 
         if sampler >= STAGE_COUNT || type_ >= SAMPLER_STATE_COUNT {
             return;
         }
-        if value == SAMP_DEFAULTS[type_] {
+        let default = SAMP_DEFAULTS[type_];
+        if value == default {
             if mtld3d_core::state_trace::enabled() {
-                log::trace!(
-                    target: mtld3d_core::state_trace::TARGET,
-                    "D3DSAMP_{type_} (sampler {sampler}) = {value:#x} (default — write suppressed in warn machinery)"
-                );
+                trace_default_samp(sampler, type_, value);
             }
             return;
         }
         if (self.samp_warn_fired[sampler] & (1u16 << type_)) != 0 {
             return;
         }
-        let class = samp_classify(
-            u32::try_from(type_).expect("D3DSAMP type fits u32 by SAMPLER_STATE_COUNT bound"),
-        );
-        if matches!(class, SampClass::Consumed) {
+        let samp =
+            u32::try_from(type_).expect("D3DSAMP type fits u32 by SAMPLER_STATE_COUNT bound");
+        if matches!(samp_classify(samp), SampClass::Consumed) {
             if mtld3d_core::state_trace::enabled() {
-                let default = SAMP_DEFAULTS[type_];
-                log::trace!(
-                    target: mtld3d_core::state_trace::TARGET,
-                    "D3DSAMP_{type_} (sampler {sampler}) Consumed = {value:#x} (default {default:#x})"
-                );
+                trace_consumed_samp(sampler, type_, value, default);
             }
             return;
         }
+        self.log_unconsumed_samp_once(sampler, type_, value, default);
+    }
+
+    /// Mark the once-per-slot latch of an unconsumed write, then format its diagnostic.
+    #[cold]
+    #[inline(never)]
+    fn log_unconsumed_samp_once(&mut self, sampler: usize, type_: usize, value: u32, default: u32) {
         self.samp_warn_fired[sampler] |= 1u16 << type_;
-        let default = SAMP_DEFAULTS[type_];
-        match class {
+        let samp =
+            u32::try_from(type_).expect("D3DSAMP type fits u32 by SAMPLER_STATE_COUNT bound");
+        match samp_classify(samp) {
             SampClass::Consumed => {} // unreachable
             SampClass::Obsolete(reason) => {
                 log::info!(
@@ -370,6 +405,26 @@ impl StageBindings {
         self.sampler_states = *sampler_defaults;
         self.fetch4 = mtld3d_core::fetch4::Fetch4State::new();
     }
+}
+
+/// Trace a sampler-state write of the D3D9 default.
+#[cold]
+#[inline(never)]
+fn trace_default_samp(sampler: usize, type_: usize, value: u32) {
+    log::trace!(
+        target: mtld3d_core::state_trace::TARGET,
+        "D3DSAMP_{type_} (sampler {sampler}) = {value:#x} (default — write suppressed in warn machinery)"
+    );
+}
+
+/// Trace a non-default sampler-state write to a consumed slot.
+#[cold]
+#[inline(never)]
+fn trace_consumed_samp(sampler: usize, type_: usize, value: u32, default: u32) {
+    log::trace!(
+        target: mtld3d_core::state_trace::TARGET,
+        "D3DSAMP_{type_} (sampler {sampler}) Consumed = {value:#x} (default {default:#x})"
+    );
 }
 
 /// Return `mask` with `bit` set when `on`, cleared otherwise.

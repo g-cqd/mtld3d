@@ -1,14 +1,16 @@
 //! Sampler states: addressing modes, filtering, and get/set round-trips.
 
-use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, assert_pixel_approx, assert_pixel_eq};
+use mtld3d_tests::{
+    Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_approx, assert_pixel_eq,
+};
 use mtld3d_types::{
     D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
     D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_POINT, D3DTOP_SELECTARG1,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -647,7 +649,12 @@ const MIP_TINTS: [u32; 7] = [
 ///
 /// Reading back the drawn pixel therefore names the level the sampler picked.
 fn mip_tinted_texture(h: &Harness) -> Texture<'_> {
-    let tex = h.create_texture(MIP_TEX_DIM, MIP_TEX_DIM, 0, 0, D3DFMT_A8R8G8B8, 0);
+    mip_tinted_texture_in(h, 0)
+}
+
+/// [`mip_tinted_texture`] created in `pool`.
+fn mip_tinted_texture_in(h: &Harness, pool: u32) -> Texture<'_> {
+    let tex = h.create_texture(MIP_TEX_DIM, MIP_TEX_DIM, 0, 0, D3DFMT_A8R8G8B8, pool);
     assert_eq!(
         usize::try_from(tex.level_count()).expect("level count fits usize"),
         MIP_TINTS.len(),
@@ -709,6 +716,16 @@ fn sample_at_bias(h: &Harness, bias: f32) -> u32 {
 
 fn arm_mip_tinted(h: &Harness, tex: &Texture<'_>) {
     assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    arm_point_mip_sampler(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+}
+
+/// Route stage 0's texture to the output and point-sample it, mip levels included.
+fn arm_point_mip_sampler(h: &Harness) {
     h.select_texture_stage(0);
     for (state, value) in [
         (D3DSAMP_MINFILTER, D3DTEXF_POINT),
@@ -719,11 +736,6 @@ fn arm_mip_tinted(h: &Harness, tex: &Texture<'_>) {
     ] {
         assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler {state}");
     }
-    assert_eq!(
-        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
-        0,
-        "SetFVF"
-    );
 }
 
 #[test]
@@ -783,6 +795,236 @@ fn out_of_range_max_mip_level_samples_the_smallest_level() {
         MIP_TINTS[MIP_TINTS.len() - 1],
         "an out-of-range MAXMIPLEVEL samples the smallest level"
     );
+}
+
+/// [`texel_to_pixel_quad`] moved `dx` backbuffer pixels to the right.
+fn texel_to_pixel_quad_at(dx: u32) -> [TexturedVertex; 6] {
+    let shift = 2.0 * f32::from(u16::try_from(dx).expect("shift fits u16")) / 640.0;
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: v.x + shift,
+        ..v
+    })
+}
+
+/// How far right of the first draw the second draw of a `SetLOD` case lands.
+const SET_LOD_RIGHT: u32 = 2 * MIP_TEX_DIM;
+
+/// Pin that `SetLOD` on a bound texture reaches the next draw of the same frame.
+///
+/// `SetLOD` on a managed texture raises the most detailed level the sampler
+/// may use, like `D3DSAMP_MAXMIPLEVEL` does for the stage. It is texture
+/// state, not device state, so nothing but the texture changes when it is
+/// called on a texture already bound: two draws of one frame around it, with
+/// no other call between them, must sample the old level and then the new
+/// one. `left` and `right` draw the bound mip-tinted texture one texel per
+/// pixel at the target's left edge and `SET_LOD_RIGHT` pixels to its right,
+/// and `set_lod` is the texture's `SetLOD`.
+fn assert_set_lod_reaches_the_next_draw<V>(
+    h: &Harness,
+    left: &[V],
+    right: &[V],
+    set_lod: impl Fn(u32) -> u32,
+    case: &str,
+) {
+    let centre = MIP_TEX_DIM / 2;
+
+    // Control: a LOD set before the frame applies to its draw.
+    assert_eq!(set_lod(2), 0, "{case}: SetLOD(2) returns the previous LOD");
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, left), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        MIP_TINTS[2],
+        "{case}: a LOD set before the frame pins its draw to level 2"
+    );
+    assert_eq!(set_lod(0), 2, "{case}: SetLOD(0) returns the previous LOD");
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, left), 0);
+        assert_eq!(set_lod(2), 0, "{case}: SetLOD(2) returns the previous LOD");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        MIP_TINTS[0],
+        "{case}: the draw before SetLOD samples the base level"
+    );
+    assert_eq!(
+        h.read_pixel(SET_LOD_RIGHT + centre, centre),
+        MIP_TINTS[2],
+        "{case}: the draw after SetLOD on the bound texture samples level 2"
+    );
+    assert_eq!(set_lod(0), 2, "{case}: SetLOD(0) restores the base level");
+}
+
+#[test]
+fn set_lod_on_a_bound_texture_reaches_the_next_draw_of_the_frame() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    let (left, right) = (texel_to_pixel_quad(), texel_to_pixel_quad_at(SET_LOD_RIGHT));
+    assert_set_lod_reaches_the_next_draw(&h, &left, &right, |lod| tex.set_lod(lod), "mip on");
+
+    // With mipmapping off the stage samples the most detailed level the texture
+    // allows, so the LOD alone picks the level.
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    assert_set_lod_reaches_the_next_draw(&h, &left, &right, |lod| tex.set_lod(lod), "mip off");
+}
+
+/// Sampler writes of the stored value between draws leave every draw of the frame right.
+///
+/// A write of the value a stage already holds marks nothing. A new value
+/// still reaches the next draw of the same frame, and a texture write reaches
+/// the draw after a same-value sampler write, since the texture marks the
+/// stage bindings itself.
+#[test]
+fn same_value_sampler_writes_between_draws_leave_every_draw_right() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    const GREY: u32 = 0xFF80_8080;
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    let (left, right) = (texel_to_pixel_quad(), texel_to_pixel_quad_at(SET_LOD_RIGHT));
+    let centre = MIP_TEX_DIM / 2;
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        for level in [0, 2, 2] {
+            assert_eq!(
+                d.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level),
+                0,
+                "SetSamplerState(MAXMIPLEVEL, {level})"
+            );
+        }
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        MIP_TINTS[0],
+        "the draw before the new value samples the base level"
+    );
+    assert_eq!(
+        h.read_pixel(SET_LOD_RIGHT + centre, centre),
+        MIP_TINTS[2],
+        "the draw after the new value samples level 2"
+    );
+
+    let side = usize::try_from(MIP_TEX_DIM >> 2).expect("mip dim fits usize");
+    tex.lock_rect(2, 0).write_u32(&vec![GREY; side * side]);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 2), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        GREY,
+        "a texture write reaches the draw after a same-value sampler write"
+    );
+}
+
+/// A same-value sampler write re-attaches a bound texture that another device took over.
+///
+/// The first device binds a managed texture and draws. Inside that frame a
+/// second device binds the same texture and draws, which moves the texture
+/// onto the second device, and the base level is then rewritten. The first
+/// device's encoder still holds the texture it uploaded before the move, so
+/// only its stage walk, which brings the texture back and uploads the new
+/// level, lets its next draw see the write. A sampler write of the stored
+/// value must leave that walk armed; the draw before it is not checked, since
+/// an upload scheduled in a frame runs at its head.
+#[test]
+fn same_value_sampler_write_keeps_a_texture_another_device_took_over() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    const GREY: u32 = 0xFF80_8080;
+    let first = Harness::new();
+    let second = Harness::new();
+    let tex = mip_tinted_texture_in(&first, D3DPOOL_MANAGED);
+    arm_mip_tinted(&first, &tex);
+    arm_mip_tinted(&second, &tex);
+    let (left, right) = (texel_to_pixel_quad(), texel_to_pixel_quad_at(SET_LOD_RIGHT));
+    let centre = MIP_TEX_DIM / 2;
+    let side = usize::try_from(MIP_TEX_DIM).expect("mip dim fits usize");
+
+    first.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        second.render_once(BLACK, |s| {
+            assert_eq!(s.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        });
+        tex.lock_rect(0, 0).write_u32(&vec![GREY; side * side]);
+        assert_eq!(
+            d.set_sampler_state(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            0,
+            "SetSamplerState of the stored MAGFILTER"
+        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_eq!(
+        second.read_pixel(centre, centre),
+        MIP_TINTS[0],
+        "the second device samples the texture it took over"
+    );
+    assert_eq!(
+        first.read_pixel(SET_LOD_RIGHT + centre, centre),
+        GREY,
+        "the first device's draw after the same-value sampler write sees the write"
+    );
+}
+
+#[test]
+fn set_lod_on_a_bound_volume_texture_reaches_the_next_draw_of_the_frame() {
+    use mtld3d_types::{D3DFVF_TEXTUREFORMAT3, D3DPOOL_MANAGED};
+
+    // A volume texture shares `SetLOD` with the 2D one. Four slices deep, its
+    // chain is as long as the 2D texture's, one tint per level; the constant
+    // `w` leaves the LOD to the one-texel-per-pixel `u` and `v`.
+    const DEPTH: u32 = 4;
+    let h = Harness::new();
+    let (hr, tex) = h.try_create_volume_texture(
+        [MIP_TEX_DIM, MIP_TEX_DIM, DEPTH],
+        0,
+        0,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(hr, 0, "CreateVolumeTexture");
+    let tex = tex.expect("created volume texture");
+    assert_eq!(
+        usize::try_from(tex.level_count()).expect("level count fits usize"),
+        MIP_TINTS.len(),
+        "64x64x4 full mip chain"
+    );
+    for (level, &tint) in MIP_TINTS.iter().enumerate() {
+        let level = u32::try_from(level).expect("level fits u32");
+        let side = usize::try_from(MIP_TEX_DIM >> level).expect("mip dim fits usize");
+        let depth = usize::try_from((DEPTH >> level).max(1)).expect("mip depth fits usize");
+        tex.write_u32(level, &vec![tint; side * side * depth]);
+    }
+    assert_eq!(h.set_volume_texture(0, &tex), 0, "SetTexture(volume)");
+    arm_point_mip_sampler(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    let volume_quad = |dx| {
+        texel_to_pixel_quad_at(dx).map(|v| VolumeVertex {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+            color: v.color,
+            u: v.u,
+            v: v.v,
+            w: 0.5,
+        })
+    };
+    let (left, right) = (volume_quad(0), volume_quad(SET_LOD_RIGHT));
+    assert_set_lod_reaches_the_next_draw(&h, &left, &right, |lod| tex.set_lod(lod), "volume");
 }
 
 #[test]

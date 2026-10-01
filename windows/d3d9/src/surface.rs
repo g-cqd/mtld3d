@@ -1707,8 +1707,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }
-            .push_op(Box::new(move |enc| enc.retire_color_target(&retired)));
+        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireColorOp { retired });
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1731,8 +1730,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }
-            .push_op(Box::new(move |enc| enc.retire_depth_target(depth)));
+        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireDepthOp { depth });
     }
     // A texture shell has nothing of the texture to give back here. The
     // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by
@@ -2547,7 +2545,7 @@ fn readback_backbuffer_region(
     // SAFETY: `device_inner` is non-null and the owning device outlives its
     // child surface; its allocation is distinct from the surface's inner.
     let device_inner = unsafe { &mut *inner.device_inner };
-    device_inner.flush_current_frame_blocking();
+    device_inner.flush_current_frame_blocking().ok()?;
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2631,17 +2629,20 @@ fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
     if page.len() < needed {
         return;
     }
-    // Copy the snapshot into a buffer the pushed op owns: the encoder thread
-    // reads it long after this returns, so it must not borrow the page (which
-    // the caller drops when the lock or DC is released).
-    let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
+    // Capture into frame-owned bytes before the caller can drop the snapshot page.
     // SAFETY: `inner.device_inner` is non-null (checked above) and points to
     // the live owning device, a different allocation from the page above.
     let device_inner = unsafe { &mut *inner.device_inner };
+    // SAFETY: the captured token moves directly into this frame's upload operation.
+    let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
     if scale.is_identity() {
-        device_inner.push_op(Box::new(move |enc| {
-            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, src_stride);
-        }));
+        device_inner.push_control(crate::device::UploadColorOp {
+            color_handle,
+            bytes,
+            width,
+            height,
+            src_stride,
+        });
         return;
     }
     let target = ResampledUpload {
@@ -2660,9 +2661,7 @@ fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_resampled(&target, &bytes);
-    }));
+    device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
 }
 
 /// `LockRect` for a system-memory offscreen surface.
@@ -2887,8 +2886,10 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     // This blit reads the RT right after the flush. Mark it read-back BEFORE
     // the flush so the store-action rules treat it as live and never discard
     // its colour store.
-    device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(tex_handle)));
-    device_inner.flush_current_frame_blocking();
+    device_inner.push_control(crate::device::NoteColorReadOp { src: tex_handle });
+    if device_inner.flush_current_frame_blocking().is_err() {
+        return false;
+    }
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2930,7 +2931,7 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
 /// Push the CPU staging buffer up to the renderable colour `MTLTexture` so a
 /// subsequent `StretchRect` / sample observes the just-written pixels. The
 /// staging rows are *copied* into the pushed encoder op (a `Vec<u8>` the
-/// closure owns, at the staging's own row pitch) so the surface's `PageBox` is
+/// operation owns, at the staging's own row pitch) so the surface's `PageBox` is
 /// never aliased across the API/encoder boundary.
 ///
 /// The staging is laid out at the extent D3D9 reports and the colour texture
@@ -2969,10 +2970,7 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         );
         return;
     }
-    // Copy the `pitch * height` bytes the lock just received into a heap buffer
-    // the op owns: the encoder thread reads it long after this returns, so it
-    // must not borrow the surface's staging (no-thunk rule).
-    let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
+    // Capture into the frame arena before the application can rewrite staging.
     if inner.device_inner.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "lockable RT staging upload skipped: surface has no owning device (colour texture left as-is)"
@@ -2985,10 +2983,16 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     // resources per D3D9 lifetime rules. It is a different allocation from the
     // surface, so the borrows below never overlap.
     let device_inner = unsafe { &mut *inner.device_inner };
+    // SAFETY: the captured token moves directly into this frame's upload operation.
+    let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
     if scale.is_identity() {
-        device_inner.push_op(Box::new(move |enc| {
-            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, pitch);
-        }));
+        device_inner.push_control(crate::device::UploadColorOp {
+            color_handle,
+            bytes,
+            width,
+            height,
+            src_stride: pitch,
+        });
         return;
     }
     let target = ResampledUpload {
@@ -3013,9 +3017,7 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_resampled(&target, &bytes);
-    }));
+    device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
 }
 
 // ── GDI FFI (IDirect3DSurface9::GetDC / ReleaseDC over a memory-backed DC) ──
@@ -3244,7 +3246,9 @@ impl SurfaceInner {
 /// the subresource takes. An offscreen plain reaches its level through the
 /// texture it owns and takes them the same way: a `StretchRect` or a `ColorFill`
 /// claims it exactly as it claims any other texture level. Only the claim half
-/// reaches a cube face, which keeps its staging for the texture's life.
+/// reaches a cube face, which keeps its staging for the texture's life. What
+/// GDI draws must not reach an upload an earlier draw still reads, so staging
+/// such an upload holds is renamed before the DIB is built over it.
 fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     if inner.parent_texture.is_null() {
         return true;
@@ -3260,7 +3264,7 @@ fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.materialize_subresource_for_cpu_read(face, inner.mip_level as usize)
+    texture.prepare_subresource_for_dc(face, inner.mip_level as usize)
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.

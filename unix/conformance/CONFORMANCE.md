@@ -20,6 +20,8 @@ make conformance-intel-i686     # one arch under the intel.* keys
 make conformance-scale          # both arches at render.scale = 0.75
 make conformance-scale-i686     # one arch at render.scale = 0.75 (what CI runs, on one image)
 make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
+ARM64=1 make conformance        # also both arches under the arm64 Wine (The arm64-runtime legs, below)
+EC=1 make conformance-arm64x    # the x86_64 binary against the ARM64X build, same Wine
 ```
 
 A leg is one architecture under one variant on one GPU family. The `intel`
@@ -47,6 +49,28 @@ Intel image is the one Mac2 machine the project runs on: dispatch the
 workflow with `record_intel_baseline` and copy the `@mac2` sections out of
 the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
 Silicon machine leaves them untouched, the merge being leg-scoped).
+
+### The arm64-runtime legs
+
+`ARM64=1 make conformance` adds `conformance-i686-arm64` and
+`conformance-x86_64-arm64`, and `EC=1` adds `conformance-arm64x`. Each runs
+the SDK's own `d3d9_test.exe` of its arch, the binary `conformance-<arch>`
+runs (a PE test runs under any Wine), under the arm64 Wine that `WINE_ARM64`
+names: the two x86 legs against the i686 and x86_64 builds, the ARM64X leg
+the x86_64 binary against the ARM64X build. Every leg runs in a private clone
+of that Wine with its own prefix, created afresh after the leg's install and
+configured by `configure-test-prefix` as the other legs' prefixes are.
+
+None of them has baseline entries of its own. Each records under its arch's
+label, so the runner judges it against that arch's entries, which were taken
+on the x86_64 Wine the SDK is (the header's `Wine:` line names it, and the
+runner warns that the arm64 Wine's version differs), and on the same Apple GPU
+family. What a leg reports is therefore how its runtime differs from that
+baseline: CrossOver's arm64 Wine and its x86 translation, plus, for the
+ARM64X leg, the ARM64X build. How such runs should be keyed, as legs of their
+own or under the existing entries, is not decided, so none has a baseline
+target, and a site one of them moves is not reclassified here on its evidence
+alone.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
@@ -242,7 +266,15 @@ record. A knob, where one makes sense, is named with its default.
   `D3DLOCK_READONLY` returns a pointer into staging an upload may still
   read.** The same trade for a font atlas or lightmap page written a few
   rectangles at a time. A whole-level lock is renamed and its contents
-  preserved, because Half-Life 2's lightmap pages rely on that. No knob.
+  preserved, because Half-Life 2's lightmap pages rely on that. The partial
+  lock and a write into a level the game holds mapped by a lock or a device
+  context are the only writes left in place under an upload that still reads
+  the level. `UpdateSurface`, `UpdateTexture`, `ColorFill` and `GetDC` move
+  the level to fresh pages first, except when every pending upload of it
+  belongs to the frame being recorded and no draw or other GPU operation on
+  the texture was recorded since, which nothing can observe. Writes into a
+  render-target or depth texture and read-backs from the GPU always move it.
+  No knob.
 - **A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
   no CPU copy once every byte has reached the GPU.** D3D9 preserves contents
   across a plain `Lock` whatever the usage says, so a title that reads back
@@ -264,6 +296,26 @@ record. A knob, where one makes sense, is named with its default.
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
+- **The adapter mode list leaves out the display sizes win32u cannot scale
+  the monitor to.** After a mode-set, win32u recomputes the monitor's scale
+  as `dpi * physical / size` on each axis, reduces it by the greatest common
+  divisor of its terms, and packs each term into 16 bits. CrossOver 27's
+  win32u asserts that the reduced numerator fits (`make_ratio`,
+  `sysparams.c:324`) and aborts the process when it does not; at 96 dpi on a
+  3456x2234 display that is 2992x1934, 2992x1870, 2336x1510, 2056x1329,
+  2056x1285, 1496x967, 1496x935, 1168x755 and 1168x730, all sizes Wine lists
+  itself. A CrossOver 27 build cannot be told apart from here, so the sizes
+  are left out on every Wine: `EnumAdapterModes` and the main module's
+  `EnumDisplaySettingsW` never offer one, and a fullscreen request for one
+  follows the window, as a request for no display mode does, rather than
+  setting the mode. The physical size is the largest extent on each axis of
+  Win32's mode list, which under `EmulateModeset` is the physical mode, and
+  the DPI is `GetSystemDpiForProcess`. The desktop mode always stays, and the
+  sizes left out are logged once. No site observes it directly:
+  `test_reset_fullscreen` sets the first served size other than the
+  desktop's, which was 2992x1934 and aborted the `device` subtest on
+  CrossOver 27. No knob: the sizes a knob would restore end the process on
+  the Wine that lists them.
 - **A windowed device's `SetGammaRamp` changes nothing on screen**, and only
   the implicit swap chain carries a ramp at all. The ramp is stored and
   `GetGammaRamp` reports it back either way, and it starts applying as soon as
@@ -533,9 +585,19 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-09-24: 0 `real`, 130 `expected`, 1 `caps`,
-22 `ceiling`, 3 `flaky`, 0 `untriaged`, 156 unique sites in all.
+`Sites:` tokens below on 2026-09-30: 0 `real`, 120 `expected`, 1 `caps`,
+22 `ceiling`, 3 `flaky`, 0 `untriaged`, 146 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+(2026-09-30: the adapter mode table stopped leaving out sizes more than 15 %
+from the desktop's aspect, which made 640x480 a settable mode on the Intel CI
+image: its display runs 3840x2160 and user32 lists 640x480 for it, so a
+fullscreen request for that size used to follow the window and now sets the
+mode. The six `test_get_display_mode` sites 14378 to 14391 and the four
+`test_multisample_get_front_buffer_data` sites 17167 to 17181, which asked
+for a 640x480 fullscreen device and read 3200x1800 back or had a 640x480
+read-back refused, left the `@mac2` legs and their clusters left this
+document. That display lists 25 sizes; it is not single-mode as the
+2026-09-05 note below says.)
 (2026-09-05: the two answers a device
 without the packed 16-bit formats derives from its render-target answer,
 `CheckDeviceType` for a 16-bit back buffer and the `AUTOGENMIPMAP` probe, were
@@ -608,30 +670,34 @@ z-order alone: raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
 The mode list `EnumAdapterModes` serves is a bounded subset of
-`EnumDisplaySettingsW`'s (the sizes of the display's own aspect, largest
-first), so an enumerated mode is one win32u accepts by
-construction, and a fullscreen request for any mode in the full list is set
-whether or not the bounded list carries it. The test binary, being the
-process's main module, enumerates the same bounded list through its own
-`EnumDisplaySettingsW` import (d3d9 redirects it at load; user32's list is
+`EnumDisplaySettingsW`'s (the sizes that fill the display, largest first,
+which are those win32u's uniform scale onto the physical display leaves a bar
+of less than one physical pixel for, then the standard sizes of another shape
+that user32 lists, largest first: 2560x1440, 1920x1080, 1600x900, 1280x720,
+1024x768, 800x600 and 640x480, which win32u letterboxes), so an enumerated
+mode is one win32u accepts by construction, and a fullscreen request for any
+mode in the full list is set whether or not the bounded list carries it. Both
+lists leave out the sizes win32u cannot scale the monitor to (see Kept
+divergences). The test binary, being the process's main module, enumerates the
+same sizes through its own `EnumDisplaySettingsW` import, in user32's order
+rather than the served one (d3d9 redirects it at load; user32's list is
 untouched and `ENUM_CURRENT_SETTINGS` passes through), so a mode the test
 picks from either list is one user32 accepts. When the app requests one, the
-device sets it and the back buffer is that mode; present
-scales it to the drawable, which stays at the display's size (MetalFX when
-enlarging, the same resample `render.scale` rides). Both halves of the
-contract then agree with the size the app rendered for: the default viewport
-and scissor, the reported present parameters, the device's and swap chain's
-`GetDisplayMode`, and the Win32 metrics and mouse. (Until 2026-08 the back
-buffer honored the mode under a monitor-sized window, which kept the D3D9
-half right and left mouse input in monitor space; before that it followed the
-window and apps that sized their viewport from their own request rendered
-into a corner.) A request that matches no mode user32 accepts still follows the
-window: native would reject it, so nothing can depend on it being honored,
-and the apps that make such requests (WoW's windowed-to-fullscreen toggle
-carries its window size) size their rendering and mouse handling from the
-window, so the window-sized back buffer is the assignment that keeps them
-consistent. We still do not reject such a request, which is the one
-`expected` site left in this area.
+device sets it and the back buffer is that mode; present scales it to the
+drawable, which stays at the display's size (MetalFX when enlarging, the same
+resample `render.scale` rides). Both halves of the contract then agree with
+the size the app rendered for: the default viewport and scissor, the reported
+present parameters, the device's and swap chain's `GetDisplayMode`, and the
+Win32 metrics and mouse. (Until 2026-08 the back buffer honored the mode under
+a monitor-sized window, which kept the D3D9 half right and left mouse input in
+monitor space; before that it followed the window and apps that sized their
+viewport from their own request rendered into a corner.) A request that
+matches no mode user32 accepts still follows the window: native would reject
+it, so nothing can depend on it being honored, and the apps that make such
+requests (WoW's windowed-to-fullscreen toggle carries its window size) size
+their rendering and mouse handling from the window, so the window-sized back
+buffer is the assignment that keeps them consistent. We still do not reject
+such a request, which is the one `expected` site left in this area.
 
 The focus half follows native too: `WM_ACTIVATEAPP FALSE` puts the registry
 mode back and `WM_ACTIVATEAPP TRUE` sets the mode and re-covers the monitor
@@ -654,31 +720,31 @@ Two refinements landed 2026-08 after the CI runner exposed them (its virtual
 display accepts the mode changes this machine's macdrv rejects, so the tests
 walk further):
 
-- **One source of display truth.** `EnumAdapterModes` / `GetAdapterDisplayMode`
-  come from `EnumDisplaySettingsW`, the same view win32u validates
-  `ChangeDisplaySettingsW` against and derives `GetMonitorInfoW` from,
-  instead of `NSScreen`: the current mode for `GetAdapterDisplayMode` (read
-  live, so it follows a mode-set), the display-aspect subset of the
-  enumerated list for `EnumAdapterModes` (so a mode a game picks is one
-  user32 accepts, fills the display, and a menu built for a driver's short
-  list does not overflow). On this
-  machine the two views agree under the pinned Retina mode; on the runner's
-  virtual display they disagreed by exactly 2x (Win32 2048x1536, `NSScreen`
-  1024x768), which split `GetDisplayMode` from the monitor rect
-  (test_get_display_mode 14472/14474) and fed the tests modes that user32
-  then refused. Seeding the list from user32 is also what made the tests'
-  own `ChangeDisplaySettingsW` calls succeed here (test_wndproc 4161/4231,
-  test_reset 2234-2238, test_mode_change), since they pick their mode from
-  `EnumAdapterModes`.
-- **Legacy aspect opt-in.** The default display-aspect list and its
-  15-size-per-format bound remain unchanged. `display.legacy4By3`, enabled
-  by the Morrowind profile, admits host-enumerated exact 4:3 sizes within the
-  desktop bounds into both the settable list and the served list. After the
-  desktop, served slots alternate largest 4:3 and largest panel sizes so
-  neither list can crowd the other out. The mode request still follows the
-  same user32 mode-set path. Wine's emulated modes may letterbox these
-  non-panel sizes with the desktop visible in the bars; the option does
-  not claim to change that presentation behavior.
+- **One source of display truth.** `EnumAdapterModes` /
+  `GetAdapterDisplayMode` come from `EnumDisplaySettingsW`, the same view
+  win32u validates `ChangeDisplaySettingsW` against and derives
+  `GetMonitorInfoW` from, instead of `NSScreen`: the current mode for
+  `GetAdapterDisplayMode` (read live, so it follows a mode-set), a bounded
+  subset of the enumerated list for `EnumAdapterModes`, the sizes that fill
+  the display and then the standard ones (so a mode a game picks is one user32
+  accepts, the sizes that fill the display come first, and a menu built for a
+  driver's short list does not overflow). On this machine the two views agree
+  under the pinned Retina mode; on the runner's virtual display they disagreed
+  by exactly 2x (Win32 2048x1536, `NSScreen` 1024x768), which split
+  `GetDisplayMode` from the monitor rect (test_get_display_mode 14472/14474)
+  and fed the tests modes that user32 then refused. Seeding the list from
+  user32 is also what made the tests' own `ChangeDisplaySettingsW` calls
+  succeed here (test_wndproc 4161/4231, test_reset 2234-2238,
+  test_mode_change), since they pick their mode from `EnumAdapterModes`.
+- **Legacy aspect opt-in.** Every enumerated size within the desktop bounds
+  stays settable whatever its aspect; the served list holds the desktop, the
+  sizes that fill the display, then the standard sizes. `display.legacy4By3`,
+  enabled by the Morrowind profile, reserves served slots for exact 4:3 sizes:
+  after the desktop they alternate between the largest 4:3 size and that
+  order, so neither can crowd the other out. The mode request still follows
+  the same user32 mode-set path. Wine's emulated modes letterbox non-panel
+  sizes with the desktop visible in the bars; the option does not claim to
+  change that presentation behavior.
 - **The mode contract.** A fullscreen device sets the requested mode
   (2026-08), so the Win32 half of the contract holds: the desktop mode
   follows a create or Reset, `GetSystemMetrics` and the window rect report
@@ -894,20 +960,10 @@ here while reading zero on a CI runner. 5552/5554 (the back buffer must keep
 the size a fullscreen create asked for across an external mode change) pass
 because the back buffer honors the request and never follows the window.
 5598/5618/5641/5676/5900 ("Failed to restore display modes") fire on the
-`@mac2` legs only: the Intel CI image's paravirtual display lists a single
-mode, so user32 refuses the mode the test sets and the restore that follows
-it, and a fullscreen device there takes the non-mode path (the back buffer
-follows the window). Desktop mode switching is out of scope, so `expected`;
-a real Intel/AMD Mac lists its modes and reads zero here.
-
-### device.c/test_get_display_mode
-Sites: 14378=expected 14379=expected 14383=expected 14384=expected
-Sites: 14390=expected 14391=expected
-
-`@mac2` legs only. The test sets 640x480 through `ChangeDisplaySettingsW`
-and expects `GetDisplayMode` to answer it; the paravirtual display refuses
-the mode (see `test_mode_change` above) and the answer stays the desktop
-mode. The same scope decision as the desktop-mode cluster.
+`@mac2` legs only, where the test's restore of the original display modes
+fails. Why it fails there is not established: the Intel CI image's display
+runs 3840x2160 at 30 Hz and user32 lists 25 sizes for it, so it is not a
+single-mode display. Desktop mode switching is out of scope, so `expected`.
 
 ### device.c/test_device_window_reset
 Sites: 5975=expected 5978=expected
@@ -1024,15 +1080,19 @@ Per-subresource pixel data is correct.
 ### device.c/test_cursor_clipping
 Sites: 14930=ceiling
 
-After a fullscreen device is created at a mode of another aspect than the
-display's, the cursor clip must equal the virtual screen, i.e. the mode.
-Under Wine's emulated mode-set win32u clips the foreground fullscreen window
-to the physical monitor and reports that rect mapped back into the mode,
-which for 640x480 on a 3:2 panel reads "(-51,0)-(691,480)": the letterbox
-bars are inside the clip. That is win32u's mapping, not ours; the device
-sets the mode exactly as native does. `ceiling` because it reads zero on a
-display whose aspect the mode matches (the CI runner's 4:3 virtual display
-has no letterbox for 640x480).
+The test creates a fullscreen device at the first served mode of at least
+640x480 that differs from the desktop mode on both axes, and the cursor clip
+must then equal the virtual screen, i.e. the mode. Under Wine's emulated
+mode-set win32u clips the foreground fullscreen window to the physical
+monitor and reports that rect mapped back into the mode, so a mode of
+another aspect than the display's has its letterbox bars inside the clip:
+640x480 on a 3456x2234 panel reads "(-51,0)-(691,480)". That is win32u's
+mapping, not ours; the device sets the mode exactly as native does.
+`ceiling` because the served list puts the sizes that fill the display
+first, so the pick is one of them and the site reads zero: 2624x1696 on a
+3456x2234 panel, 1600x1200 on the CI runner's 4:3 virtual display. It fires
+only where no second size fills the display and the pick is a standard size
+of another shape.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=ceiling
@@ -1143,18 +1203,6 @@ four V16U16 volume probes 18787, 18790, 18793 and 18796), and the autogen
 X8R8G8B8 chain its padding byte as alpha (6034). A device limitation with no D3D9-side answer, so `expected`;
 none of these fire on the Apple family, and a real Intel/AMD Mac is expected
 to read zero here.
-
-### visual.c/test_multisample_get_front_buffer_data
-Sites: 17167=expected 17169=expected 17179=expected 17181=expected
-
-`@mac2` legs only. After the `Reset` to a two-sample back buffer,
-`GetFrontBufferData` into a 640x480 system-memory surface answers
-`D3DERR_INVALIDCALL` there (17167, 17179) and the reads that follow see
-nothing (17169, 17181). The read-back measures the destination against the
-back buffer's extent, so the back buffer after that `Reset` is not 640x480
-on the paravirtual display, whose single mode makes the request a non-mode
-one (`test_mode_change` above); that mechanism is inferred from the
-rejection, not read from a trace. The Apple-family legs pass every site.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected

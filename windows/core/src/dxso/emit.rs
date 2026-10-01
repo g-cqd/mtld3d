@@ -40,6 +40,7 @@ use super::{
 bitflags::bitflags! {
     /// Per-variant boolean features folded into the PS shader cache key.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
     pub struct VariantFlags: u8 {
         /// Table-fog source select, only meaningful when `fog_table_mode != 0`.
         ///
@@ -128,7 +129,8 @@ bitflags::bitflags! {
 /// emitted).
 // Copy is required by the encoder's pass-specific key adjustment and cache-key probes.
 // The key contains only narrow masks and flags; no resource or heap storage is copied.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct VariantKey {
     pub alpha_func: u8,
     pub fog_mode: u8,
@@ -141,6 +143,8 @@ pub struct VariantKey {
     /// params arrive in `fog_data[1]` = (start, end, density, depth-bias) on
     /// buffer 13.
     pub fog_table_mode: u8,
+    /// Initialized padding in the canonical capture record.
+    pub reserved: u8,
     /// Bit `i` set ⇒ sampler slot `i` is bound to a depth-format texture.
     ///
     /// The PS emitter outputs `depth2d<float>` for that slot and wraps
@@ -209,6 +213,26 @@ pub struct VariantKey {
     pub flags: VariantFlags,
 }
 
+// Preserve the existing cache identity: canonical padding is not shader state.
+impl core::hash::Hash for VariantKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.alpha_func, state);
+        core::hash::Hash::hash(&self.fog_mode, state);
+        core::hash::Hash::hash(&self.fog_table_mode, state);
+        core::hash::Hash::hash(&self.depth_sampler_mask, state);
+        core::hash::Hash::hash(&self.depth_fetch_mask, state);
+        core::hash::Hash::hash(&self.fetch4_mask, state);
+        core::hash::Hash::hash(&self.fetch4_alpha_mask, state);
+        core::hash::Hash::hash(&self.raw_depth_red_mask, state);
+        core::hash::Hash::hash(&self.volume_sampler_mask, state);
+        core::hash::Hash::hash(&self.cube_sampler_mask, state);
+        core::hash::Hash::hash(&self.tt_projected_mask, state);
+        core::hash::Hash::hash(&self.color_out_mask, state);
+        core::hash::Hash::hash(&self.sample_mask, state);
+        core::hash::Hash::hash(&self.flags, state);
+    }
+}
+
 /// Emit the Fetch4 texel ordering through one native gather.
 ///
 /// Fetch4 selects the point-addressed texel and its right/bottom neighbours.
@@ -240,6 +264,7 @@ pub(super) fn fetch4_sample(slot: u16, uv: &str, depth: bool, alpha: bool) -> St
 /// neither bit set is 2D, which is also what an unbound slot gets: the black
 /// fallback the draw path binds there is 2D as well.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct VsSamplerKinds {
     /// Bit `i` set ⇒ vertex slot `i` binds a volume (3D) texture.
     pub volume_mask: u8,
@@ -2186,21 +2211,33 @@ fn translate_instruction(
             let coord = register_read_expr(dst.reg, ctx)?;
             let bump = &srcs[0];
             let (m00, m01, m10, m11) = bump_matrix_exprs(n);
-            // Base texcoord (`tN`). When stage N has D3DTTFF_PROJECTED the FF VS
-            // stashed the projective divisor in `.w`, so divide `.xy` by it before
-            // perturbing (a `.w` of 0 reads the origin), matching the implicit
-            // divide the plain `tex`/`texld` path applies.
-            let (bx, by) = if ctx.is_tt_projected(n) {
+            // Base texcoord (`tN`). The displacement moves `.xy` alone, and `.z`
+            // and `.w` stay the stage's own, so a cube or volume destination
+            // samples at its own third coordinate. When stage N has
+            // D3DTTFF_PROJECTED the FF VS stashed the projective divisor in `.w`,
+            // so divide `.xyz` by it before perturbing (a `.w` of 0 reads the
+            // origin), matching the implicit divide the plain `tex`/`texld` path
+            // applies; the divided coordinate's `.w` is 1.
+            let (bx, by, bz, bw) = if ctx.is_tt_projected(n) {
+                let divided =
+                    |c: char| format!("((({coord}).w != 0.0) ? ({coord}).{c} / ({coord}).w : 0.0)");
                 (
-                    format!("((({coord}).w != 0.0) ? ({coord}).x / ({coord}).w : 0.0)"),
-                    format!("((({coord}).w != 0.0) ? ({coord}).y / ({coord}).w : 0.0)"),
+                    divided('x'),
+                    divided('y'),
+                    divided('z'),
+                    String::from("1.0"),
                 )
             } else {
-                (format!("({coord}).x"), format!("({coord}).y"))
+                (
+                    format!("({coord}).x"),
+                    format!("({coord}).y"),
+                    format!("({coord}).z"),
+                    format!("({coord}).w"),
+                )
             };
             let u = format!("{bx} + {m00} * ({bump}).x + {m10} * ({bump}).y");
             let v = format!("{by} + {m01} * ({bump}).x + {m11} * ({bump}).y");
-            let coord4 = format!("float4({u}, {v}, 0.0, 0.0)");
+            let coord4 = format!("float4({u}, {v}, {bz}, {bw})");
             let sampled = sample_or_compare(ctx, n, &coord4, None, None);
             store_dst(out, *dst, &sampled, ctx, None);
             if matches!(inst.opcode, Opcode::TexBemL) {

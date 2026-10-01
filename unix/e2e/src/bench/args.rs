@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 use super::{
     ab::{AbConfig, HostBench, LegSpec},
-    compare::Options,
+    compare::{Layout, Layouts, Options},
 };
 
 /// How long a benchmark process may go without a line when `--timeout` is not given.
@@ -93,6 +93,8 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// `--` and the test binaries. Optional: `--runs <n>` (default 5, at least 3), `--bench
 /// <patterns>` (whitespace-separated, repeatable; none means every
 /// benchmark), `--config <MTLD3D_CONFIG>`, `--timeout <secs>` (default 300),
+/// `--base-config <MTLD3D_CONFIG>` and `--cand-config <MTLD3D_CONFIG>` replace
+/// the shared `--config` for the named leg, including an empty value.
 /// `--accept a,b`, `--report <file>` and `--allow-same-image` (the legs are
 /// one commit from a clean tree) as for `bench-compare`. `--base-host <exe>`
 /// and `--cand-host <exe>`, given together, add the host emitter benchmark,
@@ -101,6 +103,13 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// `--corpus-dir <dir>` names the staged shader caches every end-to-end run
 /// sees as `corpus` in its log directory, where the cold-start benchmark
 /// looks for them.
+/// `--wait-idle <secs>` waits for three consecutive measured quiet samples
+/// before each timed process, for at most that many seconds; zero (the
+/// default) keeps the single advisory sample without waiting.
+/// `--<leg>-runtime <name>` and `--<leg>-variant <name>`, given for both legs
+/// or not at all, make the run a layout comparison: one commit in two
+/// layouts, which may run two Wines and share a binary's image (see
+/// `compare::Layouts`).
 ///
 /// # Errors
 ///
@@ -114,6 +123,7 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
     let mut benches = Vec::new();
     let mut config = String::new();
     let mut timeout = DEFAULT_TIMEOUT;
+    let mut wait_idle = Duration::ZERO;
     let mut options = Options::default();
     let mut report = None;
     let mut exes = Vec::new();
@@ -129,9 +139,15 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             "--base-wine" => base.wine = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-prefix" => base.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-stamp" => base.stamp = Some(value(&mut args, &arg)?),
+            "--base-config" => base.config = Some(value(&mut args, &arg)?),
             "--cand-wine" => cand.wine = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--cand-prefix" => cand.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--cand-stamp" => cand.stamp = Some(value(&mut args, &arg)?),
+            "--cand-config" => cand.config = Some(value(&mut args, &arg)?),
+            "--base-runtime" => base.runtime = Some(value(&mut args, &arg)?),
+            "--base-variant" => base.variant = Some(value(&mut args, &arg)?),
+            "--cand-runtime" => cand.runtime = Some(value(&mut args, &arg)?),
+            "--cand-variant" => cand.variant = Some(value(&mut args, &arg)?),
             "--out" => out = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--runs" => {
                 runs = count(&value(&mut args, &arg)?, &arg)?;
@@ -152,6 +168,13 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             "--config" => config = value(&mut args, &arg)?,
             "--timeout" => {
                 timeout = Duration::from_secs(u64::from(count(&value(&mut args, &arg)?, &arg)?));
+            }
+            "--wait-idle" => {
+                let seconds = value(&mut args, &arg)?;
+                let seconds = seconds.parse::<u32>().map_err(|_| {
+                    format!("--wait-idle must be whole seconds >= 0, not {seconds:?}")
+                })?;
+                wait_idle = Duration::from_secs(u64::from(seconds));
             }
             "--accept" => options.accept.extend(accept_list(&value(&mut args, &arg)?)),
             "--report" => report = Some(PathBuf::from(value(&mut args, &arg)?)),
@@ -180,6 +203,15 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             );
         }
     };
+    let layouts = match (base.layout("base")?, cand.layout("cand")?) {
+        (Some(base), Some(cand)) => Some(Layouts { base, cand }),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "--<leg>-runtime and --<leg>-variant go with both legs or neither".to_owned(),
+            );
+        }
+    };
     Ok(AbConfig {
         base: base.finish("base")?,
         cand: cand.finish("cand")?,
@@ -189,10 +221,12 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
         out,
         config,
         timeout,
+        wait_idle,
         options,
         report,
         host,
         corpus_dir,
+        layouts,
     })
 }
 
@@ -202,9 +236,22 @@ struct PartialLeg {
     wine: Option<PathBuf>,
     prefix: Option<PathBuf>,
     stamp: Option<String>,
+    config: Option<String>,
+    runtime: Option<String>,
+    variant: Option<String>,
 }
 
 impl PartialLeg {
+    /// The leg's layout, `None` without one, or which half of it is missing.
+    fn layout(&mut self, leg: &str) -> Result<Option<Layout>, String> {
+        match (self.runtime.take(), self.variant.take()) {
+            (Some(runtime), Some(variant)) => Ok(Some(Layout { runtime, variant })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(format!("--{leg}-runtime without --{leg}-variant")),
+            (None, Some(_)) => Err(format!("--{leg}-variant without --{leg}-runtime")),
+        }
+    }
+
     /// The leg, or which of its flags is missing.
     fn finish(self, leg: &str) -> Result<LegSpec, String> {
         let missing = |flag: &str| format!("missing --{leg}-{flag}");
@@ -212,6 +259,7 @@ impl PartialLeg {
             wine: self.wine.ok_or_else(|| missing("wine <path>"))?,
             prefix: self.prefix.ok_or_else(|| missing("prefix <dir>"))?,
             stamp: self.stamp.ok_or_else(|| missing("stamp <layer stamp>"))?,
+            config: self.config,
         })
     }
 }

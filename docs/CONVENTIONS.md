@@ -57,21 +57,39 @@ Do not write, in any comment:
 
 **Wine itself is not on this list, and never will be.** mtld3d *is* a d3d9 layer *for* Wine: SEH/NTSTATUS, the unix-call boundary, `macdrv`, `wineserver`, `winebuild`, `server/thread.c`, and Wine's own d3d9 source all document the real host, and they belong in the source. The ban is on the *competing implementation* and on the *test suite cited as provenance* — not on the runtime this thing is built to live inside.
 
+## Production carries no debug assertions
+
+The `production` cargo profile (`PROD=1`) is the only build that ships and the only one a benchmark measures, and it carries no debug assertions, in Rust or in C/C++. In both workspaces the profile turns off `debug-assertions` and `overflow-checks`. For C and C++, the Makefile's `PROD=1` path exports `-DNDEBUG` in `CFLAGS` and `CXXFLAGS`, which cc-rs adds to every object a build script compiles, on every target of both workspaces: i686 and x86_64 windows-msvc, the aarch64 and arm64ec windows-msvc halves of the ARM64X build, and x86_64 and aarch64 apple-darwin. `release`, the build the tests run against, keeps the Rust checks on both sides. Its C and C++ checks differ by target. snmalloc-sys is linked into the PE DLLs and into the Unix dylib. zstd-sys is linked into the Unix dylib and the PE end-to-end test executables, not the DLLs, since only `mtld3d-core`'s `disk-cache` feature pulls it in. snmalloc-sys defines `NDEBUG` itself on msvc whenever its build is not a debug one, and the `debug = 0` override that both workspaces set for it (on the PE side for the CRT it links) makes that every profile, so only the Unix dylib keeps snmalloc's assertions in `release`. zstd follows its own `DEBUGLEVEL`, not `NDEBUG`, and keeps its assertions off in every profile. The Unix dylib's other C-family object, `mtld3d-unix`'s Objective-C delegate forward, has no assertions. The `NDEBUG` export is what keeps production free of them when a C dependency does not arrange it itself, as snmalloc-sys does not off msvc.
+
+The Makefile enforces the C/C++ half after the build. Every production install leaf and `make bundle` run `PRODUCTION_ASSERT_GATE` on the binaries they ship, and it fails the build if one imports the C library's assertion handler (`__assert_rtn` in a Mach-O image, `_assert` or `_wassert` in a PE) or carries snmalloc's own assertion message, which does not go through that handler. The message check runs on every file, since the PE DLLs and the Unix dylib both link snmalloc. `make PROD=1 production-assert-gate ASSERT_GATE_FILES=<files>` runs the same check on any files; without `PROD=1` it refuses, since the default files would be the `release` build. Production is built through make: a plain `cargo build --profile production` gets no `NDEBUG`. A new C dependency that has an assertion path of its own, one neither signal sees, extends the gate in the same change.
+
 ## Every device entry point holds the API lock
 
 A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
 
 ## Factor pure functionality into `mtld3d-core`; `d3d9` is wiring
 
-`windows/d3d9` is the COM-wrapper layer — `#[repr(C)]` vtables, refcount accounting, `extern "system"` dispatchers, the raw-dylib `unix_call` stub, `DllMain`, and `DeviceInner`. **Everything else belongs in `windows/core`**: format mapping, state packing, bytecode parsing and MSL emission, allocator bookkeeping, geometry math, key hashing, render-pass sequencing, FF state, newtype identifiers.
+`windows/d3d9` is the COM-wrapper layer: vtables, refcount accounting,
+`extern "system"` dispatchers, the `unix_call` stub, `DllMain`, Win32
+integration and application-facing state capture. Platform-independent logic
+belongs in `mtld3d-core`: format mapping, state packing, bytecode parsing and
+MSL emission, allocator bookkeeping, geometry math, key hashing, render-pass
+sequencing, fixed-function state and identifiers. Pure logic does not become
+PE-only because the crate lives under `windows/`.
 
-`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --target aarch64-apple-darwin` runs natively in ~0 s. `make test` already invokes it, auto-detecting the host triple so tests run on the native arch (no Rosetta) rather than the shipped `x86_64-apple-darwin` target.
+Native orchestration and Metal integration belong in `mtld3d-unix`; reuse core
+logic there rather than copying it. Apply the Unix-first runtime placement
+policy in [`ARCHITECTURE.md`](ARCHITECTURE.md#runtime-placement-policy).
+`mtld3d-shared` owns fixed-layout transport definitions and cross-runtime pure
+helpers, not native workers or Win32 integration.
+
+`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --features disk-cache --target aarch64-apple-darwin` runs natively in ~0 s. The `disk-cache` feature builds the on-disk shader cache and its zstd dependency, which only the Unix dylib and the tests enable, so the PE DLLs link no zstd. `make test` already invokes it with that feature, auto-detecting the host triple so tests run on the native arch (no Rosetta) rather than the shipped `x86_64-apple-darwin` target.
 
 How to apply:
 
 - New `IDirect3DXxx9::Method` body: "unpack args → call helper → route return". Helper lives in `mtld3d-core` with a unit test.
 - Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use — never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_into(&mut FfState)`.
-- Helpers needing `unix_call` inject it via `fn` pointer or trait, not a direct `mtld3d_shared` import. E.g. `slab::SeqWaiter = fn(&Arc<AtomicU64>, u64)`.
+- Pure helpers needing a platform operation receive an injected function or trait in their own runtime. Native callers use direct native operations. An injected Rust callback is never part of the PE/Unix wire protocol.
 - "Done" = green host tests, not only a green Windows build.
 
 Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;` · a function references nothing outside its own args + well-known types · a comment says "wrapper around …" · the same mapping table appears in two `d3d9` modules.
@@ -82,7 +100,7 @@ After any `.rs` change, run both before declaring the task done. `make` only reb
 
 ## winecrt0 TLS conflict
 
-Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `__tls_start`, …) with the CRT. Fix: extract only `unix_lib.o` via `ar p` in `build.rs`.
+Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `__tls_start`, …) with the CRT. Fix: `windows/shim/build.rs` extracts only `unix_lib.o`, by its full member name with `llvm-ar xP`, since an ARM64X archive carries one `unix_lib.o` per half under two directories and a basename match would hand back the first.
 
 ## `extern "system"` everywhere, not `extern "stdcall"`
 
@@ -124,7 +142,7 @@ Watch relative paths on the way out: `include_str!` resolves against the contain
 
 ## End-to-end tests are listed in `COVERAGE.md`
 
-`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the three files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `snmalloc_drift.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
+`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the five files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `unload_after_device.rs`, `snmalloc_drift.rs`, `thread_exit.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
 
 The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
 
@@ -224,7 +242,7 @@ Wrap distinct `u64`s (D3D9 object id, Metal handle, content hash, packed-bits st
 Every constant that names a value in an external ABI is declared **once**, in a shared crate, and referenced everywhere else. There are two homes, mirroring the two ABIs the codebase straddles:
 
 - **D3D9 ABI constants** → `mtld3d-types` (`windows/types/src/`). `D3DFMT_*`, `D3DRS_*`, `D3DTSS_*`, `D3DSAMP_*`, `D3DUSAGE_*`, `D3DPOOL_*`, `D3DRTYPE_*`, `D3DSBT_*`, `D3DGETDATA_*`, `D3DDECLUSAGE_*`, the FF op/arg/compare spaces, HRESULT codes (`hresult.rs`), primitive/FVF flags (`primitive.rs`), caps bits — all live here. `device.rs` / `direct3d9.rs` are glob-exported, so a new `pub const` there needs no `lib.rs` edit; a new module does.
-- **Metal wire values** → `unix/shared/src/mtl.rs` (see ARCHITECTURE.md §"Shared wire values are typed in `unix/shared/src/mtl.rs`"). Storage modes, pixel formats, compare funcs, blend factors, primitive types, usage/write-mask bitflags — declared as `#[repr(u32)]` enums or `bitflags!`, never as bare `u32`.
+- **Metal wire values** → `unix/shared/src/mtl.rs` (see ARCHITECTURE.md §"Shared wire values are typed in `unix/shared`"). Storage modes, pixel formats, compare funcs, blend factors, primitive types, usage/write-mask bitflags — declared as `#[repr(u32)]` enums or `bitflags!`, never as bare `u32`.
 
 **One principle, two homes: D3D ABI → `mtld3d-types`; Metal wire → `mtl.rs`; never restate either locally.** No function-local or module-local `const D3D*`, no bare ABI integer literal at a call site or `match` arm (`101 =>` becomes `D3DFMT_INDEX16 =>`). A local restatement is a silent-drift hazard: a local `D3DRTYPE_*` copy can drift to the wrong SDK value while the canonical constant stays fixed in its one home.
 
@@ -466,7 +484,13 @@ No glob imports. Explicit named imports only — never `use foo::*`. Two excepti
 
 ## State lives on an object, not in a static
 
-Mutable state hangs off the object that owns it. On the PE side that is `Direct3D9Inner` (everything an interface decides, starting with the resolved configuration), `DeviceInner`, or `FrameEncoder` for anything the encoder thread alone touches. On the unix side it is the per-device records: `PresentState` per command queue, `Attachment` per metal view. Where the unix side needs state the PE side owns the lifetime of, the PE side holds the record and every thunk carries its handle — that is what `queue_handle`, `view_handle` and the `DisplaySinks` pointers already are.
+Mutable state hangs off the object that owns it: an interface or device for
+application-facing state, a `FrameEncoder` for state confined to its encoder
+thread, and native per-device records for native work. Runtime placement does
+not change ownership scope. A PE object can own the lifetime of a native record
+through an opaque handle, while Unix allocates and frees the record. Shared
+sinks retain explicit backing and teardown contracts. Do not move per-device
+state into a process-global registry merely because its worker moves to Unix.
 
 A `static` that holds mutable state is an exception, and its doc block names which of these arguments earns it:
 

@@ -141,10 +141,21 @@ impl IndexBufferInner {
     /// CPU writes, per D3D9 behaviour. `dirty` is left set so `Unlock` (and any
     /// later draw) re-flushes. No-op unless locked + `Staged` + dirty. Mirrors
     /// `ib_unlock`'s upload, minus the clear.
+    #[inline]
     pub fn flush_staged_if_mapped(&mut self, dev: &mut DeviceInner) {
         if !self.locked || !matches!(self.map_mode, BufferMapMode::Staged) {
             return;
         }
+        self.flush_mapped_dirty_span(dev);
+    }
+
+    /// The upload behind [`Self::flush_staged_if_mapped`], for a locked `Staged` buffer.
+    ///
+    /// Out of line and cold so a draw inlines only the lock test: a draw
+    /// issued while its buffer is still mapped is rare.
+    #[cold]
+    #[inline(never)]
+    fn flush_mapped_dirty_span(&mut self, dev: &mut DeviceInner) {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
@@ -154,7 +165,10 @@ impl IndexBufferInner {
             return;
         };
         let size = (max - min) as usize;
-        let mut transient = dev.alloc_pagebox_capped(size);
+        let mut transient = match dev.alloc_pagebox_capped(size) {
+            Ok(value) => value,
+            Err(_hr) => return,
+        };
         // SAFETY: `src` spans `[min, max)` of the backing; `transient` is a
         // fresh `PageBox` of ≥ `size` bytes; the two allocations are disjoint.
         unsafe {
@@ -593,7 +607,10 @@ extern "system" fn ib_lock(
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "ib_lock: device_inner null on rename path");
     }
 
-    if matches!(inner.map_mode, BufferMapMode::Direct) && !inner.device_inner.is_null() {
+    if matches!(inner.map_mode, BufferMapMode::Direct)
+        && !bypass_rename
+        && !inner.device_inner.is_null()
+    {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
@@ -619,7 +636,10 @@ extern "system" fn ib_lock(
                 let buffer_id = inner.buffer_id;
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
-                let fresh = dev.alloc_pagebox_capped(logical_len);
+                let fresh = match dev.alloc_pagebox_capped(logical_len) {
+                    Ok(value) => value,
+                    Err(hr) => return hr,
+                };
                 // `Direct` buffers never release their backing (the GPU
                 // reads it), so the swap always hands the old one back.
                 let Some(old_box) = inner.backing.replace(fresh) else {
@@ -661,7 +681,7 @@ extern "system" fn ib_lock(
                 // Count the kept divergence: a contended partial Lock
                 // without DISCARD or NOOVERWRITE hands back a pointer
                 // into the backing a queued draw may still be reading
-                // (README, "Faster than conformant"). Counted and not
+                // (`docs/STATUS.md#kept-divergences`). Counted and not
                 // warned because it is a by-design no-op on a per-frame
                 // batcher path, not a stub or a fallback. The other two
                 // ways to reach `WriteInPlace` (NOOVERWRITE/READONLY,
@@ -721,7 +741,10 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
             return D3D_OK;
         };
         let size = (max - min) as usize;
-        let mut transient = dev.alloc_pagebox_capped(size);
+        let mut transient = match dev.alloc_pagebox_capped(size) {
+            Ok(value) => value,
+            Err(hr) => return hr,
+        };
         // SAFETY: `src` spans `[min, max)` of the backing; `transient` is
         // a fresh `PageBox` of ≥ `size` bytes; the two allocations are
         // disjoint.
@@ -732,6 +755,9 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
         // draw order (for rename-at-overlap). No Metal thunk here.
         inner.backing.note_upload(min, max);
         dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
+        if let Err(hr) = dev.encoder_status() {
+            return hr;
+        }
         // Only once the upload is actually queued: the range is the
         // only record that these bytes still owe a copy to the device
         // buffer, so clearing it on a path that queued nothing would

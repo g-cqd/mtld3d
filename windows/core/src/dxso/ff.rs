@@ -60,6 +60,7 @@ bitflags::bitflags! {
     /// `Hash` walks one word. Bit layout is stable:
     /// `SHADER_CACHE_SCHEMA_VERSION` must bump on any reorder or addition.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
     pub struct FfVsFlags: u16 {
         /// Vertex declaration has a NORMAL element.
         const HAS_NORMAL = 1 << 0;
@@ -141,7 +142,8 @@ bitflags::bitflags! {
 }
 
 /// Summary of the current D3D9 Fixed-Function vertex state.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct FfVsKey {
     /// Boolean predicates. See `FfVsFlags` for individual bit semantics.
     pub flags: FfVsFlags,
@@ -234,6 +236,32 @@ pub struct FfVsKey {
     /// the world-space position; always 0 on an RHW layout, which D3D9 never
     /// clips against user planes.
     pub clip_plane_count: u8,
+    /// Initialized padding in the canonical capture record.
+    pub reserved: u8,
+}
+
+// Preserve the existing cache identity: canonical padding is not shader state.
+impl core::hash::Hash for FfVsKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.flags, state);
+        core::hash::Hash::hash(&self.input_tex_coord_count, state);
+        core::hash::Hash::hash(&self.tex_coord_count, state);
+        core::hash::Hash::hash(&self.light_active_mask, state);
+        core::hash::Hash::hash(&self.light_directional_mask, state);
+        core::hash::Hash::hash(&self.light_spot_mask, state);
+        core::hash::Hash::hash(&self.diffuse_source, state);
+        core::hash::Hash::hash(&self.ambient_source, state);
+        core::hash::Hash::hash(&self.specular_source, state);
+        core::hash::Hash::hash(&self.emissive_source, state);
+        core::hash::Hash::hash(&self.fog_mode, state);
+        core::hash::Hash::hash(&self.tci_modes, state);
+        core::hash::Hash::hash(&self.tci_coord_indices, state);
+        core::hash::Hash::hash(&self.tex_coord_dims, state);
+        core::hash::Hash::hash(&self.tt_flags, state);
+        core::hash::Hash::hash(&self.vertex_blend_count, state);
+        core::hash::Hash::hash(&self.declared_weights_count, state);
+        core::hash::Hash::hash(&self.clip_plane_count, state);
+    }
 }
 
 impl FfVsKey {
@@ -325,6 +353,7 @@ bitflags::bitflags! {
     /// Texture presence and result destination share one byte in the stage key.
     // Copy keeps the compact stage-key value semantics.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
     pub struct FfStageFlags: u8 {
         const HAS_TEXTURE = 1 << 0;
         const RESULT_TEMP = 1 << 1;
@@ -349,6 +378,7 @@ pub enum FfStageResult {
 /// `Varyings.texcoord[stage]`. The PS then samples stage `N` using
 /// `Varyings.texcoord[N]` — no per-stage indirection needed here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct FfStage {
     pub color_op: u8,
     pub color_arg0: u8,
@@ -456,6 +486,7 @@ impl FfStage {
 
 /// Summary of the current D3D9 Fixed-Function pixel state.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct FfPsKey {
     pub stages: [FfStage; 8],
     /// `D3DRS_SPECULARENABLE`.

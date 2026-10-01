@@ -3,7 +3,7 @@
 This is the installation guide for the release bundle (`mtld3d.tar.xz`). It
 covers stock Wine installations and CrossOver bottles. Building from source
 and the developer `make install` flow are covered in the source repository's
-`README.md`.
+`docs/BUILDING.md`.
 
 ## Bundle contents
 
@@ -47,6 +47,33 @@ matching the arch of the Wine build itself: an x86_64 Wine takes
 round. Nothing to choose: copy both, or the one your Wine needs. The PE side
 is x86 in either case.
 
+A bundle built from source with `EC=1` (`docs/BUILDING.md` lists what that
+build needs, the environment variables naming its toolchain among it) also carries
+`wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as builtin-marked
+ARM64X images; release bundles do not. Copied into an arm64 Wine with the rest
+of `wine/`, they serve x64 games in prefixes created after the copy, which
+then run the PE side as native code. An x86_64 Wine never reads that
+directory.
+
+Which `d3d9.dll` an x64 process on an arm64 Wine gets is decided by
+`aarch64-windows`: `wineboot` fills a new prefix's `system32` from there, and
+a `d3d9.dll` in it that is an ARM64X image, ours or Wine's own, sends the
+loader to `aarch64-windows` for x64 processes too. The source tree's
+`make install` sets it up for either choice (see `docs/BUILDING.md`):
+
+- `EC=1 make install`: x64 processes get the ARM64X build; 32-bit processes
+  keep whatever `i386-windows` holds.
+- `ARM64=1 make install`: the i686 and x86_64 builds go into `i386-windows`
+  and `x86_64-windows`, and `aarch64-windows` gets x64 fake-module markers
+  for `d3d9.dll` and `mtld3d.dll` in place of any ARM64X copy, Wine's own
+  `d3d9.dll` included. x64 processes get the x86_64 build and 32-bit ones the
+  i686 build; an arm64 process has no `d3d9.dll`.
+- `EC=1 ARM64=1 make install`: all three. x64 processes get the ARM64X build,
+  32-bit processes the i686 one.
+
+Only prefixes created after the install see the change. A prefix keeps what
+`wineboot` copied into its `system32` when it was made.
+
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
 builtin, so there is no native variant of it. And Wine resolves builtin
@@ -72,14 +99,14 @@ through the bottle's DLL search path and never enters CrossOver's own
 
 ## Requirements
 
-What the test suites run on in CI:
-
-- **macOS 15 or macOS 26**, on Apple Silicon or Intel.
-- A Wine from [wine-build](https://github.com/athei/wine-build), the release
-  CI pins, which is based on **CrossOver 26**. CrossOver 27 with its arm64 Wine
-  has been tested by hand. Older Wine or CrossOver releases are not expected to
-  work.
-- A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
+- macOS 15 or macOS 26, on Apple Silicon or Intel. CI covers macOS 15 and 26
+  on Apple Silicon and macOS 15 on Intel, because no macOS 26 Intel runners
+  exist. Intel on macOS 26 is expected to work.
+- A Wine from [wine-build](https://github.com/athei/wine-build), based on
+  CrossOver 26; CI pins a release of it. CrossOver 27's arm64 Wine is tested
+  locally but not run in CI. Older Wine or CrossOver releases are not expected
+  to work.
+- A **64-bit prefix / bottle**; 32-bit games run in it through WoW64.
 - **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, which
   is what most builds are: the game and the whole PE side are x86. An arm64
   Wine brings its own x86 translation (FEX) and does not need it.
@@ -328,14 +355,40 @@ game window is scaled onto the physical display, letterboxed if the aspect
 differs, and mouse input is mapped into the mode. Without it, Wine's mac
 driver switches the whole desktop to the game's mode.
 
+On a prefix whose system DPI is set to a value other than 96, Wine scales the
+window size and the mouse coordinates of a game that does not declare itself
+DPI-aware by 96 over that DPI, but not the display mode list. In fullscreen
+the game then lays out its interface in a fraction of the screen, its clicks
+land away from the drawn pointer, and the pointer cannot reach the far edges.
+mtld3d logs a warning that names the mismatch when such a game goes
+fullscreen. The remedy is to mark the executable DPI-aware in the prefix,
+under its file name without the path:
+
+```sh
+wine reg add 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' /v hl2.exe /d '~ HIGHDPIAWARE' /f
+```
+
+With `/ve` in place of `/v hl2.exe` the value becomes the key's default and
+applies to every program in the prefix; that default is a Wine extension,
+which Windows does not read. The flag is read when a process starts, so
+restart the game after setting it.
+
 The resolution picked in the game's video options therefore sizes the frame.
 `render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
 pixels and upscaling the result to the screen.
 
-The resolution list a game sees carries sizes of the display's own aspect
-only, largest first and at most 15 per colour format, because Wine's full list
-overflows menus built for a driver's short one. Any mode Wine accepts stays
-settable whether listed or not. A request that matches no mode, such as a size
-a game derived from its own window, follows the window instead. A fullscreen
-game is never told it lost its device on a focus change: the desktop mode
-comes back on deactivation and the game's mode is set again on activation.
+The resolution list a game sees describes the primary display. The list the
+adapter reports carries the sizes that fill the display, largest first (those
+that, scaled onto it, leave a bar of less than one pixel), and then the
+standard sizes of another shape that Wine lists for it (2560x1440, 1920x1080,
+1600x900, 1280x720, 1024x768, 800x600 and 640x480), largest first, which are
+letterboxed in fullscreen. It holds at most 15 sizes per colour format,
+because Wine's full list overflows menus built for a driver's short one. A
+game that builds its menu from Wine's own display-mode list is shown the same
+sizes in Wine's order, and a game that sorts its menu shows its own order. Any
+mode Wine accepts stays settable whether listed or not, except the sizes some
+Wine builds abort on (`docs/STATUS.md`, Kept divergences). A request that
+matches no mode, such as a size a game derived from its own window, follows
+the window instead. A fullscreen game is never told it lost its device on a
+focus change: the desktop mode comes back on deactivation and the game's mode
+is set again on activation.

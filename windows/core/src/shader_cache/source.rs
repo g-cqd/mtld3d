@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 
-use super::{CachedKind, RecipeReader, ff_key_hash};
+use super::RecipeReader;
 use crate::{
     dxso::{self, DxsoProgram, VariantFlags, VariantKey, VsSamplerKinds},
     ids::ProgramId,
+    shader_key::{CachedKind, ps_source_disk_key_programmable, vs_source_disk_key_programmable},
 };
 
 /// DXSO and the stage-specific inputs needed to reproduce a compiled variant.
@@ -170,28 +171,6 @@ impl ShaderSource {
     }
 }
 
-/// Content identity of a programmable vertex shader and its emission inputs.
-#[must_use]
-pub fn vs_source_disk_key_programmable(
-    vs_id: ProgramId,
-    provided_input_mask: u16,
-    clip_plane_count: u8,
-    sampler_kinds: VsSamplerKinds,
-) -> u64 {
-    ff_key_hash(&(
-        vs_id.raw(),
-        provided_input_mask,
-        clip_plane_count,
-        sampler_kinds,
-    ))
-}
-
-/// Content identity of a programmable pixel shader and its emission inputs.
-#[must_use]
-pub fn ps_source_disk_key_programmable(ps_id: ProgramId, variant: VariantKey) -> u64 {
-    ff_key_hash(&(ps_id.raw(), variant))
-}
-
 // Clone is required by CacheEntry's round-trip and concurrent-writer test fixtures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Specialization {
@@ -205,6 +184,7 @@ enum Specialization {
 
 fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
     let VariantKey {
+        reserved: _,
         alpha_func,
         fog_mode,
         fog_table_mode,
@@ -237,6 +217,7 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
 
 fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
     Some(VariantKey {
+        reserved: 0,
         alpha_func: reader.u8()?,
         fog_mode: reader.u8()?,
         fog_table_mode: reader.u8()?,

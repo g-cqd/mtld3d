@@ -7,13 +7,14 @@ use mtld3d_core::{
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::{PageBox, PageBoxRead},
+    page_box_pool::StagingTake,
     pixel_convert,
     render_scale::{RenderScale, TargetExtent},
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
-        LockAction, MipShape, PreserveKind, decide_lock_action, honoured_lock_flags, is_in_flight,
-        staging_droppable_class,
+        LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
+        honoured_lock_flags, is_in_flight, staging_droppable_class,
     },
 };
 use mtld3d_shared::{
@@ -36,8 +37,8 @@ use mtld3d_types::{
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE,
     com_ref::{ComChild, ComUnknown},
-    device::DeviceInner,
-    encoder::{FrameEncoder, TextureInfo, TextureUploadJob},
+    device::{DeviceInner, SnapshotDirty},
+    encoder::{TextureInfo, TextureUploadJob},
     null_out,
     private_data::PrivateDataStore,
     surface::{DcLockState, Direct3DSurface9},
@@ -215,7 +216,7 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload closure
+    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
     /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
     /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
     /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
@@ -297,6 +298,24 @@ pub struct TextureInner {
     /// `ReleaseDC` keeps whatever GDI drew in them, so the level holds its
     /// staging for as long as the DC does, exactly as a `LockRect` does.
     dc_open: u32,
+    /// Subresources whose pending uploads a GPU operation recorded later may see.
+    ///
+    /// Bit `face * levels + level` for a cube, bit `level` otherwise.
+    /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
+    /// texture is recorded, after it flushes the texture's dirty levels. A CPU
+    /// write clears its subresource's bit once it lands on pages no upload
+    /// reads, fresh or renamed. Scheduling an upload onto pages an earlier
+    /// frame's upload still reads sets the bit too. So a clear bit over pages
+    /// uploads still read means no GPU operation on the texture was recorded
+    /// since those uploads were scheduled.
+    ///
+    /// That holds only while every path that schedules an upload of the
+    /// texture either marks the device's snapshot dirty, so the next draw
+    /// walks its stages and calls `note_gpu_use`, or calls `note_gpu_use`
+    /// itself. A draw that reuses a cached snapshot records no use, so an
+    /// upload scheduled without either would let such a draw sample pages a
+    /// later write changes in place.
+    observed_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -478,14 +497,6 @@ impl TextureInner {
             .sum()
     }
 
-    /// Whether `level`'s staging is currently released (placeholder only).
-    ///
-    /// The staging warmup skips such levels: there is no backing worth
-    /// wrapping, and every dropped level of every texture shares one page.
-    pub const fn staging_is_dropped(&self, level: usize) -> bool {
-        self.dropped_staging & (1u32 << level) != 0
-    }
-
     /// Claim `(face, level)` for the GPU: its Metal texture holds pixels staging does not.
     ///
     /// The next write of that subresource's staging resolves the claim, reading
@@ -545,6 +556,15 @@ impl TextureInner {
             && rect.y == 0
             && rect.w >= self.mip_width(level)
             && rect.h >= self.mip_height(level)
+    }
+
+    /// Whether a copy from `src`'s `src_level` reaches every depth slice of `level`.
+    ///
+    /// A copy walks the slices the two levels share, so a source level with
+    /// fewer slices leaves the rest of a volume level as it was. A 2D or cube
+    /// level is one slice and always covered.
+    fn copy_covers_depth(&self, level: usize, src: &Self, src_level: usize) -> bool {
+        (src.depth >> src_level).max(1) >= (self.depth >> level).max(1)
     }
 
     /// Raw pointer and byte length of one subresource's staging allocation.
@@ -665,9 +685,26 @@ impl TextureInner {
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
     fn drop_staging(&mut self, level: usize) {
-        self.staging[level] = dropped_staging_placeholder();
+        let released = core::mem::replace(&mut self.staging[level], dropped_staging_placeholder());
+        retire_staging(self.device_inner, released);
         self.dropped_staging |= 1u32 << level;
         self.reset_staging_coverage(level);
+    }
+
+    /// Give every staging allocation to the page-box pool at the texture's final release.
+    ///
+    /// A level whose upload is still in flight stays with that upload's
+    /// lease and is parked, if at all, when the lease retires.
+    fn retire_all_staging(&mut self) {
+        let device_inner = self.device_inner;
+        for backing in self.staging.drain(..) {
+            retire_staging(device_inner, backing);
+        }
+        if let Some(cube) = self.cube.as_deref_mut() {
+            for backing in cube.staging.drain(..) {
+                retire_staging(device_inner, backing);
+            }
+        }
     }
 
     /// Forget what the level's staging held, because it no longer holds it.
@@ -694,7 +731,8 @@ impl TextureInner {
         }
         let block_rows = self.mip_heights[level].div_ceil(self.block_h.max(1));
         let len = (self.mip_bytes_per_row[level] as usize).saturating_mul(block_rows as usize);
-        self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
+        // The slot holds the shared placeholder, never its last owner.
+        self.staging[level] = Arc::new(take_staging_for(self.device_inner, len.max(1)));
         self.dropped_staging &= !(1u32 << level);
         self.reset_staging_coverage(level);
         // The allocation is fresh, so no GPU-visible command references it and
@@ -830,6 +868,19 @@ impl TextureInner {
             && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
 
+    /// Make a subresource's staging ready for a device context to map.
+    ///
+    /// The DIB aliases the staging and GDI may read or write any texel of it,
+    /// so the current pixels are materialized first and the staging is then
+    /// prepared as for a partial CPU write.
+    pub fn prepare_subresource_for_dc(&mut self, face: u32, level: usize) -> bool {
+        if !self.materialize_subresource_for_cpu_read(face, level) {
+            return false;
+        }
+        self.prepare_staging_write(face, level, false);
+        true
+    }
+
     /// Fill `level`'s staging from the GPU copy of the texture.
     ///
     /// Flushes the frame so every pending upload has landed, resolves the
@@ -855,11 +906,14 @@ impl TextureInner {
         let texture_id = self.texture_id;
         let dev = DeviceInner::from_ptr(self.device_inner);
         let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-        let slot_op = Arc::clone(&slot);
-        dev.push_op(Box::new(move |enc| {
-            slot_op.store(enc.get_texture_handle_by_id(texture_id), Ordering::Release);
-        }));
-        dev.flush_current_frame_blocking();
+        let slot_op = Arc::clone(&slot).into();
+        dev.push_control(crate::device::ReadTextureHandleOp {
+            texture_id,
+            slot_op,
+        });
+        if dev.flush_current_frame_blocking().is_err() {
+            return false;
+        }
         let handle = slot.load(Ordering::Acquire);
         if handle == 0 {
             return false;
@@ -1011,21 +1065,6 @@ impl TextureInner {
     /// flush, and the cross-device rehydrate.
     pub const fn is_cpu_only(&self) -> bool {
         self.flags.contains(TextureFlags::CPU_ONLY)
-    }
-
-    /// How many per-mip staging buffers to wrap in an `MTLBuffer` eagerly.
-    ///
-    /// Zero for a cube map, whose staging is face-major in the cube sidecar,
-    /// and for a volume texture, whose box upload carries its own `Arc`;
-    /// neither has a per-level wrapper for the encoder to reuse.
-    pub fn staging_warmup_levels(&self) -> u32 {
-        if self
-            .flags
-            .intersects(TextureFlags::CUBE.union(TextureFlags::VOLUME_TEXTURE))
-        {
-            return 0;
-        }
-        u32::try_from(self.staging.len()).expect("mip count fits u32")
     }
 
     /// Volume (`LockBox`) lock: a writable pointer into the level's single staging buffer.
@@ -1264,7 +1303,8 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        self.prepare_volume_staging_write(dst_level);
+        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
+        self.prepare_staging_write(0, dst_level, whole && every_slice);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1388,6 +1428,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1554,20 +1595,8 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        if !self.flags.contains(TextureFlags::VOLUME_TEXTURE)
-            && self.staging[dst_level].has_readers()
-        {
-            // Earlier uploads and their retries retain these bytes. A whole
-            // conversion replaces them all; a partial one preserves the rest.
-            let preserve = if whole {
-                PreserveKind::None
-            } else {
-                PreserveKind::Cpu
-            };
-            self.rename_staging(dst_level, preserve);
-        } else {
-            self.prepare_volume_staging_write(dst_level);
-        }
+        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
+        self.prepare_staging_write(0, dst_level, whole && every_slice);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1676,6 +1705,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1764,6 +1794,11 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // Rejected before the staging is touched: a rename for a write that
+        // then never lands would leave the level holding fresh, unwritten pages.
+        if src_pitch == 0 {
+            return false;
+        }
         // Preserve GPU-only pixels before a partial write reaches staging.
         let whole = self.write_covers_level(
             dst_level,
@@ -1780,14 +1815,12 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(0, dst_level, whole);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        if src_pitch == 0 {
-            return false;
-        }
         // A padded row carries bytes past its last block, so the block size
         // comes from the format rather than from the pitch.
         let block_bytes = self.block_bytes.max(1) as usize;
@@ -1870,6 +1903,10 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // Rejected before the staging is touched, as in the 2D path.
+        if src_pitch == 0 {
+            return false;
+        }
         let dst_rect = DirtyRect {
             x: dx,
             y: dy,
@@ -1880,6 +1917,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -1889,9 +1927,6 @@ impl TextureInner {
         };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        if src_pitch == 0 {
-            return false;
-        }
         // A padded row carries bytes past its last block, so the block size
         // comes from the format rather than from the pitch.
         let block_bytes = self.block_bytes.max(1) as usize;
@@ -1985,6 +2020,7 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(0, dst_level, whole);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -2042,6 +2078,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -2098,17 +2135,28 @@ impl TextureInner {
         // A fill is a write: a level whose staging was never materialized (or
         // was dropped after its upload) gets one here, like any first write.
         self.ensure_staging(level);
-        let Some(box_) = self.staging.get(level) else {
+        if level >= self.staging.len() {
             return false;
-        };
+        }
         let bpp = pixel.len();
         if bpp == 0 || w == 0 || h == 0 {
             return false;
         }
         let pitch = self.mip_bytes_per_row(level) as usize;
+        let run = w as usize * bpp;
+        // Every row ends before the last one does, so checking the last row
+        // bounds the whole fill before the staging is renamed for it.
+        let last_row_end = (oy as usize + h as usize - 1) * pitch + ox as usize * bpp + run;
+        if last_row_end > self.staging[level].logical_len() {
+            return false;
+        }
+        let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
+        self.prepare_staging_write(0, level, whole);
+        let Some(box_) = self.staging.get(level) else {
+            return false;
+        };
         let logical = box_.logical_len();
         let base = box_.as_ptr().cast_mut();
-        let run = w as usize * bpp;
         for row in oy..oy.saturating_add(h) {
             let row_off = row as usize * pitch + ox as usize * bpp;
             if row_off + run > logical {
@@ -2198,7 +2246,7 @@ impl TextureInner {
         seq.load(Ordering::Acquire)
     }
 
-    /// Build a `TextureInfo` snapshot for upload closures and draw-time stage binding capture.
+    /// Build a `TextureInfo` snapshot for upload operations and draw-time stage binding capture.
     pub fn texture_info(&self) -> TextureInfo {
         // Render space: this snapshot is what creates and addresses the Metal
         // texture. `self.width`/`self.height` stay logical for `GetLevelDesc`
@@ -2242,28 +2290,10 @@ impl TextureInner {
 
     /// Clone the staging `Arc` for this mip.
     ///
-    /// Cheap (refcount bump) — used by the upload closure to keep the bytes
-    /// alive until the encoder thread blits them to the texture, and by
-    /// `push_texture_warmups` (device.rs) to populate
-    /// `StagingWarmupEntry.keepalive` so the staging `MTLBuffer` wrapper
-    /// survives a same-frame `texture_release`.
+    /// The upload retains these bytes through encoding and GPU retirement. A cached
+    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
     pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
         Arc::clone(&self.staging[level])
-    }
-
-    /// Raw backing pointer of mip `level`'s staging `PageBox`.
-    ///
-    /// For `CreateTexture`-time staging-buffer warmup. Address stays valid
-    /// until the next Lock(DISCARD) rename swaps the Arc.
-    pub fn staging_backing_ptr(&self, level: usize) -> u64 {
-        self.staging[level].as_ptr() as u64
-    }
-
-    /// Page-aligned length of mip `level`'s staging `PageBox`.
-    ///
-    /// Pairs with `staging_backing_ptr` for `BufferCreateDesc::length`.
-    pub fn staging_backing_len(&self, level: usize) -> u64 {
-        self.staging[level].len() as u64
     }
 
     /// Base, page-aligned length and row stride of one subresource's staging.
@@ -2273,12 +2303,16 @@ impl TextureInner {
     /// blit wraps the whole page as its Metal buffer and writes `mip_height`
     /// rows at the returned stride from offset zero, because every subresource
     /// owns its own allocation. The staging is materialized first, so a level
-    /// whose backing was released still receives the copy. `None` when the
+    /// whose backing was released still receives the copy. Staging an upload
+    /// still reads is renamed first, keeping its bytes: the call can still be
+    /// rejected, or its copy fail, after this returns. `None` when the
     /// subresource does not exist.
     pub fn readback_staging(&mut self, face: Option<u32>, level: usize) -> Option<(u64, u64, u32)> {
         let bytes_per_row = *self.mip_bytes_per_row.get(level)?;
         if let Some(face) = face {
             let index = self.cube_subresource_index(face, level)?;
+            self.cube.as_deref()?.staging.get(index)?;
+            self.prepare_staging_read_back(face, level, false);
             let page = self.cube.as_deref()?.staging.get(index)?;
             return Some((page.as_ptr() as u64, page.len() as u64, bytes_per_row));
         }
@@ -2286,6 +2320,7 @@ impl TextureInner {
             return None;
         }
         self.ensure_staging(level);
+        self.prepare_staging_read_back(0, level, false);
         Some((
             self.staging[level].as_ptr() as u64,
             self.staging[level].len() as u64,
@@ -2397,58 +2432,199 @@ impl TextureInner {
         let action =
             decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
         let device_inner = self.device_inner;
-        let texture_id = self.texture_id;
-        let cube = self.cube.as_deref_mut()?;
         let base = match action {
             LockAction::WriteInPlace => {
                 // The kept divergence, counted like its VB/IB twin: a
                 // contended partial Lock handed back over bytes an upload
-                // may still be reading (README, "Faster than conformant").
+                // may still be reading (`docs/STATUS.md#kept-divergences`).
                 if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
                         .bump_texture_write_in_place_contended();
                 }
-                cube.staging[index].as_ptr().cast_mut()
+                self.cube.as_deref()?.staging[index].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => {
-                mtld3d_shared::log_once_trace_by!(
-                    target: TEX_TRACE_TARGET,
-                    key: (texture_id.raw() << 8)
-                        | (index as u64 & 0x7f)
-                        | (u64::from(preserve == PreserveKind::Cpu) << 7),
-                    "cube {texture_id:#x} face {face} mip {level} lock rename preserve={}",
-                    preserve_label(preserve)
-                );
-                let mip_len = cube.staging[index].logical_len();
-                let old = core::mem::replace(
-                    &mut cube.staging[index],
-                    Arc::new(new_uninit_page_box(mip_len)),
-                );
-                if preserve == PreserveKind::Cpu {
-                    let dst = Arc::get_mut(&mut cube.staging[index])
-                        .expect("fresh cube staging Arc is unique")
-                        .as_mut_ptr();
-                    // SAFETY: old and new cube staging allocations are disjoint
-                    // and both contain `mip_len` logical bytes.
-                    unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
-                }
-                if device_inner != 0 {
-                    let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
-                    match preserve {
-                        PreserveKind::None => perf.bump_texture_discard(),
-                        PreserveKind::Cpu => perf.bump_texture_preserve_cpu(),
-                    }
-                    perf.bump_texture_rename();
-                }
-                cube.last_submit_seq[index] = 0;
-                Arc::get_mut(&mut cube.staging[index])
-                    .expect("fresh cube staging Arc is unique")
-                    .as_mut_ptr()
-            }
+            LockAction::FreshBox { preserve } => self.rename_cube_staging(face, level, preserve),
         };
         // SAFETY: `offset` was checked against the logical staging length.
         Some((unsafe { base.add(offset) }, pitch))
+    }
+
+    /// Rename one cube face level's staging while earlier uploads retain the old allocation.
+    ///
+    /// The cube counterpart of [`Self::rename_staging`]: the face level gets
+    /// fresh pages, carrying every logical byte of the old ones for
+    /// `PreserveKind::Cpu`, and the old pages stay with whichever uploads
+    /// still read them.
+    fn rename_cube_staging(&mut self, face: u32, level: usize, preserve: PreserveKind) -> *mut u8 {
+        let index = self
+            .cube_subresource_index(face, level)
+            .expect("validated cube subresource");
+        let device_inner = self.device_inner;
+        let texture_id = self.texture_id;
+        mtld3d_shared::log_once_trace_by!(
+            target: TEX_TRACE_TARGET,
+            key: (texture_id.raw() << 8)
+                | (index as u64 & 0x7f)
+                | (u64::from(preserve == PreserveKind::Cpu) << 7),
+            "cube {texture_id:#x} face {face} mip {level} staging rename preserve={}",
+            preserve_label(preserve)
+        );
+        let cube = self.cube.as_deref_mut().expect("cube storage");
+        let mip_len = cube.staging[index].logical_len();
+        let old = core::mem::replace(
+            &mut cube.staging[index],
+            Arc::new(take_staging_for(device_inner, mip_len)),
+        );
+        if preserve == PreserveKind::Cpu {
+            let dst = Arc::get_mut(&mut cube.staging[index])
+                .expect("fresh cube staging Arc is unique")
+                .as_mut_ptr();
+            // SAFETY: old and new cube staging allocations are disjoint
+            // and both contain `mip_len` logical bytes.
+            unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
+        }
+        retire_staging(device_inner, old);
+        if device_inner != 0 {
+            let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
+            match preserve {
+                PreserveKind::None => perf.bump_texture_discard(),
+                PreserveKind::Cpu => perf.bump_texture_preserve_cpu(),
+            }
+            perf.bump_texture_rename();
+        }
+        cube.last_submit_seq[index] = 0;
+        Arc::get_mut(&mut cube.staging[index])
+            .expect("fresh cube staging Arc is unique")
+            .as_mut_ptr()
+    }
+
+    /// Move a subresource's staging off pages an upload still reads, ahead of a CPU write.
+    ///
+    /// Every upload scheduled for the subresource holds a read of its pages
+    /// until it retires, and a replay reads them again. The write moves to
+    /// fresh pages when a GPU operation on the texture was recorded after one
+    /// of those uploads (see `observed_staging`): that operation has to see
+    /// the bytes the upload was scheduled with. The fresh pages are bare for a
+    /// write covering the whole level and carry the rest of the level for a
+    /// partial one; for a volume level, whole means every depth slice.
+    ///
+    /// The write lands in place only when every pending upload of the pages
+    /// was scheduled in the frame still being recorded and no GPU operation on
+    /// the texture was recorded since. The encoder replays a frame only after
+    /// it is handed off, so nothing reads the pages while this thread writes
+    /// them; each pending upload then reads the newest bytes, and nothing
+    /// recorded between the uploads and this write can see the version it
+    /// replaces. An upload of an earlier frame may be replaying on the encoder
+    /// thread at this moment, so pages it reads are renamed like observed
+    /// ones. So are the pages of a render-target or depth texture, which the
+    /// passes it is attached to use unrecorded, and a read back from the GPU.
+    /// A subresource the game holds mapped, through a `LockRect` or a device
+    /// context, is written in place whatever its readers: its pointer aliases
+    /// the current pages, and what the game writes through it has to land in
+    /// the pages the unmap publishes. `face` is a cube face index and zero for
+    /// every other texture kind.
+    fn prepare_staging_write(&mut self, face: u32, level: usize, whole_level: bool) {
+        self.move_staging_off_readers(face, level, whole_level, false);
+    }
+
+    /// [`Self::prepare_staging_write`] for a read back into the subresource from the GPU.
+    ///
+    /// A read back renames staging an upload still reads whether or not a GPU
+    /// operation was recorded since: it is itself one, and its copy runs on the
+    /// GPU while an earlier submission's upload may still read the pages.
+    fn prepare_staging_read_back(&mut self, face: u32, level: usize, whole_level: bool) {
+        self.move_staging_off_readers(face, level, whole_level, true);
+    }
+
+    /// The bit `observed_staging` keeps for one subresource.
+    ///
+    /// Zero for a subresource past the mask, which the callers read as seen.
+    fn observed_bit(&self, face: u32, level: usize) -> u128 {
+        let index = if self.cube.is_some() {
+            self.cube_subresource_index(face, level)
+        } else {
+            Some(level)
+        };
+        index
+            .and_then(|index| u32::try_from(index).ok())
+            .and_then(|index| 1u128.checked_shl(index))
+            .unwrap_or(0)
+    }
+
+    /// Record that a GPU operation on this texture follows every upload scheduled so far.
+    ///
+    /// Called where a draw's stage walk, a vertex texture bind, a `StretchRect`
+    /// or `ColorFill` endpoint, a read of the texture back, a depth resolve
+    /// into it or a mip generation flushes its dirty levels. One store: every
+    /// subresource is marked, since the operation may read any of them.
+    pub const fn note_gpu_use(&mut self) {
+        self.observed_staging = u128::MAX;
+    }
+
+    fn move_staging_off_readers(
+        &mut self,
+        face: u32,
+        level: usize,
+        whole_level: bool,
+        always: bool,
+    ) {
+        if self.dc_in_use() {
+            return;
+        }
+        let (mapped, has_readers, last_upload_seq) = match self.cube.as_deref() {
+            Some(cube) => {
+                let Some(index) = self.cube_subresource_index(face, level) else {
+                    return;
+                };
+                (
+                    cube.locked.get(index).copied().unwrap_or(false),
+                    cube.staging
+                        .get(index)
+                        .is_some_and(|staging| staging.has_readers()),
+                    cube.last_submit_seq.get(index).copied(),
+                )
+            }
+            None => (
+                self.locked.get(level).copied().unwrap_or(false),
+                self.staging
+                    .get(level)
+                    .is_some_and(|staging| staging.has_readers()),
+                self.last_submit_seq.get(level).copied(),
+            ),
+        };
+        let bit = self.observed_bit(face, level);
+        if !mapped && !has_readers {
+            // Nothing reads these pages, so the next GPU use is the first
+            // that can see what lands in them.
+            self.observed_staging &= !bit;
+        }
+        let same_frame = self.device_inner != 0
+            && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
+        // A render target or depth texture is read and written by the passes
+        // it is attached to, which no stage walk records.
+        let attached = self.d3d_usage
+            & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
+            != 0;
+        let mut write = StagingWrite::empty();
+        write.set(StagingWrite::MAPPED, mapped);
+        write.set(StagingWrite::HAS_READERS, has_readers);
+        write.set(StagingWrite::SAME_FRAME, same_frame);
+        write.set(
+            StagingWrite::OBSERVED,
+            bit == 0 || self.observed_staging & bit != 0,
+        );
+        write.set(StagingWrite::ALWAYS_RENAME, always || attached);
+        write.set(StagingWrite::WHOLE_LEVEL, whole_level);
+        let LockAction::FreshBox { preserve } = decide_staging_write(&write) else {
+            return;
+        };
+        if self.cube.is_some() {
+            self.rename_cube_staging(face, level, preserve);
+        } else {
+            self.rename_staging(level, preserve);
+        }
+        self.observed_staging &= !bit;
     }
 
     fn cube_stash_lock(
@@ -2654,7 +2830,7 @@ impl TextureInner {
                 // No rename, no preserve — same primitive as the
                 // READONLY fast-path above. `PageBox` exposes only
                 // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder closures
+                // the bytes lives across this cast. Encoder operations
                 // hold Arc clones to keep the staging alive while
                 // they construct `newBufferWithBytesNoCopy:` MTLBuffer
                 // wrappers; they never borrow the bytes themselves.
@@ -2666,9 +2842,9 @@ impl TextureInner {
                 //
                 // Counted when it is the kept divergence: a contended
                 // partial Lock without NOOVERWRITE handed back over
-                // bytes an upload may still be reading (README, "Faster
-                // than conformant"). READONLY returned above and an
-                // uncontended Lock is the specified behaviour.
+                // bytes an upload may still be reading
+                // (`docs/STATUS.md#kept-divergences`). READONLY returned
+                // above and an uncontended Lock is the specified behaviour.
                 if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
@@ -2701,7 +2877,7 @@ impl TextureInner {
         );
         // Copy only logical mip bytes, excluding the page-padded tail.
         let mip_len = self.staging[level].logical_len();
-        let fresh = new_uninit_page_box(mip_len);
+        let fresh = take_staging_for(self.device_inner, mip_len);
         let old = core::mem::replace(&mut self.staging[level], Arc::new(fresh));
         // A detached texture has no live device profiling state.
         let dev_inner_raw = self.device_inner;
@@ -2739,6 +2915,7 @@ impl TextureInner {
                 }
             }
         }
+        retire_staging(dev_inner_raw, old);
         if perf_attached {
             DeviceInner::from_ptr(dev_inner_raw)
                 .perf_mut()
@@ -2749,21 +2926,6 @@ impl TextureInner {
         Arc::get_mut(&mut self.staging[level])
             .expect("fresh Arc is unique")
             .as_mut_ptr()
-    }
-
-    /// Preserve a volume mip before writing bytes another owner may still read.
-    fn prepare_volume_staging_write(&mut self, level: usize) {
-        if self.flags.contains(TextureFlags::VOLUME_TEXTURE)
-            && self
-                .staging
-                .get(level)
-                .is_some_and(|staging| Arc::strong_count(staging) > 1)
-        {
-            // Upload jobs may be replayed after their original submit retires.
-            // Arc ownership covers those readers as well as queued and GPU reads;
-            // a cached staging wrapper alone can conservatively force a rename.
-            self.rename_staging(level, PreserveKind::Cpu);
-        }
     }
 
     fn stash_lock(
@@ -2955,7 +3117,7 @@ impl TextureInner {
     }
 }
 
-/// Allocate `len` uninitialized bytes in a page-aligned `PageBox`.
+/// Take uninitialized page-aligned staging, a parked box of each size first.
 ///
 /// Used by the `FreshBox` Lock path and by `CreateTexture` for initial
 /// staging — the game writes the dirty rect before any GPU read, and
@@ -2963,14 +3125,45 @@ impl TextureInner {
 /// are never observed. On an initial Draw-before-Lock, the freshly-
 /// created `MTLTexture` is the GPU-visible surface and is zeroed by
 /// Metal; the staging `PageBox` is only read when an upload blit fires,
-/// which requires a prior Lock write.
+/// which requires a prior Lock write. A box popped from the page-box
+/// pool carries another texture's stale bytes under exactly that
+/// contract, so it is interchangeable with a fresh allocation.
 ///
 /// Page-aligned because the encoder wraps the staging via
 /// `newBufferWithBytesNoCopy:`, which on non-UMA Macs (Intel/AMD)
 /// rejects misaligned pointer or length. Apple Silicon tolerates the
-/// misalignment in practice but documents the same contract.
-pub fn new_uninit_page_box(len: usize) -> PageBox {
-    PageBox::new_uninit(len)
+/// misalignment in practice but documents the same contract; a pooled
+/// box has the same alignment and padded length as a fresh one.
+pub fn take_staging() -> StagingTake<'static> {
+    crate::page_box_pool::PAGEBOX_POOL.take_staging()
+}
+
+/// Drop one owner of a staging box, parking it in the page-box pool if it was the last.
+///
+/// Every site where `TextureInner` gives up a staging `Arc` comes through
+/// here. An upload still in flight holds its own `Arc`, so the box stays
+/// with it and is parked, if at all, when that lease retires. A detached
+/// texture (`device_inner == 0`) drops instead: its device drained the
+/// staging lane at teardown, and parking afterwards would undo that.
+pub fn retire_staging(device_inner: u64, backing: Arc<PageBox>) {
+    if device_inner != 0 {
+        crate::page_box_pool::PAGEBOX_POOL.recycle_staging(backing);
+    }
+}
+
+/// One staging allocation, counted on the owning device when the texture still has one.
+fn take_staging_for(device_inner: u64, len: usize) -> PageBox {
+    let (page, (hits, misses)) = {
+        let mut take = take_staging();
+        let page = take.take(len);
+        (page, take.finish())
+    };
+    if device_inner != 0 {
+        DeviceInner::from_ptr(device_inner)
+            .perf_mut()
+            .add_texture_pool_outcomes(hits, misses);
+    }
+    page
 }
 
 /// Parameters for `Direct3DTexture9::new`.
@@ -3117,6 +3310,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         staging_coverage: Vec::new(),
         upload_generation: Vec::new(),
         dc_open: 0,
+        observed_staging: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -3371,14 +3565,12 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // `device_inner == 0` after `detach_from_device` — the owning
     // device has already been released and torn down (its
     // `shutdown_cleanup` already drained the texture cache + freed
-    // the matching `MTLTexture`). No closure to push, no live
+    // the matching `MTLTexture`). No operation to push, no live
     // registry to drop from. Just free the PE-side allocations.
     if dev_inner_raw != 0 {
         let dev = DeviceInner::from_ptr(dev_inner_raw);
-        // Push cleanup closure to encoder thread — it owns the Metal handle
-        dev.push_op(Box::new(move |enc| {
-            enc.destroy_cached_texture(texture_id);
-        }));
+        // Push cleanup operation to encoder thread — it owns the Metal handle
+        dev.push_control(crate::device::DestroyTextureOp { tex_id: texture_id });
         // Drop from the live-textures registry before freeing the
         // inner Box so `evict_managed_resources` never sees a dangling
         // pointer.
@@ -3409,6 +3601,8 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // (The texture outlives every shell referencing it, so this is the last
     // owner, and the shells were freed just above.)
     ti_mut.dc_lock.teardown();
+    // Offer the staging to the page-box pool; a detached texture drops it.
+    ti_mut.retire_all_staging();
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(TextureInner)` from `Self::new` and no other
     // reference can survive.
@@ -3617,7 +3811,22 @@ extern "system" fn texture_set_lod(this: *mut c_void, lod: u32) -> u32 {
         return 0;
     }
     let prev = ti.lod;
-    ti.lod = lod.min(ti.levels.saturating_sub(1));
+    let lod = lod.min(ti.levels.saturating_sub(1));
+    if lod == prev {
+        return prev;
+    }
+    ti.lod = lod;
+    // The draw snapshot folds the LOD into the sampler state of each stage the
+    // texture is bound to, and recaptures the stages only when STAGES is dirty.
+    // A texture on no device, or not bound on its own device, has no capture to
+    // refresh: the next SetTexture that binds it marks STAGES itself.
+    let device_inner = ti.device_inner;
+    if device_inner != 0 {
+        let dev = DeviceInner::from_ptr(device_inner);
+        if dev.stage_bindings().binds(this.cast()) {
+            dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
+        }
+    }
     prev
 }
 
@@ -3717,12 +3926,11 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     // a second time.
     let upload_regenerates = ti.dirty_mask & 1 != 0 && !ti.is_cpu_only();
     flush_dirty_mips(ti, dev);
+    ti.note_gpu_use();
     if upload_regenerates {
         return;
     }
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_generate_mipmaps(texture_id);
-    }));
+    dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
 }
 
 // ── IDirect3DTexture9 ──
@@ -3846,6 +4054,14 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     if ti.cube.is_none() {
         ti.ensure_staging(level);
     }
+    // The read replaces the level, so staging an upload still reads moves to
+    // fresh pages without a copy and the read lands there. A depth level
+    // publishes fresh pages of its own after the read, and a volume read
+    // covers one slice, so the rest of that level is carried over.
+    if mtld3d_core::depth_texture::PackedDepth::from_d3d(ti.d3d_format).is_none() {
+        let whole = !ti.flags.contains(TextureFlags::VOLUME_TEXTURE);
+        ti.prepare_staging_read_back(face, level, whole);
+    }
     let Some((dst_ptr, dst_len)) = ti.subresource_staging_backing(face, level) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: face {face} level {level} has no staging to read back \
@@ -3867,18 +4083,14 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // handle inside an op and read it back through an atomic slot once the
     // flush has drained the queue.
     let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-    let slot_op = Arc::clone(&slot);
-    dev.push_op(Box::new(move |enc| {
-        let handle = enc.get_texture_handle_by_id(texture_id);
-        slot_op.store(handle, Ordering::Release);
-        // The store-action optimiser would drop the colour store of a pass
-        // nothing samples in-frame, and the claim this read resolves is exactly
-        // what such a pass wrote, so note the read before the flush decides.
-        // SAFETY: `handle` is a live retained `MTLTexture` handle from the
-        // encoder texture cache, or zero, which the note ignores.
-        enc.note_color_read_back(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
-    }));
-    dev.flush_current_frame_blocking();
+    let slot_op = Arc::clone(&slot).into();
+    dev.push_control(crate::device::ReadTextureColorHandleOp {
+        texture_id,
+        slot_op,
+    });
+    if dev.flush_current_frame_blocking().is_err() {
+        return false;
+    }
     let handle = slot.load(Ordering::Acquire);
     if handle == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -4382,11 +4594,11 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
-/// Build the upload closure and push it onto the current frame's op list.
+/// Build the upload operation and push it onto the current frame's op list.
 ///
-/// The closure holds an `Arc` clone of the staging mip plus a snapshot of
+/// The operation holds an `Arc` clone of the staging mip plus a snapshot of
 /// the D3D9 format / pitch / bpp — refcount bump, zero memcpy on the API
-/// thread. The encoder thread runs it in order relative to draw closures.
+/// thread. The encoder thread runs it in order relative to draw operations.
 ///
 /// Also stamps the current submit seq onto the mip's `last_submit_seq`
 /// so a later `LockRect` can detect GPU-in-flight contention the same
@@ -4445,6 +4657,9 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     // a declined upload is retried from the staging this would have released.
     let release_staging = ti.staging_droppable(level_u) && ti.staging_fully_written(level_u);
     let upload_generation = ti.next_upload_generation(level_u);
+    if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
+        ti.observed_staging |= ti.observed_bit(0, level_u);
+    }
     let job = TextureUploadJob {
         info: ti.texture_info(),
         staging: PageBoxRead::new(ti.staging_arc(level_u)),
@@ -4480,16 +4695,19 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         rect.w,
         rect.h
     );
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        if ORDERED {
-            enc.run_ordered_texture_upload(job);
-        } else {
-            enc.run_texture_upload(job);
-        }
-        if regen_mipmaps {
-            enc.run_generate_mipmaps(texture_id);
-        }
-    }));
+    dev.push_control(crate::device::UploadTextureAndMipsOp {
+        job,
+        texture_id,
+        flags: {
+            let mut flags = crate::device::UploadTextureOpFlags::empty();
+            flags.set(crate::device::UploadTextureOpFlags::ORDERED, ORDERED);
+            flags.set(
+                crate::device::UploadTextureOpFlags::REGENERATE_MIPMAPS,
+                regen_mipmaps,
+            );
+            flags
+        },
+    });
 }
 
 fn schedule_cube_upload(
@@ -4516,10 +4734,16 @@ fn schedule_cube_upload(
         rect.w,
         rect.h
     );
+    let bit = ti.observed_bit(face, level_u);
     let cube = ti.cube.as_deref_mut().expect("cube storage");
+    let older_reader =
+        cube.staging[index].has_readers() && cube.last_submit_seq[index] != dev.current_seq();
     let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
     cube.last_submit_seq[index] = dev.current_seq();
     cube.was_uploaded[index] = true;
+    if older_reader {
+        ti.observed_staging |= bit;
+    }
     let job = TextureUploadJob {
         info: ti.texture_info(),
         staging,
@@ -4541,9 +4765,7 @@ fn schedule_cube_upload(
         release_staging: false,
         upload_generation: 0,
     };
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_texture_upload(job);
-    }));
+    dev.push_control(crate::device::UploadTextureOp { job });
 }
 
 /// Re-mark a subresource whose upload the encoder emitted nothing for.
@@ -4749,7 +4971,7 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
     // triggered this rehydrate call. A system-memory texture has no Metal
     // texture on any device, so it seeds nothing.
     if !ti.is_cpu_only() {
-        dev.push_texture_warmup(ti.texture_info());
+        dev.push_texture_warmup(&ti.texture_info());
     }
     let adopted = if pinned {
         tex.device_forward_target()
@@ -4855,9 +5077,7 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
         }
         let texture_id = ti.texture_id;
         if regenerate_mipmaps {
-            dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-                enc.run_generate_mipmaps(texture_id);
-            }));
+            dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
         }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET, key: texture_id.raw(),
@@ -5122,7 +5342,7 @@ extern "system" fn volume_lock_box(
     } else {
         0
     };
-    inner.prepare_volume_staging_write(lvl);
+    inner.prepare_staging_write(0, lvl, false);
     let ptr = inner.staging[lvl].as_ptr().cast_mut();
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.

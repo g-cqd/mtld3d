@@ -7,7 +7,7 @@
 //! takes contention (`last_submit_seq > coherent_seq`, without
 //! `NOOVERWRITE` or `READONLY`) plus either `DISCARD` or a whole-buffer
 //! range: a contended *partial* Lock keeps the live pointer, the
-//! divergence the README lists under "Faster than conformant". Unlock is
+//! divergence listed in `docs/STATUS.md#kept-divergences`. Unlock is
 //! a no-op for `Direct` buffers; `Staged` buffers upload their dirty
 //! span there.
 //!
@@ -192,7 +192,10 @@ impl VertexBufferInner {
                 "write_processed: no CPU backing to upload the processed vertices from");
             return;
         };
-        let mut transient = dev.alloc_pagebox_capped(size);
+        let mut transient = match dev.alloc_pagebox_capped(size) {
+            Ok(value) => value,
+            Err(_hr) => return,
+        };
         // SAFETY: `src` spans `[offset, end)` of the backing; `transient` is a
         // fresh `PageBox` of at least `size` bytes; the two are disjoint.
         unsafe { core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size) };
@@ -211,10 +214,21 @@ impl VertexBufferInner {
     /// (and any later draw) re-flushes whatever the app writes next. No-op
     /// unless locked + `Staged` + dirty. Mirrors `vb_unlock`'s upload, minus
     /// the clear.
+    #[inline]
     pub fn flush_staged_if_mapped(&mut self, dev: &mut DeviceInner) {
         if !self.locked || !matches!(self.map_mode, BufferMapMode::Staged) {
             return;
         }
+        self.flush_mapped_dirty_span(dev);
+    }
+
+    /// The upload behind [`Self::flush_staged_if_mapped`], for a locked `Staged` buffer.
+    ///
+    /// Out of line and cold so a draw inlines only the lock test: a draw
+    /// issued while its buffer is still mapped is rare.
+    #[cold]
+    #[inline(never)]
+    fn flush_mapped_dirty_span(&mut self, dev: &mut DeviceInner) {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
@@ -224,7 +238,10 @@ impl VertexBufferInner {
             return;
         };
         let size = (max - min) as usize;
-        let mut transient = dev.alloc_pagebox_capped(size);
+        let mut transient = match dev.alloc_pagebox_capped(size) {
+            Ok(value) => value,
+            Err(_hr) => return,
+        };
         // SAFETY: `src` spans `[min, max)` of the backing; `transient` is a
         // fresh `PageBox` of ≥ `size` bytes; the two allocations are disjoint.
         unsafe {
@@ -613,8 +630,8 @@ extern "system" fn vb_get_type(this: *mut c_void) -> u32 {
 /// - Contended partial non-DISCARD, `D3DUSAGE_DYNAMIC`: `WriteInPlace`.
 ///   The game opted into the DISCARD/NOOVERWRITE timing contract, the
 ///   same one non-persistent mapped-buffer APIs (e.g. OpenGL
-///   `glBufferSubData`) make implicitly. This is the divergence the
-///   README lists under "Faster than conformant"; the only trace it
+///   `glBufferSubData`) make implicitly. This is the divergence listed
+///   in `docs/STATUS.md#kept-divergences`; the only trace it
 ///   leaves is the `in-place` perf counter bumped below.
 /// - Non-DYNAMIC buffers never reach `plan_lock`: they are `Staged`, and
 ///   a partial write there uploads the dirtied range to a separate
@@ -721,7 +738,10 @@ extern "system" fn vb_lock(
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: device_inner null on rename path");
     }
 
-    if matches!(inner.map_mode, BufferMapMode::Direct) && !inner.device_inner.is_null() {
+    if matches!(inner.map_mode, BufferMapMode::Direct)
+        && !bypass_rename
+        && !inner.device_inner.is_null()
+    {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
@@ -747,7 +767,10 @@ extern "system" fn vb_lock(
                 let buffer_id = inner.buffer_id;
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
-                let fresh = dev.alloc_pagebox_capped(logical_len);
+                let fresh = match dev.alloc_pagebox_capped(logical_len) {
+                    Ok(value) => value,
+                    Err(hr) => return hr,
+                };
                 // `Direct` buffers never release their backing (the GPU
                 // reads it), so the swap always hands the old one back.
                 let Some(old_box) = inner.backing.replace(fresh) else {
@@ -790,7 +813,7 @@ extern "system" fn vb_lock(
                 // Count the kept divergence: a contended partial Lock
                 // without DISCARD or NOOVERWRITE hands back a pointer
                 // into the backing a queued draw may still be reading
-                // (README, "Faster than conformant"). Counted and not
+                // (`docs/STATUS.md#kept-divergences`). Counted and not
                 // warned because it is a by-design no-op on a per-frame
                 // batcher path, not a stub or a fallback. The other two
                 // ways to reach `WriteInPlace` (NOOVERWRITE/READONLY,
@@ -850,7 +873,10 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
             return D3D_OK;
         };
         let size = (max - min) as usize;
-        let mut transient = dev.alloc_pagebox_capped(size);
+        let mut transient = match dev.alloc_pagebox_capped(size) {
+            Ok(value) => value,
+            Err(hr) => return hr,
+        };
         // SAFETY: `src` spans `[min, max)` of the backing; `transient` is
         // a fresh `PageBox` of ≥ `size` bytes; the two allocations are
         // disjoint.
@@ -861,6 +887,9 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
         // draw order (for rename-at-overlap). No Metal thunk here.
         inner.backing.note_upload(min, max);
         dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
+        if let Err(hr) = dev.encoder_status() {
+            return hr;
+        }
         // Only once the upload is actually queued: the range is the
         // only record that these bytes still owe a copy to the device
         // buffer, so clearing it on a path that queued nothing would

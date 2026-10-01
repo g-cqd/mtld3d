@@ -26,6 +26,7 @@ use mtld3d_core::{
         LibrarySlot, Resolution, mark_kept_reads, may_skip_draw,
     },
     build_index::BuildLookup,
+    draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
         emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
@@ -36,16 +37,18 @@ use mtld3d_core::{
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
-    shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
+    shader_cache::{self, PipelineRecipe, ShaderRecordRef},
     shader_compile_stats::CompileBucket,
+    shader_key::CachedKind,
 };
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
     mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
-    tsc::{rdtsc, secs_to_cycles},
+    tsc::rdtsc,
 };
+use objc2::rc::autoreleasepool;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -53,9 +56,14 @@ use super::{
     open_or_create_cache_file,
 };
 use crate::{
-    draw::{PsSource, ShaderRef, VsSource},
-    unix_call::unix_call,
+    draw::{PsSourceView, ShaderRef, VsSourceView},
+    metal::handle::IntoRetained,
 };
+
+pub mod libraries;
+
+#[cfg(test)]
+mod tests;
 
 /// Worker threads each encoder builds with.
 ///
@@ -66,17 +74,6 @@ const COMPILE_WORKERS: usize = 4;
 
 /// Seconds a build may stay in flight before the encoder warns that it looks stuck.
 const STALLED_BUILD_SECS: u64 = 5;
-
-/// Stack reserved for each compile worker: 1 MiB, half the thread default.
-///
-/// A 32-bit guest's address space is what runs out first, and four workers
-/// at the default 2 MiB would reserve 8 MiB of it per device. Wine raises
-/// every thread's stack reservation to at least 1 MiB, so asking for less
-/// would change nothing but what this constant claims; this asks for the
-/// floor explicitly, and four workers cost 4 MiB per device. The stack holds
-/// the MSL emission and the PE half of the thunk; the `unix_call` itself
-/// runs on Wine's kernel stack.
-const COMPILE_WORKER_STACK: usize = 1024 * 1024;
 
 /// The jobs waiting for a worker, and the workers' wake-up.
 ///
@@ -114,8 +111,15 @@ impl CompileQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Queue a job nothing waits for yet; a primary pipeline goes ahead of the libraries.
     fn push(&self, ticket: JobTicket, job: QueuedJob) {
-        self.lock().lanes.push_normal(ticket, job);
+        let mut state = self.lock();
+        if matches!(&job.job, CompileJob::Pipeline(pipeline) if pipeline.sibling_of.is_none()) {
+            state.lanes.push_pipeline(ticket, job);
+        } else {
+            state.lanes.push_normal(ticket, job);
+        }
+        drop(state);
         self.ready.notify_one();
     }
 
@@ -169,23 +173,22 @@ impl CompileQueue {
     }
 }
 
-/// Start the encoder's compile workers; answers how many started.
+/// Start the encoder's native compile workers and retain their join handles.
 ///
-/// Called from the encoder thread's startup, never from `DllMain`. Each
-/// worker is detached: like the submit thread it is never joined (Wine can
-/// fail the wait on its handle), and it exits when the queue closes at
-/// encoder teardown or the encoder drops the result channel.
-pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileResult>) -> usize {
-    let mut started = 0;
+/// The encoder closes the queue and joins these workers before device teardown.
+pub fn spawn_workers(
+    queue: &Arc<CompileQueue>,
+    results: &mpsc::Sender<CompileResult>,
+) -> Vec<thread::JoinHandle<()>> {
+    let mut started = Vec::new();
     for _ in 0..COMPILE_WORKERS {
         let queue = Arc::clone(queue);
         let results = results.clone();
         match thread::Builder::new()
             .name("mtld3d-compile".into())
-            .stack_size(COMPILE_WORKER_STACK)
             .spawn(move || worker_main(&queue, &results))
         {
-            Ok(_detached) => started += 1,
+            Ok(handle) => started.push(handle),
             Err(e) => {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
@@ -199,8 +202,15 @@ pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileRe
 
 fn worker_main(queue: &CompileQueue, results: &mpsc::Sender<CompileResult>) {
     mtld3d_shared::crumb::init();
+    worker_main_with(queue, |ticket, job| {
+        results.send(run_job(ticket, job, true)).is_ok()
+    });
+}
+
+/// Consume the real queue while keeping job execution outside its lock.
+fn worker_main_with(queue: &CompileQueue, mut execute: impl FnMut(JobTicket, QueuedJob) -> bool) {
     while let Some((ticket, job)) = queue.next_for_worker() {
-        if results.send(run_job(ticket, job, true)).is_err() {
+        if !execute(ticket, job) {
             break;
         }
     }
@@ -227,6 +237,7 @@ struct LibraryJob {
     device: MetalHandle<MTLDeviceKind>,
     /// Whether to append the record to the shader cache.
     persist: bool,
+    cache_path: Option<std::path::PathBuf>,
 }
 
 /// The emitter input of one library, and the index key its outcome lands under.
@@ -281,6 +292,7 @@ struct PipelineJob {
     sibling_of: Option<u64>,
     device: MetalHandle<MTLDeviceKind>,
     persist: bool,
+    cache_path: Option<std::path::PathBuf>,
 }
 
 /// The shader identities a pipeline build records, taken from the draw's two sources.
@@ -304,9 +316,9 @@ impl PipelineIdentity {
 
 /// What a deferred draw's pipeline build needs besides its two functions.
 ///
-/// Kept from the draw's encoding to its submission, since the draw's
-/// sources are not: `VsSource` and `PsSource` live in the frame's scratch
-/// and are neither `Clone` nor `Copy`.
+/// Retained from encoding through submission without borrowing shader source
+/// views from the frame arena. The pipeline identity preserves the source keys
+/// needed when the two compiled functions become ready.
 pub struct DeferredTemplate {
     /// The draw's pipeline snapshot; its functions are filled in as its libraries land.
     snapshot: PipelineSnapshot,
@@ -413,6 +425,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
         reference,
         device,
         persist,
+        cache_path,
     } = job;
     let mut total_ns = 0;
     let mut emit_ns = 0;
@@ -503,7 +516,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             };
             let entry =
                 shader_cache::CacheEntry::new(reference.kind(), reference.key(), msl, retained);
-            persist_error = open_or_create_cache_file()
+            persist_error = open_or_create_cache_file(cache_path.as_deref())
                 .and_then(|writer| writer.append_shader(&entry))
                 .err();
         }
@@ -538,35 +551,42 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         sibling_of,
         device,
         persist,
+        cache_path,
     } = job;
     let mut total_ns = 0;
     let mut persist_ns = 0;
     let mut persist_error = None;
     let total = NanosSetTimer::start(&raw mut total_ns);
     let key = pipeline_state::key_from_snapshot(&snapshot, &vertex_attrs);
-    // One wire layout per used stream; lives until the synchronous thunk
-    // below has read it.
+    // One layout per used stream, borrowed through the synchronous build.
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(&snapshot);
-    let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::description_from_snapshot(&PipelineBuildInputs {
         snapshot: &snapshot,
         vertex_attrs: &vertex_attrs,
         vertex_layouts: &vertex_layouts,
-        device_handle: device,
     });
-    let status = unix_call(&mut params);
-    let pipeline = params.pipeline_handle;
-    let native = params.timings.into_inner();
+    let mut native = PipelineTimings::new();
+    let pipeline = autoreleasepool(|_| {
+        let device = device.into_retained()?;
+        crate::metal::create_render_pipeline(&device, &params, &mut native)
+    });
+    let status = if pipeline.is_some() {
+        0
+    } else {
+        error!(target: LOG_TARGET, "failed to create render pipeline");
+        0xC000_0001_u32.cast_signed()
+    };
     debug!(
         target: LOG_TARGET,
         "encoder: live CreateRenderPipeline status={status:#x} sibling={}",
         sibling_of.is_some()
     );
-    let success = status == 0 && !pipeline.is_null();
+    let success = pipeline.is_some();
     if success && persist {
         let _persist = NanosSetTimer::start(&raw mut persist_ns);
         if let Some((vs_ref, ps_ref)) = shader_refs {
             let recipe = PipelineRecipe::from_snapshot(vs_ref, ps_ref, &snapshot, &vertex_attrs);
-            persist_error = open_or_create_cache_file()
+            persist_error = open_or_create_cache_file(cache_path.as_deref())
                 .and_then(|writer| writer.append_pipeline(&recipe))
                 .err();
         } else {
@@ -584,7 +604,7 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         vs,
         ps,
         sibling_of,
-        handle: success.then_some(pipeline),
+        handle: pipeline,
         total_ns,
         persist_ns,
         native,
@@ -624,10 +644,24 @@ enum Begun {
 }
 
 impl FrameEncoder {
+    /// Both stages' built library handles for a draw, or `None` for the slow path.
+    ///
+    /// See [`libraries::StageLibraries::lookup_ready`]: a draw naming the
+    /// previous draw's source records answers from the memo.
+    #[inline]
+    pub fn lookup_libraries(
+        &mut self,
+        vs: VsSourceView<'_>,
+        ps: PsSourceView<'_>,
+        variant: VariantKey,
+    ) -> Option<(StageLibHandles, StageLibHandles)> {
+        self.libraries.lookup_ready(vs, ps, variant)
+    }
+
     /// Resolve the VS library for a draw.
     ///
-    /// Hot path: borrow-probe the source-keyed index (`ff_vs_libs` /
-    /// `prog_vs_libs`), `FxHash` + exact `Eq`, no per-draw content hash,
+    /// Hot path: borrow-probe the source-keyed index (`libraries`),
+    /// `FxHash` + exact `Eq`, no per-draw content hash,
     /// no clone. VS variants share one `MTLLibrary`, so the index key
     /// excludes `variant`. On a miss (about once per shader) the cold half
     /// computes the `disk_key`, answers from the warm cache when it can and
@@ -637,26 +671,11 @@ impl FrameEncoder {
     /// draw that names them and are never removed, so a missing program is
     /// as final as a rejected one.
     #[inline]
-    pub fn resolve_vs_library(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
-        let known = match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => self.prog_vs_libs.lookup(&(
-                *vs_id,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
-            )),
-        };
-        match known {
-            BuildLookup::Ready(handles) => return Resolution::Ready(handles),
-            BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Unknown => {}
+    pub fn resolve_vs_library(&mut self, source: VsSourceView<'_>) -> Resolution<StageLibHandles> {
+        match self.libraries.lookup_vs(source) {
+            Some(Some(handles)) => return Resolution::Ready(*handles),
+            Some(None) => return Resolution::Failed,
+            None => {}
         }
         self.resolve_vs_library_miss(source)
     }
@@ -664,7 +683,7 @@ impl FrameEncoder {
     /// The cold half of [`Self::resolve_vs_library`], out of line so a hit pays nothing for it.
     #[cold]
     #[inline(never)]
-    fn resolve_vs_library_miss(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
+    fn resolve_vs_library_miss(&mut self, source: VsSourceView<'_>) -> Resolution<StageLibHandles> {
         let mut miss_ns = 0;
         let miss = NanosSetTimer::start(&raw mut miss_ns);
         let begun = self.begin_vs_library(source);
@@ -689,25 +708,8 @@ impl FrameEncoder {
         resolution
     }
 
-    fn record_vs_library(&mut self, source: &VsSource, outcome: Option<StageLibHandles>) {
-        match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.record(key.clone(), outcome),
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => self.prog_vs_libs.record(
-                (
-                    *vs_id,
-                    *provided_input_mask,
-                    *clip_plane_count,
-                    *sampler_kinds,
-                ),
-                outcome,
-            ),
-        }
+    fn record_vs_library(&mut self, source: VsSourceView<'_>, outcome: Option<StageLibHandles>) {
+        self.libraries.record_vs(source, outcome);
     }
 
     /// Cold half of [`Self::resolve_vs_library`]: the index missed.
@@ -716,10 +718,10 @@ impl FrameEncoder {
     /// shader), bridges the warm-loaded disk-keyed `lib_cache`, and queues
     /// the build otherwise. Every `VsKey` variant of a shader maps to the
     /// same `disk_key`.
-    fn begin_vs_library(&mut self, source: &VsSource) -> Begun {
+    fn begin_vs_library(&mut self, source: VsSourceView<'_>) -> Begun {
         let disk_key = source.disk_key();
         let (kind, program) = match source {
-            VsSource::Programmable { vs_id, .. } => {
+            VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
                 let Some(program) = self.program_cache.get(vs_id) else {
                     error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
                     return Begun::Failed;
@@ -729,7 +731,7 @@ impl FrameEncoder {
                     Some(Arc::clone(program)),
                 )
             }
-            VsSource::FixedFunction { .. } => (Some(CachedKind::FfVs), None),
+            VsSourceView::FixedFunction(_) => (Some(CachedKind::FfVs), None),
         };
         // `lib_cache` owns every library built from here, and device
         // teardown destroys what it holds. A shader with no cache kind would
@@ -751,13 +753,13 @@ impl FrameEncoder {
         }
         let input = match (source, program) {
             (
-                VsSource::Programmable {
+                VsSourceView::Programmable(ProgrammableVsSource {
                     vs_id,
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
                     ..
-                },
+                }),
                 Some(program),
             ) => LibraryInput::ProgrammableVs {
                 vs_id: *vs_id,
@@ -766,10 +768,10 @@ impl FrameEncoder {
                 clip_plane_count: *clip_plane_count,
                 sampler_kinds: *sampler_kinds,
             },
-            (VsSource::FixedFunction { key, .. }, _) => {
+            (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
             }
-            (VsSource::Programmable { .. }, None) => return Begun::Failed,
+            (VsSourceView::Programmable(_), None) => return Begun::Failed,
         };
         Begun::Queued(self.enqueue_library(input, reference))
     }
@@ -777,27 +779,20 @@ impl FrameEncoder {
     /// Resolve the PS library for a draw.
     ///
     /// Hot path: borrow-probe the source-keyed index. PS MSL depends on
-    /// `variant`, so the key folds it in: `ff_ps_libs` nests
+    /// `variant`, so the key folds it in: the fixed-function index nests
     /// `FfPsKey → variant → handles` (borrow the `FfPsKey`, no clone),
-    /// `prog_ps_libs` uses a `(ProgramId, VariantKey)` `Copy` tuple. A miss
+    /// the programmable one uses a `(ProgramId, VariantKey)` `Copy` tuple. A miss
     /// takes the same cold half as the vertex stage.
     #[inline]
     pub fn resolve_ps_library(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
-        let known = match source {
-            PsSource::FixedFunction { key, .. } => self
-                .ff_ps_libs
-                .get(key)
-                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
-            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
-        };
-        match known {
-            BuildLookup::Ready(handles) => return Resolution::Ready(handles),
-            BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Unknown => {}
+        match self.libraries.lookup_ps(source, variant) {
+            Some(Some(handles)) => return Resolution::Ready(*handles),
+            Some(None) => return Resolution::Failed,
+            None => {}
         }
         self.resolve_ps_library_miss(source, variant)
     }
@@ -807,7 +802,7 @@ impl FrameEncoder {
     #[inline(never)]
     fn resolve_ps_library_miss(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
         let mut miss_ns = 0;
@@ -836,28 +831,18 @@ impl FrameEncoder {
 
     fn record_ps_library(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
         outcome: Option<StageLibHandles>,
     ) {
-        match source {
-            PsSource::FixedFunction { key, .. } => {
-                self.ff_ps_libs
-                    .entry(key.clone())
-                    .or_default()
-                    .record(variant, outcome);
-            }
-            PsSource::Programmable { ps_id, .. } => {
-                self.prog_ps_libs.record((*ps_id, variant), outcome);
-            }
-        }
+        self.libraries.record_ps(source, variant, outcome);
     }
 
     /// Cold half of [`Self::resolve_ps_library`]; the `disk_key` folds in `variant`.
-    fn begin_ps_library(&mut self, source: &PsSource, variant: VariantKey) -> Begun {
+    fn begin_ps_library(&mut self, source: PsSourceView<'_>, variant: VariantKey) -> Begun {
         let disk_key = source.disk_key(variant);
         let (kind, program) = match source {
-            PsSource::Programmable { ps_id, .. } => {
+            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
                 let Some(program) = self.program_cache.get(ps_id) else {
                     error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
                     return Begun::Failed;
@@ -867,7 +852,7 @@ impl FrameEncoder {
                     Some(Arc::clone(program)),
                 )
             }
-            PsSource::FixedFunction { .. } => (Some(CachedKind::FfPs), None),
+            PsSourceView::FixedFunction(_) => (Some(CachedKind::FfPs), None),
         };
         // See `begin_vs_library`: a library no cache kind owns would outlive
         // its device.
@@ -886,16 +871,20 @@ impl FrameEncoder {
             return Begun::Bridged(handles);
         }
         let input = match (source, program) {
-            (PsSource::Programmable { ps_id, .. }, Some(program)) => LibraryInput::ProgrammablePs {
-                ps_id: *ps_id,
-                program,
-                variant,
-            },
-            (PsSource::FixedFunction { key, .. }, _) => LibraryInput::FixedFunctionPs {
-                key: key.clone(),
-                variant,
-            },
-            (PsSource::Programmable { .. }, None) => return Begun::Failed,
+            (PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }), Some(program)) => {
+                LibraryInput::ProgrammablePs {
+                    ps_id: *ps_id,
+                    program,
+                    variant,
+                }
+            }
+            (PsSourceView::FixedFunction(FixedPsSource { key, .. }), _) => {
+                LibraryInput::FixedFunctionPs {
+                    key: key.clone(),
+                    variant,
+                }
+            }
+            (PsSourceView::Programmable(_), None) => return Begun::Failed,
         };
         Begun::Queued(self.enqueue_library(input, reference))
     }
@@ -906,6 +895,7 @@ impl FrameEncoder {
             reference,
             device: self.device_handle,
             persist: self.cache_persists(),
+            cache_path: self.cache_path.clone(),
         };
         let ticket = self.enqueue(CompileJob::Library(job));
         self.pending_libs.insert(reference, ticket);
@@ -928,20 +918,16 @@ impl FrameEncoder {
         shaders: &ShaderRef<'_>,
     ) -> Resolution<u64> {
         self.perf.bump_pipeline_memo_call();
-        // L0 memo: a draw whose pipeline snapshot is identical to the
-        // previous one returns the cached handle without rebuilding the
-        // `PipelineKey` (its D3D→Metal translations) or probing
-        // `pipeline_cache`. It also skips the no-color twin's second resolve
-        // below. A successful sibling mapping is process-lifetime. Only
-        // built primaries are memoised: a pending or failing snapshot goes
-        // on to `resolve_pipeline`, whose cache answers pending or failed on
-        // the probe. The `match` copies the handle out so the memo borrow
-        // ends before the `&mut perf` bump.
-        let memo_hit = match &self.last_pipeline_memo {
-            Some((prev, handle)) if *prev == *snapshot => Some(*handle),
-            _ => None,
-        };
-        if let Some(handle) = memo_hit {
+        // The memo: a draw whose pipeline snapshot equals a recent one
+        // returns the cached handle without rebuilding the `PipelineKey`
+        // (its D3D→Metal translations) or probing `pipeline_cache`. It also
+        // skips the no-color twin's second resolve below. A successful
+        // sibling mapping is process-lifetime. Only built primaries are
+        // memoised: a pending or failing snapshot goes on to
+        // `resolve_pipeline`, whose cache answers pending or failed on the
+        // probe. The no-color twin is resolved beside its primary and never
+        // recorded, so it takes no entry.
+        if let Some(handle) = self.pipeline_memo.lookup(snapshot) {
             self.perf.bump_pipeline_memo_hit();
             return Resolution::Ready(handle);
         }
@@ -960,7 +946,7 @@ impl FrameEncoder {
         self.queue_no_color_sibling(snapshot, vertex_attrs, with_color, |enc| {
             pipeline_identity(&enc.program_cache, shaders)
         });
-        self.last_pipeline_memo = Some((snapshot.clone(), with_color.raw()));
+        self.pipeline_memo.record(snapshot, with_color.raw());
         Resolution::Ready(with_color.raw())
     }
 
@@ -972,9 +958,9 @@ impl FrameEncoder {
     /// Rule H keeps color when there is no depth attachment. Its unused
     /// sibling would have no attachments, which Mac2 Metal rejects.
     /// A successful sibling mapping stays valid as long as the pipeline
-    /// cache, so an L0 miss can reuse it without rebuilding the alternate
+    /// cache, so a memo miss can reuse it without rebuilding the alternate
     /// snapshot and key. The sibling builds asynchronously and nothing
-    /// waits for it: until its mapping lands (at install, or on an L0 miss
+    /// waits for it: until its mapping lands (at install, or on a memo miss
     /// that finds it built), Rule H keeps the pass's color. A failed
     /// sibling leaves no mapping, and `resolve_pipeline` answers failed
     /// from its cache without another build.
@@ -994,7 +980,7 @@ impl FrameEncoder {
             // No-color twin: same identity except the attach flag (and no
             // render targets 1..3, which Rule H strips together with target
             // 0). Explicit `.clone()` because PipelineSnapshot is not Copy;
-            // fires on L0 misses until the sibling has a mapping.
+            // fires on memo misses until the sibling has a mapping.
             let mut alt = snapshot.clone();
             alt.remove_color_output();
             if let Resolution::Ready(no_color) =
@@ -1074,6 +1060,7 @@ impl FrameEncoder {
             sibling_of,
             device: self.device_handle,
             persist: self.cache_persists(),
+            cache_path: self.cache_path.clone(),
         };
         let ticket = self.enqueue(CompileJob::Pipeline(Box::new(job)));
         self.pending_pipelines.insert(key, ticket);
@@ -1126,7 +1113,11 @@ impl FrameEncoder {
         let Some(&oldest) = self.compile_in_flight.values().min() else {
             return;
         };
-        if rdtsc().saturating_sub(oldest) > secs_to_cycles(STALLED_BUILD_SECS) {
+        // Calibration runs during startup. Its absence cannot prove a five-second stall.
+        let Ok(Some(hz)) = self.clock.get() else {
+            return;
+        };
+        if rdtsc().saturating_sub(oldest) > hz.saturating_mul(STALLED_BUILD_SECS) {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "encoder: a shader or pipeline build has been in flight for over \
@@ -1680,24 +1671,23 @@ impl FrameEncoder {
         }
         self.pending_libs.remove(&reference);
         match input {
-            LibraryInput::FixedFunctionVs { key } => self.ff_vs_libs.record(key, handles),
+            LibraryInput::FixedFunctionVs { key } => self.libraries.record_ff_vs(key, handles),
             LibraryInput::ProgrammableVs {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => self.prog_vs_libs.record(
+            } => self.libraries.record_programmable_vs(
                 (vs_id, provided_input_mask, clip_plane_count, sampler_kinds),
                 handles,
             ),
-            LibraryInput::FixedFunctionPs { key, variant } => self
-                .ff_ps_libs
-                .entry(key)
-                .or_default()
-                .record(variant, handles),
+            LibraryInput::FixedFunctionPs { key, variant } => {
+                self.libraries.record_ff_ps(key, variant, handles);
+            }
             LibraryInput::ProgrammablePs { ps_id, variant, .. } => {
-                self.prog_ps_libs.record((ps_id, variant), handles);
+                self.libraries
+                    .record_programmable_ps(ps_id, variant, handles);
             }
         }
     }
@@ -1817,18 +1807,18 @@ impl FrameEncoder {
 }
 
 /// `prog 0x…` / `ff 0x…` for a vertex-shader source, keyed as its library is.
-fn vs_source_tag(source: &VsSource) -> String {
+fn vs_source_tag(source: VsSourceView<'_>) -> String {
     PairShaderId {
-        is_programmable: matches!(source, VsSource::Programmable { .. }),
+        is_programmable: matches!(source, VsSourceView::Programmable(_)),
         hash: source.disk_key(),
     }
     .tag()
 }
 
 /// `prog 0x…` / `ff 0x…` for a pixel-shader source and variant, keyed as its library is.
-fn ps_source_tag(source: &PsSource, variant: VariantKey) -> String {
+fn ps_source_tag(source: PsSourceView<'_>, variant: VariantKey) -> String {
     PairShaderId {
-        is_programmable: matches!(source, PsSource::Programmable { .. }),
+        is_programmable: matches!(source, PsSourceView::Programmable(_)),
         hash: source.disk_key(variant),
     }
     .tag()
@@ -1845,11 +1835,11 @@ fn pipeline_identity(
     PipelineIdentity {
         shader_refs: pipeline_shader_refs(program_cache, shaders),
         vs: PairShaderId {
-            is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
+            is_programmable: matches!(shaders.vs, VsSourceView::Programmable(_)),
             hash: shaders.vs.disk_key(),
         },
         ps: PairShaderId {
-            is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
+            is_programmable: matches!(shaders.ps, PsSourceView::Programmable(_)),
             hash: shaders.ps.disk_key(shaders.variant),
         },
     }
@@ -1860,15 +1850,15 @@ fn pipeline_shader_refs(
     shaders: &ShaderRef<'_>,
 ) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
     let vs_kind = match shaders.vs {
-        VsSource::FixedFunction { .. } => CachedKind::FfVs,
-        VsSource::Programmable { vs_id, .. } => {
+        VsSourceView::FixedFunction(_) => CachedKind::FfVs,
+        VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
             let major = program_cache.get(vs_id)?.major;
             CachedKind::from_programmable(major, false)?
         }
     };
     let ps_kind = match shaders.ps {
-        PsSource::FixedFunction { .. } => CachedKind::FfPs,
-        PsSource::Programmable { ps_id, .. } => {
+        PsSourceView::FixedFunction(_) => CachedKind::FfPs,
+        PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
             let major = program_cache.get(ps_id)?.major;
             CachedKind::from_programmable(major, true)?
         }

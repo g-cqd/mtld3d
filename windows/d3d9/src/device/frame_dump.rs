@@ -210,28 +210,28 @@ impl DeviceInner {
     /// Log the assembled draw state; called once per draw while a dump runs.
     ///
     /// Also tags the draw for the encoder, which wraps its Metal draw in a
-    /// `draw {seq}` debug group; the closure op lands ahead of the draw op
+    /// `draw {seq}` debug group; the operation op lands ahead of the draw op
     /// in the same op stream, so the tag reaches `emit_draw` with the draw.
     pub fn frame_dump_draw(&mut self) {
         let seq = self.frame_dump.draws;
         self.frame_dump.draws += 1;
-        self.push_op(Box::new(move |enc| enc.set_dump_draw(seq)));
+        self.push_control(crate::device::SetDumpDrawOp { seq });
         let vp = self.viewport();
         let rs = |i: u32| self.render_state(i as usize);
 
         let (rt, ds) = self.frame_dump_target_labels();
-        let vs = self.snapshot_cache.vs.map_or_else(
+        let vs = self.snapshot_cache.vs.as_ref().map_or_else(
             || String::from("none"),
-            |p| match p.as_ref() {
-                VsSource::Programmable { vs_id, .. } => format!("{vs_id:?}"),
-                VsSource::FixedFunction { .. } => String::from("ff"),
+            |p| match p {
+                VsSource::Programmable(value) => format!("{:?}", value.vs_id),
+                VsSource::FixedFunction(_) => String::from("ff"),
             },
         );
-        let ps = self.snapshot_cache.ps.map_or_else(
+        let ps = self.snapshot_cache.ps.as_ref().map_or_else(
             || String::from("none"),
-            |p| match p.as_ref() {
-                PsSource::Programmable { ps_id, .. } => format!("{ps_id:?}"),
-                PsSource::FixedFunction { .. } => String::from("ff"),
+            |p| match p {
+                PsSource::Programmable(value) => format!("{:?}", value.ps_id),
+                PsSource::FixedFunction(_) => String::from("ff"),
             },
         );
 

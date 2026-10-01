@@ -174,7 +174,7 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
 /// `DEPTHBIAS` + `SLOPESCALEDEPTHBIAS` reflect the explicit-RS bias path that
 /// reaches Metal's `setDepthBias:slopeScale:clamp:` per draw. `ANISOTROPY`
 /// advertises the wired path `D3DSAMP_MAXANISOTROPY` →
-/// `SamplerSnapshot.max_anisotropy` → `CreateSamplerStateParams.max_anisotropy`
+/// `SamplerSnapshot.max_anisotropy` → `SamplerDescription.max_anisotropy`
 /// → `setMaxAnisotropy:` on `MTLSamplerDescriptor`; without the cap bit,
 /// well-behaved games clamp to `MAXANISOTROPY=1` and never ask for it.
 /// `MIPMAPLODBIAS` advertises `D3DSAMP_MIPMAPLODBIAS`, which Metal expresses
@@ -429,6 +429,20 @@ pub fn fill(caps: &mut D3DCAPS9, caps_all: bool, sampler_border: bool) {
             "debug.capsAll=true: advertising spec-max caps for bring-up diagnostic — visual rendering may degrade"
         );
     }
+}
+
+/// Whether `op` is a `D3DTOP_*` operation the fixed-function emitter lacks.
+///
+/// True exactly when [`unimplemented_texture_op`] names one, without the name
+/// lookup, so the texture-stage setter can inline the test.
+#[inline]
+#[must_use]
+pub const fn texture_op_unimplemented(op: u32) -> bool {
+    if op == 0 || op > 32 {
+        return false;
+    }
+    let bit = 1u32 << (op - 1);
+    TexOpCaps::all().bits() & bit != 0 && TEXOP_DEFAULT.bits() & bit == 0
 }
 
 /// The `TexOpCaps` name of a `D3DTOP_*` operation the fixed-function emitter lacks.

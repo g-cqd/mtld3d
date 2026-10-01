@@ -47,8 +47,8 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
-    compare::{self, Options},
+    LAYOUTS_FILE, Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
+    compare::{self, Layouts, Options},
     machine,
     metrics::{self, Class, MetricsFile},
     shape::{self, Identity, SHAPE_RUST_LOG},
@@ -93,6 +93,8 @@ pub struct LegSpec {
     pub prefix: PathBuf,
     /// The `meta layer` value every metrics file of the leg must carry.
     pub stamp: String,
+    /// Replace the shared `--config` for this leg when supplied, including an empty value.
+    pub config: Option<String>,
 }
 
 /// A parsed `bench-ab` invocation.
@@ -108,10 +110,12 @@ pub struct AbConfig {
     pub runs: u32,
     /// The A/B directory the runs write into.
     pub out: PathBuf,
-    /// The `MTLD3D_CONFIG` of every run, before the run's own `log.dir`.
+    /// The default `MTLD3D_CONFIG`, used when a leg has no override, before its `log.dir`.
     pub config: String,
     /// How long a run may go without a line before it counts as hung.
     pub timeout: Duration,
+    /// Maximum wait for three quiet machine samples before each timed process; zero disables it.
+    pub wait_idle: Duration,
     pub options: Options,
     /// Where the report is written besides stdout.
     pub report: Option<PathBuf>,
@@ -119,6 +123,8 @@ pub struct AbConfig {
     pub host: Option<HostBench>,
     /// The staged shader caches, linked into every end-to-end run's directory as `corpus`.
     pub corpus_dir: Option<PathBuf>,
+    /// Each leg's layout, when the run compares one commit in two layouts.
+    pub layouts: Option<Layouts>,
 }
 
 /// The host emitter benchmark: each leg's own `emit_corpus`, and the caches both read.
@@ -178,12 +184,22 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             ));
         }
     }
-    let wine = check_wine(&config.base, &config.cand)?;
+    let wine = match &config.layouts {
+        Some(layouts) => check_layouts(&config.base, &config.cand, layouts)?,
+        None => check_wine(&config.base, &config.cand)?,
+    };
     fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let wine_file = out.join(WINE_FILE);
     fs::write(&wine_file, format!("{wine}\n"))
         .map_err(|e| format!("{}: {e}", wine_file.display()))?;
-    println!("bench-ab: both legs run {wine}");
+    if let Some(layouts) = &config.layouts {
+        let layouts_file = out.join(LAYOUTS_FILE);
+        fs::write(&layouts_file, layouts.render())
+            .map_err(|e| format!("{}: {e}", layouts_file.display()))?;
+        println!("bench-ab: {}; wine: {wine}", layouts.describe());
+    } else {
+        println!("bench-ab: both legs run {wine}");
+    }
     let benches = select_benches(config)?;
     if config.options.allow_same_image {
         // Recorded in the directory so that a later `bench-compare` of it
@@ -238,10 +254,11 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             Step::Round { group, round, leg } => {
                 let members: Vec<&Bench> = groups[group].iter().map(|&at| &benches[at]).collect();
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(
+                machine::keep_when_ready(
                     &dir,
                     &binary_name(&members[0].exe),
-                    &machine::sample(&wines),
+                    &wines,
+                    config.wait_idle,
                 )?;
                 for (member, path, file) in run_round(config, spec, &members, &dir)? {
                     let at = groups[group][member];
@@ -299,7 +316,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
                     Leg::Cand => &host.cand,
                 };
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(&dir, "host", &machine::sample(&wines))?;
+                machine::keep_when_ready(&dir, "host", &wines, config.wait_idle)?;
                 for (path, file) in &run_host(exe, &host.corpora, &dir, config.timeout)? {
                     check_stamp(path, file, spec)?;
                     println!(
@@ -413,6 +430,43 @@ pub fn check_wine(base: &LegSpec, cand: &LegSpec) -> Result<String, String> {
     Ok(format!("{base_version}, one wineserver"))
 }
 
+/// Check the legs of a layout comparison, and name the Wine or Wines they run.
+///
+/// Both legs build one commit, so their stamps must match, and their layouts
+/// must differ, or the run compares nothing. Legs of one runtime have to run
+/// one Wine, as in [`check_wine`]; legs of two runtimes run two, which the
+/// comparison is about, and the result names both.
+///
+/// # Errors
+///
+/// Returns a message when the stamps differ, the layouts are the same, a
+/// loader cannot be run, or legs of one runtime run two Wines.
+pub fn check_layouts(base: &LegSpec, cand: &LegSpec, layouts: &Layouts) -> Result<String, String> {
+    if base.stamp != cand.stamp {
+        return Err(format!(
+            "a layout comparison runs one commit in both legs, but base is stamped {} and \
+             cand {}",
+            base.stamp, cand.stamp
+        ));
+    }
+    if layouts.base == layouts.cand {
+        return Err(format!(
+            "both legs have the layout {} {}: a layout comparison needs two",
+            layouts.base.runtime, layouts.base.variant
+        ));
+    }
+    if layouts.base.runtime == layouts.cand.runtime {
+        return check_wine(base, cand);
+    }
+    Ok(format!(
+        "base {} ({}), cand {} ({})",
+        wine_version(&base.wine)?,
+        base.wine.display(),
+        wine_version(&cand.wine)?,
+        cand.wine.display()
+    ))
+}
+
 /// What `wine --version` prints, which the loader answers without a prefix or a server.
 fn wine_version(wine: &Path) -> Result<String, String> {
     let output = Command::new(wine)
@@ -440,7 +494,7 @@ fn select_benches(config: &AbConfig) -> Result<Vec<Bench>, String> {
     let mut found: Vec<Bench> = Vec::new();
     for exe in &config.exes {
         let binary = binary_name(exe);
-        let mut launcher = leg_launcher(&config.cand, exe, None, config.timeout)?;
+        let mut launcher = leg_launcher(&config.cand, exe, None, config.timeout, "info")?;
         for name in launcher.list()? {
             let id = test_id(&binary, &name);
             if selected(&id, &config.benches) {
@@ -504,26 +558,34 @@ pub fn names_host(pattern: &str) -> bool {
     !pattern.is_empty() && HOST_ID.contains(pattern)
 }
 
-/// A launcher for `exe` under `spec`'s Wine and prefix, running the `#[ignore]`d tests.
+/// A benchmark launcher with the same explicit log filter on both sides of Wine.
+///
+/// Timed runs need INFO identity and perf records even if the caller disabled
+/// logging. Shape runs supply their trace filter instead. Set the Unix-side
+/// override too, so an inherited Wine setting cannot suppress either account.
 fn leg_launcher(
     spec: &LegSpec,
     exe: &Path,
     log_dir: Option<&Path>,
     timeout: Duration,
+    log_filter: &str,
 ) -> Result<WineLauncher, String> {
     Ok(
         WineLauncher::new(&spec.wine, exe, log_dir, timeout, Box::new(|_| {}))?
             .ignored_only(true)
-            .with_env("WINEPREFIX", &spec.prefix.to_string_lossy()),
+            .with_env("WINEPREFIX", &spec.prefix.to_string_lossy())
+            .with_env("RUST_LOG", log_filter)
+            .with_env("__CX_UNIX_RUST_LOG", log_filter),
     )
 }
 
-/// The `MTLD3D_CONFIG` of a run writing into `dir`: the base config, then its `log.dir`.
+/// The `MTLD3D_CONFIG` of a run: the leg override or shared config, then its `log.dir`.
 ///
 /// The layer reads the path on the PE side, where the unix root is drive
 /// `Z:`. It comes last so that it wins over any `log.dir` in the base.
 #[must_use]
-pub fn run_config(base: &str, dir: &Path) -> String {
+pub fn run_config(shared: &str, leg: &LegSpec, dir: &Path) -> String {
+    let base = leg.config.as_deref().unwrap_or(shared);
     let log_dir = format!("log.dir=Z:{}", dir.display());
     if base.is_empty() {
         log_dir
@@ -556,8 +618,8 @@ fn run_round(
         link_corpus(corpus, dir)?;
     }
     let before = metrics_files(dir)?;
-    let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout)?
-        .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir));
+    let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout, "info")?
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir));
     let names: Vec<String> = benches.iter().map(|bench| bench.name.clone()).collect();
     let mut outcome = Outcome::default();
     let run = attribute::run_binary(&mut launcher, Some(names), 1, true, &mut outcome)?;
@@ -569,6 +631,7 @@ fn run_round(
             outcome.notes()
         ));
     }
+    check_measurement_logs(dir)?;
     check_verdicts(benches, &outcome.results, run.failed, dir)
         .map_err(|reason| format!("{reason}{}", outcome.notes()))?;
     let written = new_files(dir, &before)?
@@ -576,6 +639,42 @@ fn run_round(
         .map(|path| metrics::read(&path).map(|file| (path, file)))
         .collect::<Result<Vec<_>, String>>()?;
     assign(benches, written, dir)
+}
+
+/// Reject explicitly invalid measurements, including messages flushed at shutdown.
+///
+/// External frame timings can still exist when calibration failed, so inspect the
+/// completed process logs before accepting any metrics. Failed-process logs and
+/// cold-start child logs remain in the same round directory.
+fn check_measurement_logs(dir: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("log" | "layer-log")
+        ) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        check_measurement_log(&path, &text)?;
+    }
+    Ok(())
+}
+
+fn check_measurement_log(path: &Path, text: &str) -> Result<(), String> {
+    if let Some((line, message)) = text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("perf-invalid:"))
+    {
+        return Err(format!(
+            "{}:{}: invalid benchmark measurement: {}",
+            path.display(),
+            line + 1,
+            message.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Check that every one of `benches` passed in a round process that reported `results`.
@@ -689,9 +788,8 @@ fn run_shape(
         text
     });
     fs::write(&names, text).map_err(|e| format!("{}: {e}", names.display()))?;
-    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
-        .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir))
-        .with_env("RUST_LOG", SHAPE_RUST_LOG);
+    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout, SHAPE_RUST_LOG)?
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir));
     let mut watch = shape::Watch::default();
     let end = launcher.run_until(&bench.name, &mut |log, stdout| watch.look(log, stdout))?;
     let what = format!("the shape run of {} under {}", bench.id, dir.display());

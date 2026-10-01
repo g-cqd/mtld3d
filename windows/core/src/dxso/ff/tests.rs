@@ -36,6 +36,7 @@ fn stage_disable() -> FfStage {
 
 fn default_vs_key() -> FfVsKey {
     FfVsKey {
+        reserved: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,
@@ -1609,6 +1610,7 @@ fn emits_alpha_test_discard() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
+        reserved: 0,
         alpha_func: narrow(D3DCMP_GREATER),
         fog_mode: 0,
         fog_table_mode: 0,
@@ -1641,6 +1643,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
     vs.fog_mode = narrow(D3DFOG_LINEAR);
     let ps = default_ps_key();
     let variant = VariantKey {
+        reserved: 0,
         alpha_func: 0,
         fog_mode: 3,
         fog_table_mode: 0,
@@ -1755,6 +1758,7 @@ fn omits_alpha_test_when_always() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
+        reserved: 0,
         alpha_func: narrow(D3DCMP_ALWAYS),
         fog_mode: 0,
         fog_table_mode: 0,
@@ -3029,15 +3033,15 @@ fn packed_stage_tracks_ternary_arguments_in_its_hash_and_size() {
         key.stages[0].color_arg0 = narrow(D3DTA_TEXTURE);
         assert_ne!(key, current);
         assert_ne!(
-            crate::shader_cache::ff_key_hash(&key),
-            crate::shader_cache::ff_key_hash(&current)
+            crate::shader_key::ff_key_hash(&key),
+            crate::shader_key::ff_key_hash(&current)
         );
         key.stages[0].color_arg0 = current.stages[0].color_arg0;
         key.stages[0].set_result(FfStageResult::Temp);
         assert_ne!(key, current);
         assert_ne!(
-            crate::shader_cache::ff_key_hash(&key),
-            crate::shader_cache::ff_key_hash(&current)
+            crate::shader_key::ff_key_hash(&key),
+            crate::shader_key::ff_key_hash(&current)
         );
         assert_eq!(key.stages[0].has_texture(), mask & 1 != 0);
     }

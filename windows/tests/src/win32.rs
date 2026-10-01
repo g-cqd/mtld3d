@@ -106,15 +106,15 @@ const TEST_FAILURE_EXIT_CODE: u32 = 101;
 /// Make a failed assertion end the test process with a failing exit code.
 ///
 /// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
-/// once a device has been created (it cannot survive snmalloc's thread-local
-/// teardown on Wine's 1 MB main-thread stack), so a test binary's exit
-/// status is the one that `TerminateProcess` carries. The hook keeps the
-/// default hook's report, which names the failing test (libtest runs each
-/// test on a thread named after it), and then terminates with libtest's
-/// failure code at the first failed assertion, without waiting for libtest
-/// to reach the exit of its own. The tests of the suite share the
-/// process, so the ones in flight go down with it: the e2e runner marks the
-/// named test failed and runs the rest again in a fresh process.
+/// at process exit once a device has been created (it cannot survive
+/// snmalloc's thread-local teardown on Wine's 1 MB main-thread stack), so a
+/// test binary's exit status is the one that `TerminateProcess` carries.
+/// The hook keeps the default hook's report, which names the failing test
+/// (libtest runs each test on a thread named after it), and then terminates
+/// with libtest's failure code at the first failed assertion, without
+/// waiting for libtest to reach the exit of its own. The tests of the suite
+/// share the process, so the ones in flight go down with it: the e2e runner
+/// marks the named test failed and runs the rest again in a fresh process.
 pub fn install_failure_exit_hook() {
     FAILURE_EXIT_HOOK.call_once(|| {
         let default_hook = std::panic::take_hook();
@@ -653,17 +653,32 @@ const _: () = assert!(size_of::<DevModeW>() == DEV_MODE_SIZE as usize);
 /// Panics if the query fails, which means the prefix has no display at all.
 pub fn current_display_mode() -> (u32, u32) {
     const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    display_settings(ENUM_CURRENT_SETTINGS, "ENUM_CURRENT_SETTINGS")
+}
+
+/// The primary display's registry mode (`EnumDisplaySettingsW(ENUM_REGISTRY_SETTINGS)`).
+///
+/// The mode a fullscreen device puts back on the way out. A mode-set that
+/// lasts only while a device is fullscreen leaves it alone.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+pub fn registry_display_mode() -> (u32, u32) {
+    const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
+    display_settings(ENUM_REGISTRY_SETTINGS, "ENUM_REGISTRY_SETTINGS")
+}
+
+/// The size `EnumDisplaySettingsW` answers for one of its two pseudo-indices.
+fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
     // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
     // valid value.
     let mut dm: DevModeW = unsafe { core::mem::zeroed() };
     dm.size = DEV_MODE_SIZE;
     // SAFETY: Win32 thunk; a null device name selects the primary display
     // and `dm` is an owned local with `size` set per the API contract.
-    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), ENUM_CURRENT_SETTINGS, &raw mut dm) };
-    assert!(
-        ok != 0,
-        "EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS) failed"
-    );
+    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+    assert!(ok != 0, "EnumDisplaySettingsW({name}) failed");
     (dm.pels_width, dm.pels_height)
 }
 
