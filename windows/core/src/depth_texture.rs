@@ -80,8 +80,14 @@ impl PackedDepth {
         };
         // Adding 2^52 rounds a nonnegative binary64 value below 2^24 to
         // an integer in its mantissa, without an unchecked float-to-int cast.
-        let rounded = (f64::from(depth) * max + 4_503_599_627_370_496.0).to_bits()
-            - 4_503_599_627_370_496.0_f64.to_bits();
+        // The scale and the bias are two separately rounded operations on
+        // purpose: the trick needs the product rounded to a binary64 first and
+        // the bias to round *that* to an integer. A fused multiply-add rounds
+        // once over the pair instead, which lands a different code on ties and
+        // would change the packed D16/D24 bytes this writes.
+        let scaled = f64::from(depth) * max;
+        let rounded =
+            (scaled + 4_503_599_627_370_496.0).to_bits() - 4_503_599_627_370_496.0_f64.to_bits();
         let bytes = rounded.to_le_bytes();
         match self {
             Self::D16 => pixel[..2].copy_from_slice(&bytes[..2]),

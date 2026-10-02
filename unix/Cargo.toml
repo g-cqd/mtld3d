@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 version = "0.11.0"
 license = "Zlib"
 description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
@@ -170,3 +170,9 @@ undocumented_unsafe_blocks = "warn"
 # (frame encoder, MSL codegen templates, per-opcode dispatchers) where the
 # structural alternative is fragmented helpers threading the same state.
 too_many_lines = "allow"
+# `assert!(x.is_empty())` is how the test modules spell an emptiness property,
+# at over a hundred sites. The lint's rewrite restates it as a comparison
+# against an empty literal, which for a slice has to name an element type the
+# assertion does not care about (`assert_eq!(v, [] as [u32; 0])`), to buy a
+# failure message that says "not empty" either way.
+assert_is_empty = "allow"

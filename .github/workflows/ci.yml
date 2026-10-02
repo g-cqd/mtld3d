@@ -70,10 +70,10 @@ env:
   # paravirtual device that made Metal abort inside explorer.exe, so no prefix
   # ever booted there.
   WINE_RELEASE: cx-26.3.0-5
-  RUST_STABLE: 1.98.1
-  RUST_NIGHTLY: nightly-2026-08-18
+  RUST_STABLE: 1.99.0
+  RUST_NIGHTLY: nightly-2026-10-02
   CARGO_TOOLS: xwin@0.10.0
-  NEXTEST_VERSION: 0.9.143
+  NEXTEST_VERSION: 0.9.146
   # The paravirtual GPU on a runner does not implement the counters the Metal HUD
   # samples, and says so on every launch. The validation layer keeps the
   # Makefile's default of on: it catches the misuse these legs exist to find.
