@@ -43,10 +43,16 @@ use log::{info, trace};
 pub use mtld3d_shared::perf::{
     CycleAddTimer, CycleSetTimer, init_tracking_enabled, pair_stats_enabled, perf_enabled,
 };
+// The summary converts cycles through the calibrated counter rate, which is
+// the host's: 24 MHz for an arm64 build's `CNTVCT_EL0`, 1 GHz for an x86_64
+// `rdtsc` under Rosetta, a few GHz on an Intel Mac. Unit tests render fixed
+// cycle counts, so they use the fixed-rate stand-in below instead.
+#[cfg(all(perf_tracking, not(test)))]
+use mtld3d_shared::tsc::cycles_to_ms;
 #[cfg(perf_tracking)]
 use mtld3d_shared::{
     CommandType,
-    tsc::{cycles_to_ms, rdtsc, secs_to_cycles},
+    tsc::{rdtsc, secs_to_cycles},
 };
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind, perf::SubmitTimings};
 #[cfg(perf_tracking)]
@@ -6291,6 +6297,18 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
         kv.total("faults_major", faults.major);
     }
     kv
+}
+
+/// Test stand-in for `mtld3d_shared::tsc::cycles_to_ms`: the rate is 1 GHz, one cycle a nanosecond.
+///
+/// The fixtures in `tests` are cycle counts whose rendered milliseconds are
+/// written out, so the rate they render at has to be a constant of the test
+/// rather than a property of the machine. It is the same arithmetic as the
+/// production function with the calibrated rate fixed at `1_000_000_000`, so a
+/// host that happens to run at 1 GHz renders identically.
+#[cfg(all(test, perf_tracking))]
+fn cycles_to_ms(cycles: u64) -> f64 {
+    mtld3d_shared::tsc::u64_to_f64_exact(cycles) * 1e3 / 1e9
 }
 
 #[cfg(all(test, perf_tracking))]
