@@ -444,7 +444,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	bundle version-check production-assert-gate mem-routine-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
-	test test-unit test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
+	test test-unit test-unit-perf test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
 	test-e2e-arm64x bench bench-ab bench-variants bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 conformance-i686-arm64 conformance-x86_64-arm64 \
 	conformance-arm64x \
@@ -1233,6 +1233,17 @@ test: test-unit test-e2e-i686 test-e2e-x86_64 $(ARM64_ARCHS:%=test-e2e-%-arm64) 
 test-unit:
 	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
 	cd unix && cargo +$(RUST_STABLE) nextest run
+
+# The perf telemetry's own unit tests. They are compiled only when `MTLD3D_PERF`
+# turns on `cfg(perf_tracking)` (`mod tests` in `windows/core/src/perf.rs` and
+# the timer tests in `unix/shared`), so `test-unit` never sees them. Set here
+# rather than through `PERF=1` so the target means the same under any `PERF`.
+# Not part of `test`: flipping the cfg rebuilds `mtld3d-core` and everything
+# above it, which would make every `make test` pay for it twice. CI runs it as
+# a step of the `check` job.
+test-unit-perf:
+	cd windows && MTLD3D_PERF=1 cargo +$(RUST_STABLE) nextest run -p mtld3d-core --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
+	cd unix && MTLD3D_PERF=1 cargo +$(RUST_STABLE) nextest run -p mtld3d-shared
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.

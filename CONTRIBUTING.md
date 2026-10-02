@@ -42,6 +42,11 @@ Two commands, both green before you commit:
   many of its checks fail by design, so it gates on a regression against a
   baseline instead of on zero failures.
 
+The perf telemetry's unit tests exist only in a `PERF=1` build, so neither
+command above compiles them. `make test-unit-perf` runs them, and CI runs it as
+a step of the `check` job; run it yourself after touching `perf.rs` or the
+shared timers.
+
 Two opt-in switches (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
 add legs that run under an arm64 Wine, the one `WINE_ARM64` names. `ARM64=1`
 adds `test-e2e-i686-arm64` and `test-e2e-x86_64-arm64` to `make test`, the

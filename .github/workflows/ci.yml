@@ -162,6 +162,11 @@ jobs:
       - name: test-unit
         if: ${{ !cancelled() }}
         run: make test-unit
+      # The telemetry's unit tests exist only in a `PERF=1` build, which no
+      # other step makes, so without this they would compile nowhere.
+      - name: test-unit-perf
+        if: ${{ !cancelled() }}
+        run: make test-unit-perf
 
   # The end-to-end suite: the staged test binaries, run by the pinned Wine
   # against a Metal device, one leg per image and PE arch.
