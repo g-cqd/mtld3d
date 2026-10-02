@@ -95,7 +95,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # BUILD_ID, which names the build inside every binary, comes from
           # `git describe --tags`.
@@ -107,7 +107,7 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           prime: 'true'
       - run: make stage
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: stage
           path: windows/target/mtld3d-stage.tar
@@ -126,7 +126,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-tags: true
       - uses: ./.github/actions/prepare
@@ -214,7 +214,7 @@ jobs:
             arch: i686
             scale: "0.75"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
@@ -246,7 +246,7 @@ jobs:
       # the one whose logs are worth reading, and a leg cut off by its budget
       # ends cancelled, not failed. A leg that dies before any process logs a
       # line has nothing to upload, and that must not turn one red into two.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
@@ -293,7 +293,7 @@ jobs:
             printf 'state=completed\n'
           } >> "$output/collection-status.txt"
           exit "$collector_status"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-system-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
@@ -346,7 +346,7 @@ jobs:
             arch: i686
             variant: scale
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
@@ -393,14 +393,14 @@ jobs:
 
       # `always()`, because a diverging run is exactly the one whose output is
       # worth reading, and the job reports failure whenever it diverges.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ inputs.record_intel_baseline && matrix.runner == 'macos-15-intel' }}
         with:
           name: baseline-mac2-${{ matrix.arch }}
@@ -439,7 +439,7 @@ jobs:
       # refuse to fetch one ref from two sources ("Cannot fetch both <sha>
       # and refs/tags/<tag> to refs/tags/<tag>"), which failed every tag run
       # since the macos-26 image.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The toolchain first, since every make target needs the WINE_SDK the
       # prepare action sets; then the version check, so a tag that disagrees
       # with the manifests is answered before the wait for main's run and the
