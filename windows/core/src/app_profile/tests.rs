@@ -282,3 +282,43 @@ fn a_builtin_profile_is_found_by_name_alone() {
         "an executable name is not a profile name"
     );
 }
+
+/// The three fields read out of the shipped `FarCry2.exe` (GOG 1.0.0.7).
+const FAR_CRY_2: [(&str, &str); 3] = [
+    ("CompanyName", "Ubisoft Entertainment"),
+    ("ProductName", "Far Cry 2"),
+    ("OriginalFilename", "FarCry2.exe"),
+];
+
+#[test]
+fn the_far_cry_2_profile_reports_the_adapter_vendor_its_alpha_to_coverage_needs() {
+    let id = AppIdentity::new("FarCry2.exe".to_owned(), Some(&blob(&FAR_CRY_2)));
+    let profile = lookup(&id).expect("the Far Cry 2 profile matches the real binary's resource");
+    assert_eq!(profile.name(), "farcry2");
+    assert_eq!(parse(None, "", None).adapter_spoof, AdapterSpoof::None);
+    assert_eq!(
+        parse(Some(profile), "", None).adapter_spoof,
+        AdapterSpoof::Nvidia
+    );
+    // The installed file is lower case on a case-insensitive volume.
+    let lower = AppIdentity::new("farcry2.exe".to_owned(), Some(&blob(&FAR_CRY_2)));
+    assert_eq!(lookup(&lower).map(AppProfile::name), Some("farcry2"));
+    // A user's file still wins, key by key.
+    assert_eq!(
+        parse(Some(profile), "adapter.spoof=none", None).adapter_spoof,
+        AdapterSpoof::None
+    );
+}
+
+#[test]
+fn the_far_cry_2_profile_leaves_other_ubisoft_programs_alone() {
+    let editor = AppIdentity::new("FC2Editor.exe".to_owned(), Some(&blob(&FAR_CRY_2)));
+    assert!(lookup(&editor).is_none());
+    let other = blob(&[
+        ("CompanyName", "Somebody Else"),
+        ("ProductName", "Far Cry 2"),
+        ("OriginalFilename", "FarCry2.exe"),
+    ]);
+    let id = AppIdentity::new("FarCry2.exe".to_owned(), Some(&other));
+    assert!(lookup(&id).is_none());
+}

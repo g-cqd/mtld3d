@@ -60,6 +60,26 @@ static PROFILES: &[AppProfile] = &[
         original_filename: None,
         settings: "adapter.spoof=amd;caps.dfFormats=false;depth.aliasSameSize=true",
     },
+    // Far Cry 2.
+    //
+    // Its "alpha to coverage" option only works on an adapter it recognises.
+    // At start-up the game reads the adapter vendor and, for NVIDIA, assumes
+    // the `A2M1` POINTSIZE control, and for ATI probes
+    // `CheckDeviceFormat(ATOC)`. For any other vendor it sets neither, yet it
+    // still leaves its foliage shaders without an alpha test, relying on the
+    // coverage it never requested: with 4x MSAA and the option on, every leaf
+    // card and blade of grass draws opaque. Reporting the NVIDIA identity makes
+    // it request coverage through the `A2M` latch, which mtld3d honours
+    // independently of `ALPHATESTENABLE`. The AMD identity also works, through
+    // `ATOC`, but depends on the game raising `ALPHATESTENABLE` per draw.
+    AppProfile {
+        name: "farcry2",
+        exe: "FarCry2.exe",
+        company: Some("Ubisoft"),
+        product: Some("Far Cry 2"),
+        original_filename: Some("FarCry2.exe"),
+        settings: "adapter.spoof=nvidia",
+    },
     // Halo 2.
     //
     // It locks a window of its shared world index buffer and writes past the
