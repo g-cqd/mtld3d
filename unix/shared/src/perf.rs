@@ -2,7 +2,8 @@
 //!
 //! Houses the runtime gate (`PERF_TRACKING_ENABLED` cached from
 //! `RUST_LOG=mtld3d::perf=info`) and the state-agnostic RAII timers
-//! (`CycleSetTimer`, `CycleAddTimer`, and `NanosSetTimer` for a duration
+//! (`CycleSetTimer`, `CycleAddTimer`, `AtomicCycleAddTimer` for a bucket
+//! several threads add to, and `NanosSetTimer` for a duration
 //! that crosses the boundary), all used by `d3d9.dll` PE-side
 //! AND `mtld3d.so` unix-side. Each cdylib that links `mtld3d-shared`
 //! statically gets its own static instance, which matches each cdylib's
@@ -16,14 +17,14 @@
 //! ## Compile-time gate
 //!
 //! Under `cfg(not(perf_tracking))` (i.e. `make` without `PERF=1`), the
-//! gate helpers become `const fn` returning `false`, both timer structs
-//! become unit structs with `const fn` no-op constructors and no `Drop`,
+//! gate helpers become `const fn` returning `false`, the timer structs
+//! become zero-sized with `const fn` no-op constructors and an empty `Drop`,
 //! and the statics + the latch fn vanish. LLVM then dead-code-eliminates
 //! every `let _t = CycleSetTimer::start(...)` call site to literal zero
 //! bytes after thin-LTO inlining.
 
 #[cfg(perf_tracking)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(perf_tracking)]
 use log::{Level, log_enabled};
@@ -434,6 +435,106 @@ impl Drop for CycleAddTimer {
 // LLVM DCEs the empty drop body after inlining.
 #[cfg(not(perf_tracking))]
 impl Drop for CycleAddTimer {
+    fn drop(&mut self) {}
+}
+
+/// A cycle total that several threads add to and one reader empties, without a lock.
+///
+/// The API-side perf buckets (`mtld3d-core`'s `ApiCycles`) are bumped by every
+/// thread a game calls Direct3D from and drained once per present, so they
+/// cannot be a plain `u64` behind a raw pointer: two timers dropping at once
+/// would race on it. Every access is a `Relaxed` atomic operation. That is
+/// enough because the value is a statistic with no ordering relation to any
+/// other memory: a reader only needs each add to land exactly once, which a
+/// read-modify-write guarantees whatever the interleaving, and a drain that
+/// races an add leaves the add for the next window rather than losing it.
+///
+/// A unit struct under `cfg(not(perf_tracking))`, where nothing holds one.
+#[cfg(perf_tracking)]
+#[repr(transparent)]
+pub struct CycleCounter(AtomicU64);
+
+#[cfg(not(perf_tracking))]
+pub struct CycleCounter;
+
+#[cfg(perf_tracking)]
+impl CycleCounter {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Add `cycles`, wrapping at `u64::MAX` like the plain accumulators do.
+    pub fn add(&self, cycles: u64) {
+        self.0.fetch_add(cycles, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Return the total and leave zero, as one step no concurrent [`Self::add`] can fall between.
+    #[must_use]
+    pub fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Default for CycleCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard for sub-scope measurements that accumulate into a shared [`CycleCounter`].
+///
+/// The counterpart of [`CycleAddTimer`] for targets that more than one thread
+/// bumps: the Draw-internal snapshot breakdown and the query wait on the API
+/// side. [`CycleAddTimer`] stays for the encoder thread's own plain fields.
+///
+/// `None` disables the timer: it reads no clock and writes nothing. The runtime
+/// gate belongs to whoever hands the target out, which is why there is no
+/// `perf_enabled()` check here. The borrow keeps the counter alive until the
+/// timer drops, so no lifetime argument is left to a caller.
+#[cfg(perf_tracking)]
+pub struct AtomicCycleAddTimer<'a> {
+    start: u64,
+    target: Option<&'a CycleCounter>,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct AtomicCycleAddTimer<'a>(core::marker::PhantomData<&'a CycleCounter>);
+
+impl<'a> AtomicCycleAddTimer<'a> {
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn start(target: Option<&'a CycleCounter>) -> Self {
+        let start = if target.is_some() { rdtsc() } else { 0 };
+        Self { start, target }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start(_target: Option<&'a CycleCounter>) -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Drop for AtomicCycleAddTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(target) = self.target {
+            target.add(rdtsc().saturating_sub(self.start));
+        }
+    }
+}
+
+// Empty Drop under `not(perf_tracking)`, as for the timers above.
+#[cfg(not(perf_tracking))]
+impl Drop for AtomicCycleAddTimer<'_> {
     fn drop(&mut self) {}
 }
 

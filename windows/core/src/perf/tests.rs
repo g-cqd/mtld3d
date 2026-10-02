@@ -1340,17 +1340,17 @@ fn exclusive_exit_saturates_when_children_exceed_elapsed() {
 #[test]
 fn api_timer_storage_outlives_nested_device_release() {
     let mut storage = ApiPerfStorage::new();
-    let weak = Arc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.shared);
     let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture);
     let inner = ApiTimer::new(Some(&storage), ApiCategory::Device);
     storage.state_mut().bump_texture_rename();
-    assert_eq!(storage.state.lock().unwrap().timer_depth, 2);
+    assert_eq!(storage.shared.state.lock().unwrap().timer_depth, 2);
     drop(storage);
     assert_eq!(weak.strong_count(), 2);
     drop(inner);
     {
         let retained = weak.upgrade().expect("outer timer owns the state");
-        let state = retained.lock().unwrap();
+        let state = retained.state.lock().unwrap();
         assert_eq!(state.timer_depth, 1);
         assert_eq!(state.counters.texture_renames, 1);
         assert_eq!(
@@ -1365,7 +1365,7 @@ fn api_timer_storage_outlives_nested_device_release() {
 #[test]
 fn api_timer_storage_outlives_direct_device_release() {
     let storage = ApiPerfStorage::new();
-    let weak = Arc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.shared);
     let timer = ApiTimer::new(Some(&storage), ApiCategory::Device);
     drop(storage);
     assert_eq!(weak.strong_count(), 1);
@@ -1380,7 +1380,7 @@ fn api_timer_nested_writeback_balances_depth_and_counts() {
     let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
     drop(inner);
     drop(outer);
-    let state = storage.state.lock().unwrap();
+    let state = storage.shared.state.lock().unwrap();
     assert_eq!(state.timer_depth, 0);
     assert_eq!(state.active_child_cycles, 0);
     assert_eq!(
@@ -1398,9 +1398,9 @@ fn api_timer_disabled_does_not_retain_storage() {
     // Unit tests install no logger, so the runtime gate remains disabled.
     assert!(!perf_enabled());
     let storage = ApiPerfStorage::new();
-    let weak = Arc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.shared);
     let timer = ApiTimer::start_device(Some(&storage), DeviceSubCategory::Misc);
-    assert_eq!(storage.state.lock().unwrap().timer_depth, 0);
+    assert_eq!(storage.shared.state.lock().unwrap().timer_depth, 0);
     assert_eq!(weak.strong_count(), 1);
     drop(storage);
     assert!(weak.upgrade().is_none());
@@ -1410,7 +1410,7 @@ fn api_timer_disabled_does_not_retain_storage() {
 #[test]
 fn api_perf_storage_without_timers_is_reclaimed() {
     let storage = ApiPerfStorage::new();
-    let weak = Arc::downgrade(&storage.state);
+    let weak = Arc::downgrade(&storage.shared);
     drop(storage);
     assert!(weak.upgrade().is_none());
 }
@@ -1668,7 +1668,7 @@ fn api_timers_from_many_threads_stay_balanced_without_panicking() {
             });
         }
     });
-    let state = storage.state.lock().unwrap();
+    let state = storage.shared.state.lock().unwrap();
     assert_eq!(state.timer_depth, 0);
     let total = u32::try_from(THREADS * ITERATIONS).unwrap();
     assert_eq!(
@@ -1679,4 +1679,167 @@ fn api_timers_from_many_threads_stay_balanced_without_panicking() {
         state.counters.api_call_counts_by_category[ApiCategory::Texture as usize],
         total
     );
+}
+
+/// Every API-side cycle bucket reaches its payload field at the drain, then starts again at zero.
+#[test]
+fn api_cycle_counters_drain_into_the_payload_and_reset() {
+    let mut storage = ApiPerfStorage::new();
+    let cycles = storage.cycles_if(true);
+    let buckets = [
+        cycles.query_wait(),
+        cycles.draw_snapshot(),
+        cycles.draw_push_op(),
+        cycles.draw_snapshot_stages(),
+        cycles.draw_snapshot_c_ff(),
+        cycles.draw_snapshot_c_pr(),
+        cycles.draw_snapshot_keys(),
+        cycles.draw_snapshot_bumps(),
+        cycles.draw_snapshot_keys_sampled(),
+    ];
+    for (i, bucket) in buckets.iter().enumerate() {
+        bucket
+            .expect("an enabled handle has every bucket")
+            .add(100 + i as u64);
+    }
+    for (section, value) in [
+        (SnapshotSection::Vdecl, 1_001),
+        (SnapshotSection::Rs, 1_002),
+        (SnapshotSection::PsConstB, 1_003),
+    ] {
+        cycles
+            .draw_snapshot_section(section)
+            .expect("an enabled handle has every section")
+            .add(value);
+    }
+    storage.state_mut().bump_vb_rename();
+
+    let mut first = FramePerfPayload::new();
+    storage.drain_into_payload(&mut first);
+    let c = &first.counters;
+    assert_eq!(c.query_wait_cycles, 100);
+    assert_eq!(c.draw_snapshot_cycles, 101);
+    assert_eq!(c.draw_push_op_cycles, 102);
+    assert_eq!(c.draw_snapshot_stages_cycles, 103);
+    assert_eq!(c.draw_snapshot_c_ff_cycles, 104);
+    assert_eq!(c.draw_snapshot_c_pr_cycles, 105);
+    assert_eq!(c.draw_snapshot_keys_cycles, 106);
+    assert_eq!(c.draw_snapshot_bumps_cycles, 107);
+    assert_eq!(c.draw_snapshot_keys_sampled_cycles, 108);
+    let mut sections = [0; SnapshotSection::SLOTS];
+    sections[SnapshotSection::Vdecl as usize] = 1_001;
+    sections[SnapshotSection::Rs as usize] = 1_002;
+    sections[SnapshotSection::PsConstB as usize] = 1_003;
+    assert_eq!(c.draw_snapshot_section_cycles, sections);
+    assert_eq!(c.vb_rename, 1, "the locked counters drain in the same call");
+
+    let mut second = FramePerfPayload::new();
+    storage.drain_into_payload(&mut second);
+    let c = &second.counters;
+    assert_eq!(c.query_wait_cycles, 0);
+    assert_eq!(c.draw_snapshot_cycles, 0);
+    assert_eq!(c.draw_snapshot_keys_sampled_cycles, 0);
+    assert_eq!(c.draw_snapshot_section_cycles, [0; SnapshotSection::SLOTS]);
+    assert_eq!(c.vb_rename, 0);
+}
+
+/// A handle exists only while the runtime gate is on, and it keeps the storage alive.
+#[test]
+fn api_cycles_handle_follows_the_gate_and_retains_the_storage() {
+    // Unit tests install no logger, so the runtime gate remains disabled.
+    assert!(!perf_enabled());
+    let storage = ApiPerfStorage::new();
+    assert!(storage.cycles().draw_snapshot().is_none());
+    assert!(storage.cycles_if(false).query_wait().is_none());
+
+    let weak = Arc::downgrade(&storage.shared);
+    let handle = storage.cycles_if(true);
+    drop(storage);
+    assert!(
+        handle.draw_snapshot().is_some(),
+        "the handle outlives the device's storage"
+    );
+    assert_eq!(weak.strong_count(), 1);
+    drop(handle);
+    assert!(weak.upgrade().is_none());
+}
+
+/// Timers on several threads add to the shared buckets and nested `ApiTimer`s without losing one.
+///
+/// Each iteration nests two `ApiTimer`s around two `AtomicCycleAddTimer`s and adds a known
+/// amount directly, so the totals the clock does not decide are exact: the call counts and the
+/// direct adds. The timed buckets can only be checked by their order, since an inner span is
+/// never longer than the span around it.
+#[test]
+fn nested_api_timers_and_cycle_timers_from_many_threads_lose_no_update() {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 20_000;
+    const ADD: u64 = 3;
+    let mut storage = ApiPerfStorage::new();
+    let cycles = storage.cycles_if(true);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..ITERATIONS {
+                    let outer = ApiTimer::new(Some(&storage), ApiCategory::Device);
+                    let parent = AtomicCycleAddTimer::start(cycles.draw_snapshot());
+                    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+                    let child = AtomicCycleAddTimer::start(cycles.draw_snapshot_stages());
+                    cycles.draw_push_op().expect("enabled").add(ADD);
+                    drop(child);
+                    drop(inner);
+                    drop(parent);
+                    drop(outer);
+                }
+            });
+        }
+    });
+    let calls = u32::try_from(THREADS * ITERATIONS).unwrap();
+    let mut payload = FramePerfPayload::new();
+    storage.drain_into_payload(&mut payload);
+    let c = &payload.counters;
+    assert_eq!(
+        c.api_call_counts_by_category[ApiCategory::Device as usize],
+        calls
+    );
+    assert_eq!(
+        c.api_call_counts_by_category[ApiCategory::Texture as usize],
+        calls
+    );
+    assert_eq!(c.draw_push_op_cycles, ADD * u64::from(calls));
+    assert!(c.draw_snapshot_cycles >= c.draw_snapshot_stages_cycles);
+    assert_eq!(storage.shared.state.lock().unwrap().timer_depth, 0);
+}
+
+/// A drain that races the timers counts every add exactly once across the drains.
+#[test]
+fn draining_while_threads_add_counts_every_add_once() {
+    const THREADS: u64 = 8;
+    const ADDS: u64 = 50_000;
+    let mut storage = ApiPerfStorage::new();
+    let cycles = storage.cycles_if(true);
+    let finished = std::sync::atomic::AtomicU64::new(0);
+    let mut drained = 0;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                let bucket = cycles
+                    .draw_snapshot_section(SnapshotSection::Rs)
+                    .expect("enabled");
+                for _ in 0..ADDS {
+                    bucket.add(1);
+                }
+                finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+            });
+        }
+        while finished.load(std::sync::atomic::Ordering::Acquire) < THREADS {
+            let mut payload = FramePerfPayload::new();
+            storage.drain_into_payload(&mut payload);
+            drained += payload.counters.draw_snapshot_section_cycles[SnapshotSection::Rs as usize];
+        }
+    });
+    let mut last = FramePerfPayload::new();
+    storage.drain_into_payload(&mut last);
+    drained += last.counters.draw_snapshot_section_cycles[SnapshotSection::Rs as usize];
+    assert_eq!(drained, THREADS * ADDS);
 }

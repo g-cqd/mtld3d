@@ -9,8 +9,10 @@
 //! Structure:
 //! * `ApiCategory` + `ApiTimer`  — RAII guard that buckets TSC cycles
 //!   by COM vtable category on every D3D9 entry point.
-//! * `ApiPerfStorage` owns the API thread's `ApiPerfState`.
-//!   Every counter the API thread bumps lands here.
+//! * `ApiPerfStorage` owns the API side's counters: the `ApiPerfState`
+//!   behind a mutex, and beside it the `ApiCycleCounters` of the timed
+//!   sub-scopes, which are atomics so that every thread a game calls
+//!   Direct3D from can bump them without the lock.
 //! * `FramePerfPayload` — embedded on `FrameData`. Copy of the
 //!   API-thread counters that crosses the API→encoder channel.
 //! * `EncoderPerfState` — embedded on `FrameEncoder`. Per-frame
@@ -41,7 +43,8 @@ use log::{info, trace};
 /// The gate + state-agnostic timers + latch fn moved to
 /// [`mtld3d_shared::perf`].
 pub use mtld3d_shared::perf::{
-    CycleAddTimer, CycleSetTimer, init_tracking_enabled, pair_stats_enabled, perf_enabled,
+    AtomicCycleAddTimer, CycleAddTimer, CycleCounter, CycleSetTimer, init_tracking_enabled,
+    pair_stats_enabled, perf_enabled,
 };
 // The summary converts cycles through the calibrated counter rate, which is
 // the host's: 24 MHz for an arm64 build's `CNTVCT_EL0`, 1 GHz for an x86_64
@@ -108,6 +111,8 @@ pub const SUMMARY_INTERVAL_SECS: u64 = 2;
 const _: () = {
     assert!(size_of::<ApiPerfStorage>() == 0);
     assert!(size_of::<ApiTimer>() == 0);
+    assert!(size_of::<ApiCycles>() == 0);
+    assert!(size_of::<AtomicCycleAddTimer<'static>>() == 0);
 };
 
 /// Perf telemetry has its own `log` target so the 2-second summary can be silenced.
@@ -441,11 +446,29 @@ pub enum OpSubDetail {
 /// from several threads, so the counters sit behind a mutex that is held only
 /// for one update and never across a nested entry point. Timing attributed to
 /// nested calls from different threads is approximate; memory safety is not.
+///
+/// The cycle totals of the Draw-internal sub-scopes and the query wait are the
+/// exception: they sit beside the mutex as [`CycleCounter`]s, because their
+/// timers run across calls that take the lock themselves. A timer that held a
+/// pointer into the locked state would write it without the lock; one that
+/// holds an [`ApiCycles`] adds atomically and leaves the lock alone.
 pub struct ApiPerfStorage {
     #[cfg(perf_tracking)]
-    state: Arc<Mutex<ApiPerfState>>,
+    shared: Arc<ApiPerfShared>,
     #[cfg(not(perf_tracking))]
     state: ApiPerfState,
+}
+
+/// What every holder of an [`ApiPerfStorage`] shares: the locked counters and the atomic ones.
+///
+/// The atomic totals are a sibling of the mutex, not a field of the locked
+/// state. A guard hands out `&mut ApiPerfState`, which asserts exclusive
+/// access to everything in it, so an atomic inside would be aliased by every
+/// thread adding to it while another holds the guard.
+#[cfg(perf_tracking)]
+struct ApiPerfShared {
+    cycles: ApiCycleCounters,
+    state: Mutex<ApiPerfState>,
 }
 
 impl Default for ApiPerfStorage {
@@ -459,7 +482,10 @@ impl ApiPerfStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(ApiPerfState::new())),
+            shared: Arc::new(ApiPerfShared {
+                cycles: ApiCycleCounters::new(),
+                state: Mutex::new(ApiPerfState::new()),
+            }),
         }
     }
 
@@ -475,7 +501,7 @@ impl ApiPerfStorage {
     pub fn state_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
         #[cfg(perf_tracking)]
         {
-            lock_state(&self.state)
+            lock_state(&self.shared.state)
         }
         #[cfg(not(perf_tracking))]
         {
@@ -483,23 +509,274 @@ impl ApiPerfStorage {
         }
     }
 
-    /// Stable backing for subtimers nested inside an owning API timer.
+    /// Hand out the atomic sub-scope counters, or nothing while perf tracking is off at runtime.
+    ///
+    /// The handle retains the storage, so it stays valid whatever happens to
+    /// the device while a timer built from it runs.
     #[cfg(perf_tracking)]
-    pub fn as_ptr(&mut self) -> *mut ApiPerfState {
-        let mut guard = lock_state(&self.state);
-        &raw mut *guard
+    #[must_use]
+    pub fn cycles(&self) -> ApiCycles {
+        self.cycles_if(perf_enabled())
     }
 
     #[cfg(not(perf_tracking))]
-    pub const fn as_ptr(&mut self) -> *mut ApiPerfState {
-        core::ptr::null_mut()
+    #[inline]
+    #[must_use]
+    pub const fn cycles(&self) -> ApiCycles {
+        ApiCycles
     }
+
+    /// [`Self::cycles`] with the runtime gate given, for a test that has no logger to latch it.
+    #[cfg(perf_tracking)]
+    fn cycles_if(&self, enabled: bool) -> ApiCycles {
+        ApiCycles {
+            shared: enabled.then(|| Arc::clone(&self.shared)),
+        }
+    }
+
+    /// Drain this frame's API-side counters into the outgoing payload, then zero them.
+    ///
+    /// Moves the locked counters and the atomic cycle totals. A timer that
+    /// adds while this runs is counted by the next frame's drain, not lost.
+    #[cfg(perf_tracking)]
+    pub fn drain_into_payload(&mut self, payload: &mut FramePerfPayload) {
+        lock_state(&self.shared.state).drain_into_payload(payload);
+        self.shared.cycles.drain_into(&mut payload.counters);
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    pub const fn drain_into_payload(&mut self, _payload: &mut FramePerfPayload) {}
 }
 
 /// Lock the counters; a poisoned lock still holds consistent plain counters.
 #[cfg(perf_tracking)]
 fn lock_state(state: &Mutex<ApiPerfState>) -> MutexGuard<'_, ApiPerfState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Cycle totals of the API-side sub-scopes, bumped by timers on any thread.
+///
+/// Every bucket here is a sub-scope inside a Draw or Query entry point, timed
+/// by an [`AtomicCycleAddTimer`] while the entry point's own [`ApiTimer`] is
+/// live. Each moves into the like-named [`FrameCounters`] field at the drain.
+#[cfg(perf_tracking)]
+struct ApiCycleCounters {
+    /// Time blocked in `IDirect3DQuery9::GetData(D3DGETDATA_FLUSH)` on Metal's completion wait.
+    query_wait: CycleCounter,
+    /// The Draw methods' snapshot phase.
+    draw_snapshot: CycleCounter,
+    /// The Draw methods' `push_op` phase.
+    draw_push_op: CycleCounter,
+    /// `snapshot_shared`'s per-stage binding walk.
+    draw_snapshot_stages: CycleCounter,
+    /// The const-snapshot block of a draw with a fixed-function stage.
+    draw_snapshot_c_ff: CycleCounter,
+    /// The const-snapshot block of a draw whose stages are both programmable.
+    draw_snapshot_c_pr: CycleCounter,
+    /// The shader-key resolution block.
+    draw_snapshot_keys: CycleCounter,
+    /// The post-consts scratch bumps.
+    draw_snapshot_bumps: CycleCounter,
+    /// The `keys` scope again, on the sampled draws that also time the sections.
+    draw_snapshot_keys_sampled: CycleCounter,
+    /// One section's rebuild block, indexed by [`SnapshotSection`].
+    draw_snapshot_section: [CycleCounter; SnapshotSection::SLOTS],
+}
+
+#[cfg(perf_tracking)]
+impl ApiCycleCounters {
+    const fn new() -> Self {
+        Self {
+            query_wait: CycleCounter::new(),
+            draw_snapshot: CycleCounter::new(),
+            draw_push_op: CycleCounter::new(),
+            draw_snapshot_stages: CycleCounter::new(),
+            draw_snapshot_c_ff: CycleCounter::new(),
+            draw_snapshot_c_pr: CycleCounter::new(),
+            draw_snapshot_keys: CycleCounter::new(),
+            draw_snapshot_bumps: CycleCounter::new(),
+            draw_snapshot_keys_sampled: CycleCounter::new(),
+            draw_snapshot_section: [const { CycleCounter::new() }; SnapshotSection::SLOTS],
+        }
+    }
+
+    /// Move each total into its field of `counters`, leaving zero behind.
+    fn drain_into(&self, counters: &mut FrameCounters) {
+        counters.query_wait_cycles = self.query_wait.take();
+        counters.draw_snapshot_cycles = self.draw_snapshot.take();
+        counters.draw_push_op_cycles = self.draw_push_op.take();
+        counters.draw_snapshot_stages_cycles = self.draw_snapshot_stages.take();
+        counters.draw_snapshot_c_ff_cycles = self.draw_snapshot_c_ff.take();
+        counters.draw_snapshot_c_pr_cycles = self.draw_snapshot_c_pr.take();
+        counters.draw_snapshot_keys_cycles = self.draw_snapshot_keys.take();
+        counters.draw_snapshot_bumps_cycles = self.draw_snapshot_bumps.take();
+        counters.draw_snapshot_keys_sampled_cycles = self.draw_snapshot_keys_sampled.take();
+        for (slot, counter) in counters
+            .draw_snapshot_section_cycles
+            .iter_mut()
+            .zip(&self.draw_snapshot_section)
+        {
+            *slot = counter.take();
+        }
+    }
+}
+
+/// A retained view of the API-side cycle counters: the source of every API-side timer target.
+///
+/// Holds the storage alive, and every target is a borrow of the handle, so a
+/// timer cannot outlive the counter it adds to. It is empty while perf
+/// tracking is off at runtime, and every getter then answers `None`, which
+/// disables the timer without a branch at the call site. A `ZST` under
+/// `cfg(not(perf_tracking))`.
+#[cfg(perf_tracking)]
+pub struct ApiCycles {
+    shared: Option<Arc<ApiPerfShared>>,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct ApiCycles;
+
+#[cfg(perf_tracking)]
+impl ApiCycles {
+    fn counter(
+        &self,
+        pick: impl FnOnce(&ApiCycleCounters) -> &CycleCounter,
+    ) -> Option<&CycleCounter> {
+        self.shared.as_deref().map(|shared| pick(&shared.cycles))
+    }
+
+    /// The bucket for the wait on the GPU inside a query poll.
+    #[must_use]
+    pub fn query_wait(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.query_wait)
+    }
+
+    /// The bucket for every Draw method's snapshot phase.
+    ///
+    /// Accumulated across calls: all Draw methods share the one bucket.
+    #[must_use]
+    pub fn draw_snapshot(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot)
+    }
+
+    /// The bucket for every Draw method's `Box::new` + `push_op` phase.
+    #[must_use]
+    pub fn draw_push_op(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_push_op)
+    }
+
+    /// The bucket for `snapshot_shared`'s per-stage binding walk.
+    ///
+    /// A sub-component of [`Self::draw_snapshot`]: both timers are live at
+    /// once, so the walk's cycles count into the outer total too, which is
+    /// the display shape (`snapshot` is the parent, `stages` nests under it).
+    #[must_use]
+    pub fn draw_snapshot_stages(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_stages)
+    }
+
+    /// The bucket for the const-snapshot block on a draw with a fixed-function stage.
+    ///
+    /// Selected at draw-classification time beside its programmable sibling
+    /// [`Self::draw_snapshot_c_pr`].
+    #[must_use]
+    pub fn draw_snapshot_c_ff(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_c_ff)
+    }
+
+    /// The bucket for the const-snapshot block on a draw whose stages are both programmable.
+    #[must_use]
+    pub fn draw_snapshot_c_pr(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_c_pr)
+    }
+
+    /// The bucket for the shader-key resolution block in `snapshot_shared`.
+    #[must_use]
+    pub fn draw_snapshot_keys(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_keys)
+    }
+
+    /// The bucket for the post-consts scratch bumps and cache assignments.
+    #[must_use]
+    pub fn draw_snapshot_bumps(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_bumps)
+    }
+
+    /// The bucket for one section's rebuild block in the snapshot.
+    ///
+    /// A child of [`Self::draw_snapshot_keys`] for the six sections inside
+    /// the `keys` scope. The timer runs only inside the section's dirty
+    /// branch, so the slot over the section's rebuild count is its cost per
+    /// rebuild.
+    #[must_use]
+    pub fn draw_snapshot_section(&self, section: SnapshotSection) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_section[section as usize])
+    }
+
+    /// The bucket for the `keys` scope of a sampled draw.
+    ///
+    /// The parent of [`Self::draw_snapshot_section`] on the same draws, so the
+    /// part of `keys` outside the six sections is measured on the draws the
+    /// sections are.
+    #[must_use]
+    pub fn draw_snapshot_keys_sampled(&self) -> Option<&CycleCounter> {
+        self.counter(|c| &c.draw_snapshot_keys_sampled)
+    }
+}
+
+#[cfg(not(perf_tracking))]
+impl ApiCycles {
+    #[inline]
+    #[must_use]
+    pub const fn query_wait(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_push_op(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_stages(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_c_ff(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_c_pr(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_keys(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_bumps(&self) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_section(&self, _section: SnapshotSection) -> Option<&CycleCounter> {
+        None
+    }
+    #[inline]
+    #[must_use]
+    pub const fn draw_snapshot_keys_sampled(&self) -> Option<&CycleCounter> {
+        None
+    }
 }
 
 /// RAII guard that measures TSC cycles spent inside a D3D9 COM vtable entry point.
@@ -522,7 +799,7 @@ fn lock_state(state: &Mutex<ApiPerfState>) -> MutexGuard<'_, ApiPerfState> {
 #[cfg(perf_tracking)]
 pub struct ApiTimer {
     start: u64,
-    state: Option<Arc<Mutex<ApiPerfState>>>,
+    state: Option<Arc<ApiPerfShared>>,
     category: ApiCategory,
     /// Set on `Device`-category timers built via `start_device`.
     ///
@@ -564,11 +841,11 @@ impl ApiTimer {
     /// (returns 0) when disabled.
     #[cfg(perf_tracking)]
     #[inline]
-    fn enter_scope(state: Option<&Arc<Mutex<ApiPerfState>>>) -> u64 {
+    fn enter_scope(state: Option<&Arc<ApiPerfShared>>) -> u64 {
         let Some(state) = state else {
             return 0;
         };
-        let mut perf = lock_state(state);
+        let mut perf = lock_state(&state.state);
         let saved = perf.active_child_cycles;
         perf.active_child_cycles = 0;
         perf.timer_depth = perf.timer_depth.saturating_add(1);
@@ -583,7 +860,7 @@ impl ApiTimer {
 
     #[cfg(perf_tracking)]
     fn new(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
-        let state = storage.map(|s| Arc::clone(&s.state));
+        let state = storage.map(|s| Arc::clone(&s.shared));
         let saved_child_cycles = Self::enter_scope(state.as_ref());
         let start = if state.is_some() { rdtsc() } else { 0 };
         Self {
@@ -704,7 +981,7 @@ impl Drop for ApiTimer {
             return;
         };
         let elapsed = rdtsc() - self.start;
-        let mut perf = lock_state(state);
+        let mut perf = lock_state(&state.state);
         // Exclusive (self) time: subtract the cycles consumed by nested
         // timers (delegated D3D9 entry points) so their interval lands
         // in their own bucket, not double-counted into ours too. Then
@@ -776,7 +1053,7 @@ struct FrameCounters {
     /// TSC cycles the API thread spent blocked in `IDirect3DQuery9::GetData(D3DGETDATA_FLUSH)`.
     ///
     /// Waiting on Metal's `MTLCommandBuffer::waitUntilCompleted` —
-    /// accumulated by `CycleAddTimer` because a single frame can contain
+    /// accumulated by an `AtomicCycleAddTimer` because a single frame can contain
     /// multiple FLUSH polls that each block.
     query_wait_cycles: u64,
     /// Per-sub-category cycle bucket inside the `Device` `ApiCategory`.
@@ -804,7 +1081,7 @@ struct FrameCounters {
     ///
     /// The phase: `snapshot_bound_vertex_source`,
     /// `snapshot_bound_index_source`, `snapshot_shared`. Accumulated by
-    /// `CycleAddTimer` so all Draw entry points share a single bucket.
+    /// `AtomicCycleAddTimer` so all Draw entry points share a single bucket.
     draw_snapshot_cycles: u64,
     /// Sub-component of `draw_snapshot_cycles` covering the per-stage binding walk.
     ///
@@ -1329,16 +1606,18 @@ impl EncoderFrameCounters {
 /// Per-frame API-thread counters owned by [`ApiPerfStorage`].
 ///
 /// Under `cfg(not(perf_tracking))` this collapses to a unit struct; all
-/// `bump_*` / `add_*` / `*_cycles_ptr` methods become `const fn` no-ops
-/// (pointer accessors return `null_mut()`, which the shared-side timer
-/// stubs ignore). The counter state and the entire `drain_into_payload`
-/// path are then compile-time-elided.
+/// `bump_*` / `add_*` methods become `const fn` no-ops. The counter state
+/// and the entire `drain_into_payload` path are then compile-time-elided.
 #[cfg(perf_tracking)]
 pub struct ApiPerfState {
     /// The API-thread-bumped per-frame counters (see [`FrameCounters`]).
     ///
     /// `drain_into_payload` moves this wholesale into the payload and
     /// leaves a zeroed `FrameCounters` behind.
+    ///
+    /// The query-wait and Draw-internal cycle fields stay zero in here: their
+    /// timers add to `ApiCycleCounters` instead, and
+    /// `ApiPerfStorage::drain_into_payload` fills the payload's copies from it.
     counters: FrameCounters,
     reset_epoch: u64,
     reset_epoch_saturated: bool,
@@ -1409,91 +1688,6 @@ impl ApiPerfState {
     pub const fn advance_reset_epoch(&mut self) {
         self.reset_epoch_saturated |= self.reset_epoch == u64::MAX;
         self.reset_epoch = self.reset_epoch.saturating_add(1);
-    }
-
-    /// Pointer the `CycleAddTimer` writes into.
-    ///
-    /// Naming mirrors the `present_block_cycles_ptr` accessor — d3d9
-    /// query.rs is the only consumer.
-    pub const fn query_wait_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.query_wait_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the Draw-internal snapshot phase.
-    ///
-    /// Accumulated (multiple calls per frame), one shared bucket for all
-    /// Draw methods.
-    pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the Draw-internal push-op phase.
-    ///
-    /// `Box::new` + `push_op`.
-    pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_push_op_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for `snapshot_shared`'s per-stage binding walk.
-    ///
-    /// Sub-component of `draw_snapshot_cycles_ptr`; both timers are live
-    /// simultaneously — the stage walk's cycles are double-counted into
-    /// the outer `snapshot` total, which is the desired display semantic
-    /// (`snapshot` is the parent, `stages` is shown nested under it).
-    pub const fn draw_snapshot_stages_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_stages_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the const-snapshot block on FF draws.
-    ///
-    /// Peer of `draw_snapshot_stages_cycles_ptr` under the parent
-    /// `snapshot` total. Selected at draw-classification time alongside
-    /// its programmable sibling [`Self::draw_snapshot_c_pr_cycles_ptr`].
-    pub const fn draw_snapshot_c_ff_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_c_ff_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the const-snapshot block.
-    ///
-    /// Selected when both VS and PS are programmable. Peer of
-    /// [`Self::draw_snapshot_c_ff_cycles_ptr`].
-    pub const fn draw_snapshot_c_pr_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_c_pr_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the shader-key resolution block.
-    ///
-    /// The block lives in `snapshot_shared`. Peer of `stages`/`consts`
-    /// under the parent `snapshot` total.
-    pub const fn draw_snapshot_keys_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_keys_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for the post-consts block in `snapshot_shared`.
-    ///
-    /// The scratch-bump + cache-assignment work. Peer of
-    /// `stages`/`consts`/`keys` under the parent `snapshot` total.
-    pub const fn draw_snapshot_bumps_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_bumps_cycles
-    }
-
-    /// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
-    ///
-    /// A child of `draw_snapshot_keys_cycles_ptr` for the six sections
-    /// inside the `keys` scope. The timer runs only inside the section's
-    /// dirty branch, so the slot over the section's rebuild count is its
-    /// cost per rebuild.
-    pub const fn draw_snapshot_section_cycles_ptr(&mut self, section: SnapshotSection) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_section_cycles[section as usize]
-    }
-
-    /// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
-    ///
-    /// The parent of [`Self::draw_snapshot_section_cycles_ptr`] on the same
-    /// draws, so the part of `keys` outside the six sections is measured on
-    /// the draws the sections are.
-    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.draw_snapshot_keys_sampled_cycles
     }
 
     /// Add cycles + one call to the per-category accumulator.
@@ -1743,12 +1937,13 @@ impl ApiPerfState {
             self.counters.texture_pool_misses.saturating_add(misses);
     }
 
-    /// Drain this frame's API-thread counters into the outgoing payload, then zero self.
+    /// Drain this frame's locked counters into the outgoing payload, then zero self.
     ///
-    /// Also samples `rdtsc()` and computes `frame_total_cycles` as the
-    /// delta from the previous call — returns 0 on the very first frame
-    /// (no predecessor).
-    pub fn drain_into_payload(&mut self, payload: &mut FramePerfPayload) {
+    /// Leaves the atomic cycle totals to `ApiPerfStorage::drain_into_payload`,
+    /// the only caller outside the tests. Also samples `rdtsc()` and computes
+    /// `frame_total_cycles` as the delta from the previous call — returns 0 on
+    /// the very first frame (no predecessor).
+    fn drain_into_payload(&mut self, payload: &mut FramePerfPayload) {
         let now = rdtsc();
         let prev = core::mem::replace(&mut self.prev_present_rdtsc, now);
         // Move this frame's counters into the payload, leaving a zeroed
@@ -1777,50 +1972,6 @@ impl ApiPerfState {
     #[inline]
     pub const fn new() -> Self {
         Self
-    }
-
-    #[inline]
-    pub const fn query_wait_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_stages_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_c_ff_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_c_pr_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_keys_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_bumps_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_section_cycles_ptr(
-        &mut self,
-        _section: SnapshotSection,
-    ) -> *mut u64 {
-        core::ptr::null_mut()
-    }
-    #[inline]
-    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
-        core::ptr::null_mut()
     }
 
     #[inline]
@@ -1871,9 +2022,6 @@ impl ApiPerfState {
     pub const fn bump_texture_discard(&mut self) {}
     #[inline]
     pub const fn add_texture_pool_outcomes(&mut self, _hits: u32, _misses: u32) {}
-
-    #[inline]
-    pub const fn drain_into_payload(&mut self, _payload: &mut FramePerfPayload) {}
 }
 
 /// Payload that crosses the API→encoder channel inside `FrameData`.

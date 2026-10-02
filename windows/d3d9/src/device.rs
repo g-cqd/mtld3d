@@ -42,8 +42,8 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::BackbufferContents,
     perf::{
-        ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
-        DeviceSubCategory, KeysGate,
+        ApiCycles, ApiPerfState, ApiPerfStorage, ApiTimer, AtomicCycleAddTimer, BindSubCategory,
+        CycleSetTimer, DeviceSubCategory, KeysGate,
     },
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
@@ -1617,7 +1617,7 @@ impl DeviceInner {
         // share the recycled frame arena.
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
-        self.perf.state_mut().drain_into_payload(frame.perf_mut());
+        self.perf.drain_into_payload(frame.perf_mut());
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
@@ -1919,19 +1919,19 @@ impl DeviceInner {
         unsafe { dev.as_ref() }.map(|dev| &dev.perf)
     }
 
-    /// Null-tolerant wrapper: returns `null_mut()` for a null device.
+    /// The retained handle a Draw or Query entry point's sub-timers take their targets from.
     ///
-    /// The subtimer finishes before the enclosing API timer, which retains
-    /// the separately allocated counter state in a PERF build.
-    pub fn perf_ptr_of(dev: *mut Self) -> *mut ApiPerfState {
-        if dev.is_null() {
-            core::ptr::null_mut()
-        } else {
-            // SAFETY: caller guarantees a non-null valid device pointer
-            // while obtaining the counter pointer. The enclosing API timer
-            // retains its storage until the subtimer has finished.
-            unsafe { (*dev).perf.as_ptr() }
-        }
+    /// Holds the counter storage alive on its own, so it stays valid however
+    /// the device is torn down while the timers run, and it is empty while
+    /// perf tracking is off at runtime.
+    #[cfg(perf_tracking)]
+    pub fn perf_cycles(&self) -> ApiCycles {
+        self.perf.cycles()
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn perf_cycles(&self) -> ApiCycles {
+        self.perf.cycles()
     }
 
     pub const fn encoder_runtime(&self) -> u64 {
@@ -3552,131 +3552,6 @@ fn bind_timer(this: *mut c_void, sub: BindSubCategory) -> ApiTimer {
         unsafe { DeviceInner::perf_storage_of(obj.inner) }
     });
     ApiTimer::start_bind(storage, sub)
-}
-
-/// Pointer the Draw-internal `CycleAddTimer` for the snapshot phase writes into.
-///
-/// Returns null when `perf_ptr` is null so the guard's `Drop`
-/// short-circuits — matches the gate `ApiTimer::start_device` already
-/// applies for standalone-resource calls.
-#[inline]
-fn draw_snapshot_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: caller obtained `perf_ptr` from `DeviceInner::perf_ptr_of`,
-    // which yields separately allocated counter storage retained by the
-    // enclosing API timer for the duration of the COM call.
-    unsafe { (*perf_ptr).draw_snapshot_cycles_ptr() }
-}
-
-/// Pointer the Draw-internal `CycleAddTimer` for the push-op phase writes into.
-///
-/// Same null-guard as `draw_snapshot_ptr`.
-#[inline]
-fn draw_push_op_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_push_op_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for the per-stage binding walk in `snapshot_shared`.
-///
-/// Sub-component of `draw_snapshot_ptr`; the outer snapshot timer is
-/// still live, so the stage walk's cycles double-count into the parent
-/// total — matches the nested render shape (`snapshot → stages`). Same
-/// null-guard as `draw_snapshot_ptr`.
-#[inline]
-fn draw_snapshot_stages_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_stages_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for the FF consts snapshot block.
-///
-/// Picked when the draw uses any FF stage. Peer of
-/// `draw_snapshot_stages_ptr` under the parent `snapshot` total.
-/// Selected at draw-classification time; the programmable-only
-/// sibling is `draw_snapshot_c_pr_ptr`.
-#[inline]
-fn draw_snapshot_c_ff_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_c_ff_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for the programmable consts snapshot block.
-///
-/// Picked when both VS and PS are programmable. Peer of
-/// `draw_snapshot_c_ff_ptr`.
-#[inline]
-fn draw_snapshot_c_pr_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_c_pr_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for the shader-key resolution block.
-///
-/// In `snapshot_shared` (`VDECL` + `RS` + `RT_DS` + `VARIANT` +
-/// `VS_SOURCE` + `PS_SOURCE`). Peer of `draw_snapshot_stages_ptr` /
-/// `..._consts_ptr` under the parent `snapshot` total.
-#[inline]
-fn draw_snapshot_keys_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_keys_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
-///
-/// A child of `draw_snapshot_keys_ptr` for the six sections inside the
-/// `keys` scope, started only inside the section's dirty branch. Same
-/// null-guard as `draw_snapshot_ptr`.
-#[inline]
-fn draw_snapshot_section_ptr(perf_ptr: *mut ApiPerfState, section: SnapshotSection) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_section_cycles_ptr(section) }
-}
-
-/// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
-///
-/// Null on an unsampled draw (the caller passes a null `perf_ptr`), so the
-/// timer reads no clock there. Same null-guard as `draw_snapshot_ptr`.
-#[inline]
-fn draw_snapshot_keys_sampled_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_keys_sampled_cycles_ptr() }
-}
-
-/// Pointer the `CycleAddTimer` writes into for the post-consts scratch bumps.
-///
-/// Plus cache assignments + snapshot-wrapper bump in `snapshot_shared`.
-/// Peer of the other snapshot sub-buckets.
-#[inline]
-fn draw_snapshot_bumps_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
-    if perf_ptr.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: see `draw_snapshot_ptr`.
-    unsafe { (*perf_ptr).draw_snapshot_bumps_cycles_ptr() }
 }
 
 extern "system" fn device_query_interface(
@@ -10392,8 +10267,8 @@ extern "system" fn device_draw_primitive(
         std::hint::cold_path();
         return hr;
     }
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let cycles = obj.inner().perf_cycles();
+    let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
         std::hint::cold_path();
         if let Err(hr) = obj.inner().recording_status() {
@@ -10407,7 +10282,7 @@ extern "system" fn device_draw_primitive(
     };
     emit_snapshot_deltas(&obj);
     drop(snap);
-    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     let result = obj.inner().current_frame.record_single_stream_draw(
         &NonindexedDraw {
             primitive: metal_prim,
@@ -10469,8 +10344,8 @@ fn draw_bound_triangle_fan(
     if let Err(hr) = obj.inner().known_encoder_status() {
         return hr;
     }
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let cycles = obj.inner().perf_cycles();
+    let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
     let Some((first, extra)) = snapshot_bound_streams::<StreamBinding>(obj.inner()) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -10481,7 +10356,7 @@ fn draw_bound_triangle_fan(
     let stream0_freq = obj.inner().bound_buffers().stream_freq(0);
     emit_snapshot_deltas(obj);
     drop(snap);
-    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     obj.inner().record_draw(&DrawOp {
         metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
         vertex_source: VertexSource::Bound {
@@ -10679,8 +10554,8 @@ extern "system" fn device_draw_indexed_primitive(
         std::hint::cold_path();
         return hr;
     }
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let cycles = obj.inner().perf_cycles();
+    let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
         std::hint::cold_path();
         // D3D9 permits an indexed draw with a valid declaration but NO stream
@@ -10707,7 +10582,7 @@ extern "system" fn device_draw_indexed_primitive(
 
     emit_snapshot_deltas(&obj);
     drop(snap);
-    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     let result = obj.inner().current_frame.record_single_stream_draw(
         &IndexedDraw {
             primitive: metal_prim,
@@ -10939,11 +10814,11 @@ extern "system" fn device_draw_primitive_up(
             };
             generated_fan_source(dev, &fan)
         };
-        let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-        let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+        let cycles = obj.inner().perf_cycles();
+        let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
         emit_snapshot_deltas(&obj);
         drop(snap);
-        let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+        let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
         dev.record_draw(&DrawOp {
@@ -10971,8 +10846,8 @@ extern "system" fn device_draw_primitive_up(
         return D3DERR_INVALIDCALL;
     }
 
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let cycles = obj.inner().perf_cycles();
+    let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
 
     let data_size = (vtx_count * vertex_stride) as usize;
     // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
@@ -10981,7 +10856,7 @@ extern "system" fn device_draw_primitive_up(
 
     emit_snapshot_deltas(&obj);
     drop(snap);
-    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
@@ -11070,8 +10945,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     let sampled = obj.inner().perf_mut().record_snapshot_rebuild(dirty.bits());
 
-    let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
-    let stages_timer = CycleAddTimer::start(stages_ptr);
+    let cycles = obj.inner().perf_cycles();
+    let stages_timer = AtomicCycleAddTimer::start(cycles.draw_snapshot_stages());
 
     // STAGES first: `flush_dirty_mips` inside `snapshot_stage_bindings`
     // pushes upload ops via `dev.push_op`, which mutably borrows
@@ -11107,28 +10982,23 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // residual. Dropped just before `consts_timer`
     // starts so the buckets don't double-count. Each section's own timer
     // runs inside its dirty branch, a child of `keys_timer`, and only on a
-    // sampled draw: on the others its target is null and it reads no clock.
+    // sampled draw: on the others it has no target and reads no clock.
     // The sampled draws also time the whole scope into a slot of their own,
     // so the part of `keys` outside the sections is taken on the same draws
     // as the sections, with the same timer cost in both.
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let section_perf_ptr = if sampled {
-        perf_ptr
-    } else {
-        core::ptr::null_mut()
-    };
-    let keys_timer = CycleAddTimer::start(draw_snapshot_keys_ptr(perf_ptr));
-    let keys_sampled_timer = CycleAddTimer::start(draw_snapshot_keys_sampled_ptr(section_perf_ptr));
+    let section_cycles = sampled.then_some(&cycles);
+    let keys_timer = AtomicCycleAddTimer::start(cycles.draw_snapshot_keys());
+    let keys_sampled_timer =
+        AtomicCycleAddTimer::start(section_cycles.and_then(ApiCycles::draw_snapshot_keys_sampled));
     let dev = obj.inner();
 
     // VDECL FIRST — its rebuild updates `dev.cached_ff_vs_layout`,
     // which conflicts with the long-lived `dev.render_states()` borrow
     // taken below.
     let vdecl_value = if dirty.contains(SnapshotDirty::VDECL) {
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::Vdecl,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::Vdecl)),
+        );
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
         let fvf = dev.fvf;
         let decl_ptr = dev.vertex_decl();
@@ -11194,10 +11064,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let render_state_value = if dirty.contains(SnapshotDirty::RS) {
         use mtld3d_core::pipeline_state::{PipelineRsBits, PipelineRsFlags};
 
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::Rs,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::Rs)),
+        );
         // `SetRenderState` stores whatever DWORD the game passed, so an
         // enum state is narrowed through `render_state::enum_value`: the
         // byte when the value is inside that state's enum space, the D3D9
@@ -11297,10 +11166,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // RT_DS: depth/stencil presence.
     let depth_stencil_value = if dirty.contains(SnapshotDirty::RT_DS) {
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::RtDs,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::RtDs)),
+        );
         let bound_ds = dev.bound_rt().depth_stencil();
         let (has_depth, has_stencil) = if !bound_ds.is_null() {
             // SAFETY: non-null check passed; refcount holds it live.
@@ -11325,10 +11193,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // VARIANT: depends on RS + ff_vs_layout.has_rhw + depth_sampler_mask
     // (current live stage bindings).
     let variant_value = if dirty.contains(SnapshotDirty::VARIANT) {
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::Variant,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::Variant)),
+        );
         let mut variant = dev.ff_state().variant_key(
             rs,
             dev.cached_ff_vs_layout.has_rhw(),
@@ -11366,10 +11233,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // even when a VS is still bound. The PS side is NOT bypassed — a bound PS
     // still runs.
     let vs_value = if dirty.contains(SnapshotDirty::VS_SOURCE) {
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::VsSource,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::VsSource)),
+        );
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
             let key = dev
                 .ff_state()
@@ -11422,10 +11288,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // PS_SOURCE.
     let ps_value = if dirty.contains(SnapshotDirty::PS_SOURCE) {
-        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
-            section_perf_ptr,
-            SnapshotSection::PsSource,
-        ));
+        let _section = AtomicCycleAddTimer::start(
+            section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::PsSource)),
+        );
         if bound_pixel_shader.is_null() {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
@@ -11484,9 +11349,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // the two classes.
     let any_ff = bound_vertex_shader.is_null() || bound_pixel_shader.is_null();
     let consts_timer = if any_ff {
-        CycleAddTimer::start(draw_snapshot_c_ff_ptr(DeviceInner::perf_ptr_of(obj.inner)))
+        AtomicCycleAddTimer::start(cycles.draw_snapshot_c_ff())
     } else {
-        CycleAddTimer::start(draw_snapshot_c_pr_ptr(DeviceInner::perf_ptr_of(obj.inner)))
+        AtomicCycleAddTimer::start(cycles.draw_snapshot_c_pr())
     };
 
     // VS_CONST source (Phase 1 — owned/borrowed before scratch borrow).
@@ -11771,8 +11636,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         None
     };
     drop(consts_timer);
-    let bumps_timer =
-        CycleAddTimer::start(draw_snapshot_bumps_ptr(DeviceInner::perf_ptr_of(obj.inner)));
+    let bumps_timer = AtomicCycleAddTimer::start(cycles.draw_snapshot_bumps());
     let stages = stage_bindings_arr_opt.as_ref().map(|(packed, mask)| {
         // SAFETY: snapshot_stage_bindings initialized exactly popcount(mask)
         // entries. The borrowed prefix is consumed synchronously by capture.
@@ -12050,11 +11914,11 @@ extern "system" fn device_draw_indexed_primitive_up(
         )
     };
 
-    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let cycles = obj.inner().perf_cycles();
+    let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
     emit_snapshot_deltas(&obj);
     drop(snap);
-    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {

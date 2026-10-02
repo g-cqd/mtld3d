@@ -137,7 +137,8 @@ fn event_status(inner: &QueryInner) -> i32 {
     if mtld3d_core::query_fence::event_needs_submit(end_seq, dev.current_seq()) {
         // Only bounded channel admission can stall here. Encoding and
         // submission continue independently of this readiness poll.
-        let _wait = mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().query_wait_cycles_ptr());
+        let cycles = dev.perf_cycles();
+        let _wait = mtld3d_core::perf::AtomicCycleAddTimer::start(cycles.query_wait());
         if let Err(hr) = dev.flush_current_frame_async() {
             return hr;
         }
@@ -516,8 +517,9 @@ extern "system" fn query_get_data(
                             // alive by the device for the wrapper's lifetime.
                             let dev = unsafe { &mut *inner.device_inner };
                             {
-                                let _wait = mtld3d_core::perf::CycleAddTimer::start(
-                                    dev.perf_mut().query_wait_cycles_ptr(),
+                                let cycles = dev.perf_cycles();
+                                let _wait = mtld3d_core::perf::AtomicCycleAddTimer::start(
+                                    cycles.query_wait(),
                                 );
                                 if let Err(hr) = dev.flush_current_frame_blocking() {
                                     return hr;

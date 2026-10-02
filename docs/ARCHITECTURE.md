@@ -997,18 +997,20 @@ serializes reads, append operations and compaction; startup removes unreadable
 tails under that lock before another process can append behind them.
 Explicit `PERF=0` also overrides an inherited `MTLD3D_PERF` environment variable.
 
-### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
+### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `AtomicCycleAddTimer` / `CycleSetTimer` / `CycleAddTimer`
 
 Time measurements that flow into the perf summary go through one of:
 
 - `ApiTimer` — D3D9 vtable entry brackets, accumulates into `api_cycles_by_category[Category]`.
-- `CycleAddTimer` — sub-scope inside an outer `ApiTimer`, accumulates into a `*mut u64` field (e.g. `query_wait_cycles`).
+- `AtomicCycleAddTimer` — sub-scope inside an outer `ApiTimer` on the API side (the Draw snapshot breakdown, `query_wait_cycles`), accumulates into a shared `CycleCounter` with a relaxed atomic add. A game may call Direct3D from several threads, so these buckets never go through a pointer into the mutex-protected `ApiPerfState`: they live beside it in `ApiPerfStorage`, a timer borrows its counter from an `ApiCycles` handle that retains the storage, and the per-present drain takes each one with an atomic swap.
+- `CycleAddTimer` — the same for a plain `*mut u64` field that one thread owns, such as the encoder's `op_sub_cycles`.
 - `NanosSetTimer`: elapsed wall time in nanoseconds for native thunk outputs and cold compilation phases.
 - `CycleSetTimer` — once-per-frame measurement that overwrites a `*mut u64` field (e.g. `present_block_cycles`, `op_cycles`, `submit_cycles`, `drawable_wait_cycles`, `present_wait_cycles`).
 
-All four read `PERF_TRACKING_ENABLED`, a static `AtomicBool` latched once at
-logger initialization from `log_enabled!(target: "mtld3d::perf", Level::Info)`.
-A disabled helper reads no clock. The cached gate avoids a filter lookup on
+All of them read `PERF_TRACKING_ENABLED`, a static `AtomicBool` latched once at
+logger initialization from `log_enabled!(target: "mtld3d::perf", Level::Info)`
+(`AtomicCycleAddTimer` through the `ApiCycles` handle, which is empty while the
+gate is off). A disabled helper reads no clock. The cached gate avoids a filter lookup on
 every measurement. On a non-PERF build, the helpers compile to nothing
 (`cfg(perf_tracking)`).
 
