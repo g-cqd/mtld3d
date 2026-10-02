@@ -2565,7 +2565,7 @@ fn readback_backbuffer_region(
     let bytes = i32::try_from(bytes_per_row)
         .ok()
         .and_then(|_| (bytes_per_row as usize).checked_mul(region.h as usize));
-    let Some(bytes) = bytes.filter(|&bytes| bytes != 0 && bytes <= isize::MAX as usize) else {
+    let Some(bytes) = bytes.filter(|&bytes| bytes != 0 && isize::try_from(bytes).is_ok()) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "back-buffer read-back: the {}x{} page is empty or too large → INVALIDCALL",
             region.w, region.h);

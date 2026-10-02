@@ -1098,6 +1098,7 @@ impl Drop for ApiTimer {
         );
         perf.active_child_cycles = restored;
         self.book(&mut perf, self_time);
+        drop(perf);
     }
 }
 

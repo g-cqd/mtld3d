@@ -6886,7 +6886,7 @@ extern "system" fn device_update_surface(
             .map(|r| (r.x1, r.y1, r.x2, r.y2));
         // SAFETY: as above; POINT is two i32 (x, y).
         let point = (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) })
-            .map_or((0, 0), |p| (p[0], p[1]));
+            .map_or((0, 0), <(i32, i32)>::from);
         return update_surface_into_color_target(obj.inner(), &src_surf, &dst_surf, rect, point);
     }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
