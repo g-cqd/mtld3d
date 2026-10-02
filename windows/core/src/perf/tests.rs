@@ -2033,7 +2033,9 @@ fn a_window_without_timed_frames_reports_counts_and_zero_timers() {
 
 /// The grid takes its counts and the peaks of the every-frame timers from every frame.
 ///
-/// The per-call ratios stay with the timed frames, whose time they divide.
+/// The per-call ratios stay with the timed frames, whose time they divide. The fixtures are
+/// cycle counts at the 1 GHz stand-in rate the rendering uses (one cycle a nanosecond), so
+/// they hold on a host whose own counter runs at another rate.
 #[test]
 fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
     let device = ApiCategory::Device as usize;
@@ -2043,10 +2045,10 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         frame.counters.timed = 1;
         frame.counters.api_call_counts_by_category[device] = 10;
         frame.counters.device_sub_calls[render_state] = 10;
-        frame.counters.device_sub_cycles[render_state] = ns_to_cycles(1_000);
+        frame.counters.device_sub_cycles[render_state] = 1_000;
         frame.enc.slot_waits = 1;
-        frame.timing.frame_total_cycles = ns_to_cycles(1_000_000);
-        frame.timing.present_block_cycles = ns_to_cycles(100_000);
+        frame.timing.frame_total_cycles = 1_000_000;
+        frame.timing.present_block_cycles = 100_000;
         frame
     };
     let untimed_frame = {
@@ -2054,8 +2056,8 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         frame.counters.api_call_counts_by_category[device] = 30;
         frame.counters.device_sub_calls[render_state] = 30;
         frame.enc.slot_waits = 4;
-        frame.timing.frame_total_cycles = ns_to_cycles(9_000_000);
-        frame.timing.present_block_cycles = ns_to_cycles(7_000_000);
+        frame.timing.frame_total_cycles = 9_000_000;
+        frame.timing.present_block_cycles = 7_000_000;
         frame
     };
     let mut enc = EncoderPerfState::new();
@@ -2081,7 +2083,7 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
         row("│  │  ├─ RenderState").contains("( 100 ns/call)"),
         "the ratio divides the timed frame's time by its own calls: {grid}"
     );
-    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns_to_cycles(ns)));
+    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns));
     assert!(row("API thread").contains(&peak(9_000_000)), "{grid}");
     assert!(row("Frame total").contains(&peak(9_000_000)), "{grid}");
     assert!(
@@ -2092,7 +2094,7 @@ fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
     let line = render_kv(&enc.perf_window, &enc.count_window, &sample_caches(), 2.0).finish();
     assert!(line.contains(" api_calls_total=40 "), "{line}");
     assert!(line.contains(" slot_waits_total=5 "), "{line}");
-    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns_to_cycles(ns)));
+    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns));
     assert!(
         line.contains(&format!(" frame_peak_ms={} ", kv_peak(9_000_000))),
         "{line}"
