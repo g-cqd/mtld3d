@@ -23,7 +23,7 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use mtld3d_types::{
-    D3DBOX, D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12, D3DLOCK_DISCARD,
+    D3DBOX, D3DFMT_A8R8G8B8, D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12, D3DLOCK_DISCARD,
     D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY,
     D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE,
     D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC,
@@ -179,6 +179,12 @@ pub struct TextureInner {
     /// with `D3DUSAGE_RENDERTARGET` — passed through to `CreateTextureParams`
     /// so the Metal texture is allocated with `MTLTextureUsage::RenderTarget`.
     usage_flags: TextureUsage,
+    /// References state blocks hold on this texture.
+    ///
+    /// A `D3DPOOL_DEFAULT` texture a state block keeps alive is a `Reset`
+    /// blocker until this and the public refcount are both zero
+    /// (`ComChild::state_block_refs_mut`).
+    state_block_refs: u32,
     /// Raw D3D9 `D3DUSAGE_*` bits.
     ///
     /// Read by the lock entry points to tell the default-pool texture D3D9
@@ -1162,13 +1168,15 @@ impl TextureInner {
         core::mem::take(&mut self.subresources)
     }
 
-    /// Validate an `UpdateSurface` copy of `src`'s `src_level` into this texture's `dst_level`.
+    /// Validate an `UpdateSurface` region of a `src_extent` source into `dst_level`.
     ///
-    /// The source is optionally a sub-rect `[l,t,r,b)`, and the destination
-    /// origin is `dst_point` `(x,y)`. Returns false → INVALIDCALL when the rect
-    /// is empty/inverted, the region does not fit the destination mip, or (for
-    /// block-compressed formats) the origins/extents are not block-aligned (and
-    /// not full). Enforces the D3D9 `UpdateSurface` block-alignment rules.
+    /// The source is a level of another texture or a standalone system-memory
+    /// surface, `src_extent` its width and height, optionally narrowed to a
+    /// sub-rect `[l,t,r,b)`, and the destination origin is `dst_point` `(x,y)`.
+    /// Returns false → INVALIDCALL for a region
+    /// `mtld3d_core::dirty_rect::update_surface_region` refuses: an empty or
+    /// inverted rect, one that leaves either level, or (for block-compressed
+    /// formats) origins and extents off the block grid.
     ///
     /// `UpdateSurface` only: the region is the application's there, so a bad one
     /// is rejected. `UpdateTexture` takes no region, deriving one per mip from
@@ -1179,58 +1187,18 @@ impl TextureInner {
     pub fn update_region_valid(
         &self,
         dst_level: usize,
-        src: &Self,
-        src_level: usize,
+        src_extent: (u32, u32),
         src_rect: Option<(i32, i32, i32, i32)>,
         dst_point: (i32, i32),
     ) -> bool {
-        let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
-        let (rx, ry, rw, rh) = match src_rect {
-            None => (0u32, 0u32, sw, sh),
-            Some((l, t, r, b)) => {
-                if l < 0 || t < 0 || r <= l || b <= t {
-                    return false;
-                }
-                (
-                    l.cast_unsigned(),
-                    t.cast_unsigned(),
-                    (r - l).cast_unsigned(),
-                    (b - t).cast_unsigned(),
-                )
-            }
-        };
-        if dst_point.0 < 0 || dst_point.1 < 0 {
-            return false;
-        }
-        let (dx, dy) = (dst_point.0.cast_unsigned(), dst_point.1.cast_unsigned());
-        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
-        // Region must lie inside both src and dst mips.
-        if rx.saturating_add(rw) > sw
-            || ry.saturating_add(rh) > sh
-            || dx.saturating_add(rw) > dw
-            || dy.saturating_add(rh) > dh
-        {
-            return false;
-        }
-        // Block-compressed: origins block-aligned; a non-block-aligned extent
-        // is only allowed when it reaches the edge of BOTH the source and the
-        // destination mip (a partial-block region that stops short of either
-        // edge is rejected — e.g. a 2x2 region from a 2x2 src mip into a 4x4
-        // dst mip is invalid even though it reaches the src edge).
-        let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
-        if bw > 1 || bh > 1 {
-            let aligned = |v: u32, b: u32| v.is_multiple_of(b);
-            if !aligned(rx, bw)
-                || !aligned(ry, bh)
-                || !aligned(dx, bw)
-                || !aligned(dy, bh)
-                || (!aligned(rw, bw) && (rx + rw != sw || dx + rw != dw))
-                || (!aligned(rh, bh) && (ry + rh != sh || dy + rh != dh))
-            {
-                return false;
-            }
-        }
-        true
+        mtld3d_core::dirty_rect::update_surface_region(
+            src_rect,
+            dst_point,
+            src_extent,
+            (self.mip_width(dst_level), self.mip_height(dst_level)),
+            (self.block_w, self.block_h),
+        )
+        .is_some()
     }
 
     /// Copy a sub-rectangle of `src`'s `src_level` staging into `dst_level`'s staging.
@@ -3066,6 +3034,32 @@ impl TextureInner {
         self.update_dirty[level] = Some(self.update_dirty[level].map_or(add, |cur| cur.union(add)));
     }
 
+    /// Union an `AddDirtyRect` region into the source dirty region of every level.
+    ///
+    /// D3D9 applies the level-0 rect to the whole chain, each level getting it
+    /// scaled to its own extent with the edges rounded outward; `None` marks
+    /// every level whole. `face` selects one cube face's chain, `None` the 2D
+    /// chain.
+    pub fn mark_update_dirty_every_level(&mut self, face: Option<u32>, rect: Option<DirtyRect>) {
+        let mut level_rect = rect;
+        for level in 0..self.app_level_count() as usize {
+            let clipped = if let Some(r) = level_rect {
+                level_rect = Some(r.next_mip());
+                // A rect that misses this level's extent leaves it clean.
+                let Some(clamped) = r.clamp(self.mip_width(level), self.mip_height(level)) else {
+                    continue;
+                };
+                Some(clamped)
+            } else {
+                None
+            };
+            match face {
+                Some(face) => self.mark_cube_update_dirty(face, level, clipped),
+                None => self.mark_update_dirty(level, clipped),
+            }
+        }
+    }
+
     /// Record that a read-back rewrote one subresource's staging.
     ///
     /// `face` selects a cube subresource, `None` the 2D mip chain. The bytes
@@ -3298,6 +3292,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         flags,
         swizzle: info.swizzle,
         usage_flags: info.usage_flags,
+        state_block_refs: 0,
         d3d_usage: info.d3d_usage,
         render_scale: info.render_scale,
         autogen_filter_type: D3DTEXF_LINEAR,
@@ -3613,12 +3608,6 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
 }
 
 impl ComUnknown for Direct3DTexture9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }
@@ -3644,6 +3633,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     }
     fn blocks_reset_while_referenced(&self) -> bool {
         self.inner().is_default_pool()
+    }
+    fn state_block_refs_mut(&mut self) -> Option<&mut u32> {
+        Some(&mut self.inner_mut().state_block_refs)
     }
     fn private_refcount(&self) -> u32 {
         self.private_refcount
@@ -4101,6 +4093,18 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     if let Some(format) = mtld3d_core::depth_texture::PackedDepth::from_d3d(ti.d3d_format) {
         return materialize_depth_planes(ti, level, handle, &format);
     }
+    // A widened level (R8G8B8 on every device, the packed 16-bit formats on
+    // one without them) is BGRA8 on the GPU and narrower in its staging, so
+    // its texels come back four bytes wide into pages of their own and are
+    // narrowed into the staging rows the lock reports.
+    let mut wide =
+        mtld3d_core::upload_pass::is_expanded_upload(ti.d3d_format, ti.metal_pixel_format)
+            .then(|| PageBox::new_zeroed((width as usize) * 4 * (height as usize)));
+    let (read_ptr, read_len, read_pitch) = wide
+        .as_mut()
+        .map_or((dst_ptr, dst_len, bytes_per_row), |page| {
+            (page.as_mut_ptr() as u64, page.len(), width * 4)
+        });
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -4110,15 +4114,15 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         // SAFETY: `handle` is non-zero (checked above) and a live retained
         // `MTLTexture` handle from the encoder texture cache.
         tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
-        dst_ptr,
-        dst_len: dst_len as u64,
+        dst_ptr: read_ptr,
+        dst_len: read_len as u64,
         mip_level: u32::try_from(level).unwrap_or(0),
         slice: face,
         origin_x: 0,
         origin_y: 0,
         width,
         height,
-        bytes_per_row,
+        bytes_per_row: read_pitch,
         // The texture's own logical extent, which the read is measured
         // against: a render-target texture rasterized at `render.scale` is
         // resolved up to it first, and an offscreen plain, which never inherits
@@ -4135,6 +4139,45 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
             "texture {texture_id:#x}: face {face} level {level} read-back \
              BlitTextureToBuffer failed status={status:#x} → materialization failed");
         return false;
+    }
+    if let Some(page) = wide {
+        let region = mtld3d_core::pixel_convert::ConvertRegion {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width,
+            height,
+            src_pitch: read_pitch as usize,
+            dst_pitch: bytes_per_row as usize,
+            src_slice_pitch: page.len(),
+            dst_slice_pitch: needed,
+            depth: 1,
+        };
+        // SAFETY: `dst_ptr`/`dst_len` name the level's live staging (resolved
+        // above and at least `needed` bytes long); nothing else borrows it
+        // while this texture is exclusively borrowed, and it is a different
+        // allocation from `page`.
+        let staging = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::with_exposed_provenance_mut::<u8>(
+                    usize::try_from(dst_ptr).expect("a PE staging address fits usize"),
+                ),
+                dst_len,
+            )
+        };
+        if !mtld3d_core::pixel_convert::convert_region(
+            staging,
+            ti.d3d_format,
+            page.as_slice(),
+            D3DFMT_A8R8G8B8,
+            &region,
+        ) {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "texture {texture_id:#x}: face {face} level {level} read-back could not be \
+                 narrowed to format {:#x} → materialization failed", ti.d3d_format);
+            return false;
+        }
     }
     if ti.cube.is_none()
         && let Some(coverage) = ti.staging_coverage.get_mut(level)
@@ -4338,19 +4381,32 @@ extern "system" fn texture_lock_rect(
     0 // S_OK
 }
 
+/// The `INVALIDCALL` `UnlockRect` answers for a level past the mip chain.
+///
+/// Out of line so the unlock path does not build the log arguments.
+#[cold]
+#[inline(never)]
+fn reject_unlock_level(level: u32) -> i32 {
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "IDirect3DTexture9::UnlockRect: level {level} past the mip chain → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    let level_u8 = u8::try_from(level).expect("D3D9 mip level ≤ 14");
-    mtld3d_shared::crumb!("api:tex_ulock", u64::from(level_u8));
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let ti = obj.inner_mut();
+    // Checked before anything narrows `level`: an application may pass any
+    // `u32`, and a level past the chain is INVALIDCALL, never a panic.
     if level >= ti.app_level_count() {
-        return D3DERR_INVALIDCALL;
+        return reject_unlock_level(level);
     }
+    mtld3d_shared::crumb!("api:tex_ulock", u64::from(level));
     let level_u = level as usize;
     let (read_only, no_dirty, was_locked, lock_rect) = ti.take_lock(level_u);
     if !was_locked {
@@ -4489,7 +4545,7 @@ extern "system" fn texture_add_dirty_rect(this: *mut c_void, rect: *const c_void
     }
     // Source dirtiness and managed GPU publication are separate consumers.
     // Other pools keep their existing metadata-only AddDirtyRect behavior.
-    ti.mark_update_dirty(0, dirty);
+    ti.mark_update_dirty_every_level(None, dirty);
     if ti.d3d_pool == D3DPOOL_MANAGED {
         let mut mip_rect = dirty;
         for level in 0..ti.app_level_count() as usize {
@@ -5247,12 +5303,22 @@ extern "system" fn volume_get_volume_level(
     D3D_OK
 }
 
+/// Warn once that a `LockBox` passed `D3DLOCK` bits this layer does not know.
+///
+/// Out of line so `LockBox` does not build the log arguments on its hot path.
+#[cold]
+#[inline(never)]
+fn warn_unknown_lock_box_bits(unknown: u32) {
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "volume LockBox: unrecognised D3DLOCK bits {unknown:#x} ignored");
+}
+
 extern "system" fn volume_lock_box(
     this: *mut c_void,
     level: u32,
     locked_box: *mut D3DLOCKED_BOX,
     box_ptr: *const c_void,
-    _flags: u32,
+    flags: u32,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if locked_box.is_null() {
@@ -5342,11 +5408,21 @@ extern "system" fn volume_lock_box(
     } else {
         0
     };
-    inner.prepare_staging_write(0, lvl, false);
+    let read_only = flags & D3DLOCK_READONLY != 0;
+    let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
+    // A read-only lock writes nothing, so it reads the pages an upload may
+    // still be reading rather than moving the level off them.
+    if !read_only {
+        inner.prepare_staging_write(0, lvl, false);
+    }
     let ptr = inner.staging[lvl].as_ptr().cast_mut();
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.
-    inner.stash_lock(lvl, false, false, None);
+    inner.stash_lock(lvl, read_only, no_dirty, None);
+    let unknown = flags & !D3DLOCK_KNOWN_BITS;
+    if unknown != 0 {
+        warn_unknown_lock_box_bits(unknown);
+    }
     // SAFETY: `offset` lands inside the level's allocation — the box is
     // validated above against the level dimensions and `lock_box` sized the
     // backing as `slice_pitch * depth`.
@@ -5373,21 +5449,29 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
     if lvl >= inner.levels as usize {
         return D3DERR_INVALIDCALL;
     }
-    let (read_only, _, was_locked, _) = inner.take_lock(lvl);
+    let (read_only, no_dirty, was_locked, _) = inner.take_lock(lvl);
     if !was_locked {
         // UnlockBox without a matching LockBox (or a double-Unlock) is INVALIDCALL.
         return D3DERR_INVALIDCALL;
     }
-    if read_only {
-        // A read-only lock wrote nothing, so there is nothing to upload.
+    // A read-only lock wrote nothing, so it publishes nothing, except on a
+    // level that was never uploaded: its contents are owed to the GPU once,
+    // as the 2D `UnlockRect` does for a READONLY first lock.
+    if read_only && inner.was_uploaded[lvl] {
         return D3D_OK;
     }
     // The written level is now an `UpdateTexture` source: a SYSTEMMEM volume
     // filled through LockBox and pushed into a DEFAULT-pool twin is the
     // standard way an engine uploads a colour-grading LUT, and UpdateTexture
     // copies only levels marked here. Volumes track dirtiness per whole
-    // level (no sub-box), so the mark is the full mip.
-    inner.mark_update_dirty(lvl, None);
+    // level (no sub-box), so the mark is the full mip. A read-only lock and a
+    // `D3DLOCK_NO_DIRTY_UPDATE` lock add no dirty region. The GPU upload below
+    // still carries a NO_DIRTY_UPDATE write, because a volume's `AddDirtyBox`
+    // publishes nothing to the GPU and the write would otherwise never reach
+    // it.
+    if !read_only && !no_dirty {
+        inner.mark_update_dirty(lvl, None);
+    }
     // Lazy box→3D upload, mirroring the 2D `texture_unlock_rect` path: mark the
     // level dirty so the next bind-time `flush_dirty_mips` dispatches
     // `schedule_upload` (the volume variant), which routes the whole staging
@@ -5417,8 +5501,9 @@ extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) 
     };
     // Volume dirty boxes update source metadata for the next UpdateTexture.
     // They do not schedule GPU uploads; staging may not carry Lock-written bytes.
-    // Volumes track the whole level, so the box itself is not recorded.
-    obj.inner_mut().mark_update_dirty(0, None);
+    // Volumes track the whole level, so the box itself is not recorded, and
+    // like a 2D rect it reaches every level of the chain.
+    obj.inner_mut().mark_update_dirty_every_level(None, None);
     D3D_OK
 }
 
@@ -5525,17 +5610,18 @@ extern "system" fn volume9_query_interface(
     let _api = volume9_api_lock(this);
     // A volume is an `IUnknown` and an `IDirect3DVolume9`, nothing else: it is
     // not a resource (the parent texture is).
-    // SAFETY: `riid` is the caller's read-only GUID pointer.
-    let accepted = (unsafe { InPtr::<Guid>::opt(riid.cast()) })
-        .is_some_and(|iid| matches!(*iid, IID_IUNKNOWN | IID_IDIRECT3DVOLUME9));
-    if accepted && !ppv.is_null() {
-        // SAFETY: validated writable out pointer.
-        unsafe { *ppv = this };
-        volume9_add_ref(this);
-        return D3D_OK;
+    // SAFETY: `this` is the live volume for the vtable call, `riid` the
+    // caller's read-only GUID pointer and `ppv` its out slot, per the ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[IID_IUNKNOWN, IID_IDIRECT3DVOLUME9],
+            volume9_add_ref,
+            "IDirect3DVolume9",
+        )
     }
-    null_out(ppv);
-    E_NOINTERFACE
 }
 
 extern "system" fn volume9_add_ref(this: *mut c_void) -> u32 {
@@ -6036,7 +6122,7 @@ extern "system" fn cube_add_dirty_rect(this: *mut c_void, face: u32, rect: *cons
     } else {
         None
     };
-    ti.mark_cube_update_dirty(face, 0, dirty);
+    ti.mark_update_dirty_every_level(Some(face), dirty);
     D3D_OK
 }
 

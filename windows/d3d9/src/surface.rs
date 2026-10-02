@@ -66,8 +66,8 @@ pub struct SystemMemoryDst {
     pub height: u32,
     /// Row stride the destination's own `LockRect` reports.
     pub bytes_per_row: u32,
-    /// Byte layout of the destination's D3D9 format.
-    pub format: mtld3d_shared::mtl::PixelFormat,
+    /// The destination's D3D9 format (`D3DFMT_*`).
+    pub format: u32,
 }
 
 /// Marks a surface as one of the device's **implicit** (device-owned) surfaces.
@@ -983,7 +983,7 @@ impl Direct3DSurface9 {
                 width,
                 height,
                 bytes_per_row,
-                format: fmt.metal_pixel_format(),
+                format: inner.standalone_format,
             });
         }
         if inner.parent_texture.is_null() {
@@ -1001,14 +1001,14 @@ impl Direct3DSurface9 {
         let level = inner.mip_level as usize;
         let face = (inner.cube_face != u32::MAX).then_some(inner.cube_face);
         let (ptr, len, bytes_per_row) = texture.readback_staging(face, level)?;
-        let fmt = mtld3d_core::format::map_d3d_format(texture.d3d_format())?;
+        mtld3d_core::format::map_d3d_format(texture.d3d_format())?;
         Some(SystemMemoryDst {
             ptr,
             len,
             width: texture.mip_width(level),
             height: texture.mip_height(level),
             bytes_per_row,
-            format: fmt.metal_pixel_format(),
+            format: texture.d3d_format(),
         })
     }
 
@@ -1851,12 +1851,6 @@ pub unsafe fn set_cached_surface_device(ptr: u64, device_inner: *mut DeviceInner
 }
 
 impl ComUnknown for Direct3DSurface9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
         let chain = self.forward_swapchain();
@@ -2246,6 +2240,8 @@ extern "system" fn surface_lock_rect(
     let inner_mut = unsafe { &mut *obj.inner };
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state.
     if (unsafe { &*inner_mut.dc_lock_ptr() }).dc_in_use {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::LockRect while a GetDC on the resource is outstanding → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     let parent_tex = obj.inner().parent_texture;
@@ -2467,19 +2463,39 @@ fn backbuffer_lock_readback(
         return D3DERR_INVALIDCALL;
     }
     let (width, height) = (inner.live_width(), inner.live_height());
-    let Some(region) = parse_rect(rect.map(|r| (r.x1, r.y1, r.x2, r.y2)), width, height) else {
-        return D3DERR_INVALIDCALL;
+    let region = match parse_rect(rect.map(|r| (r.x1, r.y1, r.x2, r.y2)), width, height) {
+        Ok(region) => region,
+        Err(reason) => {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: reason.key(),
+                "back-buffer LockRect: {} → INVALIDCALL",
+                reason.as_str()
+            );
+            return D3DERR_INVALIDCALL;
+        }
     };
-    let Some(mapping) = mtld3d_core::format::map_d3d_format(inner.live_format()) else {
+    let format = inner.live_format();
+    let Some(mapping) = mtld3d_core::format::map_d3d_format(format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "colour-surface LockRect: no format mapping for {format:#x} → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     };
     let bpp = mapping.bytes_per_pixel();
     if bpp == 0 || region.w == 0 || region.h == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: format {format:#x} has no read-back layout or the locked \
+             area is empty → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     // Publishing the map before reading back rejects a second lock without
-    // replacing the page still exposed to the first caller.
+    // replacing the page still exposed to the first caller. The back buffer
+    // takes the surface lock state like every other lockable surface, so a
+    // `GetDC` on it that is still outstanding refuses the lock as well.
     if let Err(hr) = inner.try_begin_lock() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "backbuffer LockRect while the back buffer is already locked or a GetDC on it is outstanding → INVALIDCALL"
+        );
         return hr;
     }
     let snapshot_region = if read_only {
@@ -2508,6 +2524,8 @@ fn backbuffer_lock_readback(
             })
     };
     let Some(pixels) = offset.and_then(|offset| page.as_mut_slice().get_mut(offset..)) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the locked origin lies outside the read-back page → INVALIDCALL");
         let _ = inner.try_end_lock();
         return D3DERR_INVALIDCALL;
     };
@@ -2528,24 +2546,40 @@ fn readback_backbuffer_region(
 ) -> Option<(PageBox, u32)> {
     let (full_width, full_height) = (inner.live_width(), inner.live_height());
     let tex_handle = inner.live_color_handle();
+    let format = inner.live_format();
     if inner.device_inner.is_null() || tex_handle.is_null() || region.w == 0 || region.h == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer read-back: nothing to read back ({}x{}, texture {:#x}, {}) → INVALIDCALL",
+            region.w, region.h, tex_handle.raw(),
+            if inner.device_inner.is_null() { "no owning device" } else { "owning device present" });
         return None;
     }
-    let fmt = mtld3d_core::format::map_d3d_format(inner.live_format())?;
-    if fmt.bytes_per_pixel() == 0 {
+    let bytes_per_pixel =
+        mtld3d_core::format::map_d3d_format(format).map_or(0, |mapping| mapping.bytes_per_pixel());
+    if bytes_per_pixel == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer read-back: format {format:#x} has no read-back layout → INVALIDCALL");
         return None;
     }
-    let bytes_per_row = mtld3d_core::format::linear_row_pitch(region.w, fmt.bytes_per_pixel());
-    i32::try_from(bytes_per_row).ok()?;
-    let bytes = (bytes_per_row as usize).checked_mul(region.h as usize)?;
-    if bytes == 0 || bytes > isize::MAX as usize {
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(region.w, bytes_per_pixel);
+    let bytes = i32::try_from(bytes_per_row)
+        .ok()
+        .and_then(|_| (bytes_per_row as usize).checked_mul(region.h as usize));
+    let Some(bytes) = bytes.filter(|&bytes| bytes != 0 && bytes <= isize::MAX as usize) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer read-back: the {}x{} page is empty or too large → INVALIDCALL",
+            region.w, region.h);
         return None;
-    }
+    };
     let mut page = PageBox::new_uninit(bytes);
     // SAFETY: `device_inner` is non-null and the owning device outlives its
     // child surface; its allocation is distinct from the surface's inner.
     let device_inner = unsafe { &mut *inner.device_inner };
-    device_inner.flush_current_frame_blocking().ok()?;
+    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer read-back: flushing the frame failed ({hr:#x}) → INVALIDCALL");
+        return None;
+    }
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2570,7 +2604,7 @@ fn readback_backbuffer_region(
     let status = unix_call(&mut params);
     if status != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "backbuffer readback failed status={status:#x} → INVALIDCALL"
+            "back-buffer read-back: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL"
         );
         return None;
     }
@@ -2607,12 +2641,19 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
 fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
     let (width, height) = (inner.live_width(), inner.live_height());
     let color_handle = inner.live_color_handle().raw();
-    let Some(mapping) = mtld3d_core::format::map_d3d_format(inner.live_format()) else {
+    let live_format = inner.live_format();
+    let Some(mapping) = mtld3d_core::format::map_d3d_format(live_format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: format {live_format:#x} has no mapping; GDI's drawing is \
+             not written back");
         return;
     };
     let format = mapping.metal_pixel_format();
     let bpp = mapping.bytes_per_pixel();
     if bpp == 0 || width == 0 || height == 0 || color_handle == 0 || inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: nothing to write back into ({width}x{height}, {bpp} bytes \
+             per pixel, texture {color_handle:#x}); GDI's drawing is not written back");
         return;
     }
     // SAFETY: `device_inner` is non-null (checked above) and points to the live
@@ -2620,13 +2661,21 @@ fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
     let scale = unsafe { (*inner.device_inner).scale_for_created_target(width, height, true) };
     let src_stride = mtld3d_core::format::linear_row_pitch(width, bpp);
     let Some(needed) = (src_stride as usize).checked_mul(height as usize) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: the {width}x{height} page size overflows; GDI's drawing is \
+             not written back");
         return;
     };
     let Some(snapshot) = inner.readback.as_ref() else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: the DC's page is gone; GDI's drawing is not written back");
         return;
     };
     let page = &snapshot.page;
     if page.len() < needed {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: the DC's page holds {} bytes, {needed} needed; GDI's \
+             drawing is not written back", page.len());
         return;
     }
     // Capture into frame-owned bytes before the caller can drop the snapshot page.

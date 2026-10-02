@@ -1,23 +1,23 @@
 //! Fixed-function transform + texture-stage routing + alpha test.
 
 use mtld3d_tests::{
-    CubeTexture, Harness, LitVertex, PosVertex, SpecularVertex, Texture, Vertex,
-    assert_pixel_approx,
+    CubeTexture, Harness, LitVertex, PosVertex, RhwVertex, SpecularVertex, Texture, TexturedVertex,
+    Vertex, assert_pixel_approx,
 };
 use mtld3d_types::{
     D3DCMP_GREATER, D3DCOLORVALUE, D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZB2,
-    D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMCS_MATERIAL,
-    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
-    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE,
-    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE,
-    D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE,
-    D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT,
-    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
-    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3,
-    D3DVBF_1WEIGHTS, D3DVECTOR,
+    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZB1,
+    D3DFVF_XYZB2, D3DFVF_XYZRHW, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9,
+    D3DMATERIAL9, D3DMCS_MATERIAL, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP,
+    D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
+    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING,
+    D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
+    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -1613,11 +1613,79 @@ fn light_type_change_between_draws_of_one_frame_reaches_the_later_draws() {
     );
 }
 
+/// Position, one blend weight and a diffuse colour, for `D3DFVF_XYZB1 | D3DFVF_DIFFUSE`.
+#[repr(C)]
+struct SequentialBlendVertex {
+    position: [f32; 3],
+    weight: f32,
+    color: u32,
+}
+
+/// Vertex blending reads a world matrix the title never set as identity.
+///
+/// Only `D3DTS_WORLD` is written, and it moves everything far off screen,
+/// so a quad lands at the origin only through the identity D3D9 defines for
+/// every other `D3DTS_WORLDMATRIX(i)`. Sequential `D3DVBF_1WEIGHTS` blending
+/// with the whole weight on the implicit second matrix reads matrix 1;
+/// indexed blending with the whole weight on bone 5 reads matrix 5.
+#[test]
+fn vertex_blending_reads_unset_world_matrices_as_identity() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_WORLD, &translate_x(10.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZB1 | D3DFVF_DIFFUSE), 0);
+    h.select_diffuse_stage(0);
+
+    let sequential = [(-0.25, 0.25), (-0.25, -0.25), (0.25, 0.25), (0.25, -0.25)].map(|(x, y)| {
+        SequentialBlendVertex {
+            position: [x, y, 0.5],
+            weight: 0.0,
+            color: BLEND_RED,
+        }
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &sequential),
+            0,
+            "sequential draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLEND_RED,
+        "sequential blending: the unset matrix 1 is identity"
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_DIFFUSE),
+        0
+    );
+    let indexed = indexed_quad(5);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &indexed),
+            0,
+            "indexed draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLEND_RED,
+        "indexed blending: the unset matrix 5 is identity"
+    );
+}
+
 #[test]
 fn palette_growth_between_draws_of_one_frame_reaches_the_second_draw() {
-    // Raising the world-palette high-water mark between draws widens the FF
-    // VS constant block a blended draw binds, so the draw after it must carry
-    // the larger row count to reach the new matrix.
+    // A world matrix written between two draws of one frame is uploaded
+    // before the blended draw after it, which reads it rather than the
+    // identity the first draw saw in that slot.
     let h = Harness::new();
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
     assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
@@ -1710,5 +1778,100 @@ fn overflow_light_writes_between_draws_of_one_frame_reach_the_later_draw() {
     assert!(
         r >= 0xF0 && g >= 0xF0 && b >= 0xF0,
         "second draw, light 9 enabled between the draws: white, got ({r}, {g}, {b})"
+    );
+}
+
+// ── A texture transform written before a pretransformed draw ──
+
+const TT_RED: u32 = 0xFFFF_0000;
+const TT_GREEN: u32 = 0xFF00_FF00;
+
+/// A textured quad centred on `x` in clip space, every corner at `u = 0.25`.
+fn quarter_u_quad_at(x: f32) -> [TexturedVertex; 4] {
+    [(-0.3, 0.3), (-0.3, -0.3), (0.3, 0.3), (0.3, -0.3)].map(|(dx, dy)| TexturedVertex {
+        x: x + dx,
+        y: dy,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 0.25,
+        v: 0.5,
+    })
+}
+
+#[test]
+fn texture_transform_written_before_a_pretransformed_draw_reaches_the_next_transformed_draw() {
+    // A 2x1 texture, red left and green right, sampled at u = 0.25 through a
+    // COUNT2 texture transform: the identity reads red, a 3x scale of u reads
+    // green. The scale is written between two transformed draws, with an
+    // XYZRHW draw in between that does not read the transform; the draw after
+    // it, and the next frame's, must still see the scale.
+    #[rustfmt::skip]
+    const SCALE_U3: [f32; 16] = [
+        3.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    const TEXTURED: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION, D3DTS_TEXTURE0] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0, "SetTransform");
+    }
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[TT_RED, TT_GREEN]);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+    let (left, right) = (quarter_u_quad_at(-0.5), quarter_u_quad_at(0.5));
+    let corner = [(0.0, 0.0), (16.0, 0.0), (0.0, 16.0)].map(|(x, y)| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: 0xFFFF_FFFF,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.set_fvf(TEXTURED), 0, "SetFVF textured");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        assert_eq!(d.set_transform(D3DTS_TEXTURE0, &SCALE_U3), 0, "scale u");
+        assert_eq!(
+            d.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE),
+            0,
+            "SetFVF XYZRHW"
+        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner), 0);
+        assert_eq!(d.set_fvf(TEXTURED), 0, "SetFVF textured again");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    assert_eq!(h.read_pixel(160, 240), TT_RED, "first draw, identity: red");
+    assert_eq!(
+        h.read_pixel(480, 240),
+        TT_GREEN,
+        "the draw after the XYZRHW draw reads the scale written before it"
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(480, 240),
+        TT_GREEN,
+        "the next frame's draw reads the scale as well"
     );
 }

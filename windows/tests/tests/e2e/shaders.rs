@@ -827,6 +827,192 @@ fn integer_and_bool_shader_constants_round_trip() {
     assert_eq!(ps_b, [0, 1], "PS const B round-trip");
 }
 
+/// Constant calls take a zero count and refuse a window past the register file.
+///
+/// A zero count is a call that moves nothing and answers `D3D_OK` on all
+/// twelve `Set`/`Get` entry points, leaving the registers as they were. The
+/// integer and boolean files are sixteen registers deep, and a start at or
+/// past the sixteenth is `INVALIDCALL` whatever the count, where a start
+/// inside the file keeps clamping an oversized count to what remains. The
+/// float getters refuse a window that runs past the 256 vertex-shader or 224
+/// pixel-shader registers, as the float setters do.
+#[test]
+fn constant_calls_take_a_zero_count_and_refuse_a_window_past_the_file() {
+    let h = Harness::new();
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[1.0, 2.0, 3.0, 4.0]), 0);
+    assert_eq!(h.set_vertex_shader_constant_i(0, &[1, 2, 3, 4]), 0);
+    assert_eq!(h.set_vertex_shader_constant_b(0, &[1]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[5.0, 6.0, 7.0, 8.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_i(0, &[5, 6, 7, 8]), 0);
+    assert_eq!(h.set_pixel_shader_constant_b(0, &[1]), 0);
+
+    let floats = [9.0_f32; 4];
+    let ints = [9_i32; 4];
+    let float_setters = [
+        Harness::set_vertex_shader_constant_f_raw
+            as unsafe fn(&Harness, u32, *const f32, u32) -> i32,
+        Harness::set_pixel_shader_constant_f_raw,
+    ];
+    for set in float_setters {
+        // SAFETY: a zero count reads no register of the array.
+        let hr = unsafe { set(&h, 0, floats.as_ptr(), 0) };
+        assert_eq!(hr, 0, "F set, count 0");
+    }
+    let int_setters = [
+        Harness::set_vertex_shader_constant_i_raw
+            as unsafe fn(&Harness, u32, *const i32, u32) -> i32,
+        Harness::set_vertex_shader_constant_b_raw,
+        Harness::set_pixel_shader_constant_i_raw,
+        Harness::set_pixel_shader_constant_b_raw,
+    ];
+    for set in int_setters {
+        // SAFETY: a zero count reads no register of the array.
+        let hr = unsafe { set(&h, 0, ints.as_ptr(), 0) };
+        assert_eq!(hr, 0, "I/B set, count 0");
+    }
+    assert_eq!(
+        h.get_vertex_shader_constant_f(0, 0).0,
+        0,
+        "VS F get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_i(0, 0).0,
+        0,
+        "VS I get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_b(0, 0).0,
+        0,
+        "VS B get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(0, 0).0,
+        0,
+        "PS F get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_i(0, 0).0,
+        0,
+        "PS I get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_b(0, 0).0,
+        0,
+        "PS B get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_f(0, 1),
+        (0, vec![1.0, 2.0, 3.0, 4.0]),
+        "a zero-count VS F set leaves c0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(0, 1),
+        (0, vec![5.0, 6.0, 7.0, 8.0]),
+        "a zero-count PS F set leaves c0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_i(0, 1),
+        (0, vec![1, 2, 3, 4]),
+        "a zero-count VS I set leaves i0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_i(0, 1),
+        (0, vec![5, 6, 7, 8]),
+        "a zero-count PS I set leaves i0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_b(0, 1),
+        (0, vec![1]),
+        "a zero-count VS B set leaves b0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_b(0, 1),
+        (0, vec![1]),
+        "a zero-count PS B set leaves b0"
+    );
+
+    for start in [16, 17, u32::MAX] {
+        assert_eq!(
+            h.set_vertex_shader_constant_i(start, &[1, 2, 3, 4]),
+            D3DERR_INVALIDCALL,
+            "VS I set at {start}"
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_b(start, &[1]),
+            D3DERR_INVALIDCALL,
+            "VS B set at {start}"
+        );
+        assert_eq!(
+            h.set_pixel_shader_constant_i(start, &[1, 2, 3, 4]),
+            D3DERR_INVALIDCALL,
+            "PS I set at {start}"
+        );
+        assert_eq!(
+            h.set_pixel_shader_constant_b(start, &[1]),
+            D3DERR_INVALIDCALL,
+            "PS B set at {start}"
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_i(start, &[]),
+            D3DERR_INVALIDCALL,
+            "VS I set at {start}, count 0"
+        );
+        for (label, hr) in [
+            ("VS I get", h.get_vertex_shader_constant_i(start, 1).0),
+            ("VS B get", h.get_vertex_shader_constant_b(start, 1).0),
+            ("PS I get", h.get_pixel_shader_constant_i(start, 1).0),
+            ("PS B get", h.get_pixel_shader_constant_b(start, 1).0),
+        ] {
+            assert_eq!(hr, D3DERR_INVALIDCALL, "{label} at {start}");
+        }
+    }
+    assert_eq!(
+        h.set_vertex_shader_constant_i(15, &[1, 2, 3, 4]),
+        0,
+        "i15 is the last integer register"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_b(15, &[1]),
+        0,
+        "b15 is the last boolean register"
+    );
+
+    for (start, count) in [(255, 2), (256, 1), (257, 0), (u32::MAX, 1)] {
+        assert_eq!(
+            h.get_vertex_shader_constant_f(start, count).0,
+            D3DERR_INVALIDCALL,
+            "VS F get at {start}, count {count}"
+        );
+    }
+    for (start, count) in [(223, 2), (224, 1), (225, 0), (u32::MAX, 1)] {
+        assert_eq!(
+            h.get_pixel_shader_constant_f(start, count).0,
+            D3DERR_INVALIDCALL,
+            "PS F get at {start}, count {count}"
+        );
+    }
+    assert_eq!(
+        h.get_vertex_shader_constant_f(255, 1).0,
+        0,
+        "c255 is the last vertex-shader float register"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_f(256, 0).0,
+        0,
+        "an empty VS F window at the end of the file"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(223, 1).0,
+        0,
+        "c223 is the last pixel-shader float register"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(224, 0).0,
+        0,
+        "an empty PS F window at the end of the file"
+    );
+}
+
 #[test]
 fn float_shader_constants_round_trip() {
     // GetVertexShaderConstantF / GetPixelShaderConstantF read back the values
@@ -1259,6 +1445,66 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
     assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
+#[test]
+fn reset_restores_the_vertex_sampler_state_the_draw_samples_with() {
+    // Reset puts every sampler state back to its default, the vertex samplers
+    // included, and a texture bound after it samples with those defaults.
+    // The fetch reads u = 1.25 of a 2x1 texture, red then green: the default
+    // WRAP addressing reads the red texel, a CLAMP left over from before the
+    // Reset would read the green one.
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let vertex_sampler_0 = mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+    assert_eq!(
+        h.set_sampler_state(
+            vertex_sampler_0,
+            mtld3d_types::D3DSAMP_ADDRESSU,
+            mtld3d_types::D3DTADDRESS_CLAMP
+        ),
+        0,
+        "CLAMP before the Reset"
+    );
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset");
+    assert_eq!(
+        h.sampler_state(vertex_sampler_0, mtld3d_types::D3DSAMP_ADDRESSU),
+        mtld3d_types::D3DTADDRESS_WRAP,
+        "Reset reports the default addressing"
+    );
+
+    let tex = h.create_texture(2, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED, GREEN]);
+    assert_eq!(
+        h.set_texture(vertex_sampler_0, &tex),
+        0,
+        "bind vertex sampler 0"
+    );
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `def c4` x, the fetch's u.
+    vs_tokens[15] = 1.25f32.to_bits();
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "the fetch at u = 1.25 wraps to the red texel"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(vertex_sampler_0), 0, "unbind slot");
 }
 
 #[test]

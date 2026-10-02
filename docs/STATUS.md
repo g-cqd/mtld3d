@@ -143,6 +143,15 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
+- Additional swap chains with a window of their own: an additional chain
+  owns its back buffer, but the device has one window and one drawable, so
+  its `Present` shows that back buffer in the device window, and a title
+  that presents a second chain into another window sees it in the first.
+- `Present` arguments: a source rect, a destination rect, a destination
+  window override and a dirty region are accepted on
+  `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
+  each warned once; the whole back buffer is presented across the device
+  window.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
@@ -161,6 +170,11 @@ unless its entry says otherwise.
   reference. Planar chroma is never filtered: `D3DTEXF_LINEAR` filters luma
   and replicates each chroma sample over its 2x2 block. `ColorFill` of a
   packed or planar YUV surface succeeds and leaves it unfilled.
+- Packed YUV (YUY2, UYVY) textures: nothing decodes them when they are
+  sampled, so `CheckDeviceFormat` answers `D3DERR_NOTAVAILABLE` for every
+  texture query and only a `D3DPOOL_SCRATCH` texture creates. They remain
+  offscreen plain surfaces, and a DEFAULT-pool one is a `StretchRect` source
+  that decodes into any render target and 1:1 into a colour offscreen plain.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
@@ -196,8 +210,17 @@ unless its entry says otherwise.
   counterpart here.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
   [Fullscreen](../INSTALL.md#fullscreen) section of `INSTALL.md`.
-- Device loss: no exclusive mode is taken, so nothing is ever lost, and
-  `TestCooperativeLevel` reports `D3D_OK` across focus changes.
+- Device loss on focus changes: no exclusive mode is taken, so a focus
+  change loses nothing, and `TestCooperativeLevel` reports `D3D_OK` across
+  it. A device is lost only when the layer itself fails: a frame that
+  cannot be encoded or submitted to Metal, such as a depth transfer whose
+  private planes cannot be allocated, latches `D3DERR_DEVICELOST`. A frame
+  whose commands cannot be recorded because the layer's own command buffer
+  could not grow latches `E_OUTOFMEMORY` instead. Every later call that
+  reports device state, `TestCooperativeLevel` and `Reset` included,
+  returns the latched code until the device is released, and the log names
+  the step that failed first. There is no recovery short of creating a new
+  device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

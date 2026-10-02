@@ -36,7 +36,7 @@ use mtld3d_types::{
 
 use crate::{
     LOG_TARGET,
-    caps::{texture_op_unimplemented, unimplemented_texture_op},
+    caps::{FF_TEXTURE_STAGES, texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
         FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
@@ -170,15 +170,16 @@ pub struct FfState {
     /// `D3DTS_WORLD == D3DTS_WORLDMATRIX(0)` per spec (both equal raw state
     /// 256), so `palette[0]` is the single-world-matrix slot used when vertex
     /// blending is disabled. `palette[1..255]` are the additional matrices for
-    /// `D3DRS_VERTEXBLEND` mode. 16 KB per device, one-time. Most games (e.g.
-    /// `WoW`) only touch `palette[0]`; per-draw constant upload reads
-    /// `world_palette[0..=world_palette_high_water]`, so non-blending
-    /// workloads ship 64 bytes of world matrix as before.
+    /// `D3DRS_VERTEXBLEND` mode. 16 KB per device, one-time. Every slot starts
+    /// as identity, which is what a blended draw reads for a matrix the title
+    /// never set; a draw uploads the matrices its blending can read
+    /// (`palette_matrices`), and a draw without blending reads
+    /// `palette[0]` through the world-view section alone.
     world_palette: [D3DMATRIX; 256],
     /// Maximum palette index ever written via `SetTransform`.
     ///
-    /// Drives the per-draw upload extent so we don't ship unused identity
-    /// matrices.
+    /// Read only to warn once when indexed blending cannot reach a matrix
+    /// the title wrote; it sizes nothing.
     world_palette_high_water: u16,
     texture_transforms: [D3DMATRIX; 8],
     material: D3DMATERIAL9,
@@ -221,8 +222,9 @@ pub struct FfState {
     /// here. An enabled overflow light with a non-zero type feeds FF lighting:
     /// [`Self::resolve_active_lights`] packs it after the active fast-path
     /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
-    /// section like a fast-path write. [`FfStateSnapshot`] does not capture
-    /// these slots. Empty for every workload that stays within 8 lights.
+    /// section like a fast-path write. [`FfStateSnapshot`] captures them with
+    /// the fast-path slots. Empty for every workload that stays within 8
+    /// lights.
     overflow_lights: BTreeMap<u32, OverflowLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
     /// Bit `s` set iff stage `s`'s `D3DTSS_TEXTURETRANSFORMFLAGS` is non-zero.
@@ -422,11 +424,7 @@ impl FfState {
 
     /// Track the highest world-palette index ever set.
     ///
-    /// Per-draw constant uploads then only pack
-    /// `world_palette[0..=high_water]` instead of the full 16 KB array.
-    /// `D3DTS_WORLD == D3DTS_WORLDMATRIX(0) == 256` always keeps
-    /// `high_water >= 0` (the default value), so non-blending workloads pay
-    /// one matrix as before.
+    /// Only the warning for a matrix past the blending cap reads it.
     fn bump_palette_high_water(&mut self, state: u32) {
         if (256..=511).contains(&state) {
             // (state - 256) is in 0..=255, well inside u16.
@@ -440,42 +438,44 @@ impl FfState {
 
     /// Number of world matrices the game has set via `SetTransform`.
     ///
-    /// Or 1 if only `D3DTS_WORLD` / `palette[0]` was touched. Drives the
-    /// per-draw constant-upload extent in [`Self::build_palette_section`].
+    /// Or 1 if only `D3DTS_WORLD` / `palette[0]` was touched.
     #[must_use]
     pub const fn world_palette_used(&self) -> usize {
         self.world_palette_high_water as usize + 1
     }
 
-    /// World matrices a vertex-blending draw uploads and the shader may read.
+    /// World matrices a vertex-blending draw with `vs_key` can read, and so uploads.
     ///
-    /// [`Self::world_palette_used`] counts every `D3DTS_WORLDMATRIX(i)` the
-    /// title has written, and D3D9 lets that run to 256, while the FF VS
-    /// constant block holds the palette only up to
-    /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], the index `caps::fill` advertises as
-    /// `D3DCAPS9::MaxVertexBlendMatrixIndex`. Counting or packing past it runs
-    /// off the end of the block, so the matrices above the cap are dropped and
-    /// the first draw that would have carried one says so once.
-    fn world_palette_uploaded(&self) -> usize {
-        let used = self.world_palette_used();
+    /// Sequential blending reads `world_palette[0..k]` for the key's `k`
+    /// matrices, whichever of them the title has set: an unset matrix is
+    /// identity, and the shader has to read it as identity rather than as
+    /// rows no upload wrote. Indexed blending reads the index each vertex
+    /// carries, clamped to [`MAX_VERTEX_BLEND_MATRIX_INDEX`] (the index
+    /// `caps::fill` advertises as `D3DCAPS9::MaxVertexBlendMatrixIndex`, the
+    /// last one the FF VS constant block holds), so every matrix up to the
+    /// cap is uploaded. D3D9 lets a title write matrices up to 255, and the
+    /// first indexed draw after one past the cap was written says once that
+    /// no draw reaches it. Zero without blending.
+    fn palette_matrices(&self, vs_key: &FfVsKey) -> usize {
+        let count = usize::from(vs_key.vertex_blend_count);
+        if count == 0 || !vs_key.vertex_blend_indexed() {
+            return count;
+        }
         let limit = usize::try_from(MAX_VERTEX_BLEND_MATRIX_INDEX)
             .expect("MaxVertexBlendMatrixIndex fits usize")
             + 1;
+        let used = self.world_palette_used();
         if used > limit {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "FF vertex blend: D3DTS_WORLDMATRIX({}) is past MaxVertexBlendMatrixIndex {MAX_VERTEX_BLEND_MATRIX_INDEX} → matrices above the cap not uploaded",
                 used - 1
             );
-            return limit;
         }
-        used
+        limit
     }
 
     /// Read-only access to the world-matrix palette.
-    ///
-    /// Slice length is bounded by `world_palette_used()` for callers that want
-    /// only the in-use range.
     #[must_use]
     pub const fn world_palette(&self) -> &[D3DMATRIX; 256] {
         &self.world_palette
@@ -627,20 +627,6 @@ impl FfState {
         [active_mask, dir, spot]
     }
 
-    /// The FF VS source input a transform write can move: the world-palette high-water mark.
-    ///
-    /// [`Self::ff_vs_row_count`] sizes a blended draw's palette from it, and
-    /// nothing else a transform write changes reaches the FF VS key or row
-    /// count (matrices feed only the constant sections). So a `set_transform`
-    /// or `multiply_transform` call that leaves this value unchanged leaves
-    /// the FF VS source unchanged, and the device marks `VS_SOURCE` for it
-    /// only when the value moves. It is one field read, so a transform write
-    /// stays O(1) whatever lights exist.
-    #[must_use]
-    pub const fn vs_source_transform_inputs(&self) -> u16 {
-        self.world_palette_high_water
-    }
-
     /// The FF VS source inputs a light write can move: which lights are active, with which type.
     ///
     /// These are the `FfState` fields behind the key's active, directional
@@ -710,8 +696,8 @@ impl FfState {
     /// or the mask goes stale against the restored array. The light masks
     /// cannot be re-derived the same way (an untouched slot's
     /// `D3DLIGHT9::default()` is indistinguishable from an explicit
-    /// directional `SetLight`), so they travel with [`FfStateSnapshot`]
-    /// instead.
+    /// directional `SetLight`), so [`FfStateSnapshot`] restores lights
+    /// through their setters instead.
     fn recompute_tt_active_mask(&mut self) {
         self.tt_active_mask = 0;
         for (s, stage) in self.texture_stage_states.iter().enumerate() {
@@ -1554,7 +1540,7 @@ impl FfState {
     ///
     /// Panics if the uploaded palette count exceeds `u32` or if the computed
     /// row count exceeds `u16`. Both are unreachable:
-    /// `world_palette_uploaded` bounds the palette by
+    /// `palette_matrices` bounds the palette by
     /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], so the count stops at
     /// `95 + 40 * 4 = 255`.
     #[must_use]
@@ -1596,7 +1582,7 @@ impl FfState {
         }
         let mut row_count: u32 = u32::from(max_row) + 1;
         if vs_key.vertex_blend_count > 0 {
-            let used = self.world_palette_uploaded();
+            let used = self.palette_matrices(vs_key);
             let palette_rows = u32::from(FF_VS_PALETTE_BASE_ROW)
                 + u32::try_from(used).expect("uploaded palette ≤ 40") * 4;
             if palette_rows > row_count {
@@ -1988,7 +1974,8 @@ impl FfState {
 
     /// Bump-copy the row 95+ PALETTE section (world-matrix palette × view).
     ///
-    /// Extent: `world_palette_uploaded` × 4 rows. Returns `None` when
+    /// Extent: four rows per matrix the key's blending can read
+    /// (`palette_matrices`). Returns `None` when
     /// `vs_key.vertex_blend_count == 0` (palette is never read by the
     /// shader in that case).
     ///
@@ -2025,7 +2012,7 @@ impl FfState {
         if vs_key.vertex_blend_count == 0 {
             return;
         }
-        let used = self.world_palette_uploaded();
+        let used = self.palette_matrices(vs_key);
         let rows_usize = used * 4;
         assert_eq!(dst.len(), rows_usize);
         for (bone, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -2075,11 +2062,7 @@ impl FfState {
     /// Panics if the internally bounded section exceeds its row budget.
     #[must_use]
     pub fn palette_section_rows(&self, vs_key: &FfVsKey) -> u16 {
-        if vs_key.vertex_blend_count == 0 {
-            0
-        } else {
-            u16::try_from(self.world_palette_uploaded() * 4).expect("palette has at most 160 rows")
-        }
+        u16::try_from(self.palette_matrices(vs_key) * 4).expect("palette has at most 160 rows")
     }
 
     /// Pack a used stage-constant prefix directly into immutable frame scratch.
@@ -2182,6 +2165,39 @@ pub enum TssWriteFeeds {
     StageConstant,
     /// The SM1 `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`).
     BumpEnv,
+}
+
+/// The last texture stage the texture-stage-state calls store; a later stage clamps to it.
+pub const LAST_TEXTURE_STAGE: u32 = FF_TEXTURE_STAGES - 1;
+
+/// Whether a texture-stage-state stage and type name an entry of the stored table.
+///
+/// Type 0 names no `D3DTSS_*` state, and a type past `D3DTSS_CONSTANT` lies
+/// past the table.
+#[must_use]
+#[inline]
+pub const fn texture_stage_state_in_table(stage: u32, ty: u32) -> bool {
+    stage <= LAST_TEXTURE_STAGE && ty != 0 && (ty as usize) < TEXTURE_STAGE_STATE_COUNT
+}
+
+/// Clamp a texture-stage-state stage and type into the stored table, as D3D9 runtimes do.
+///
+/// A stage past the last reads and writes the last. A type past
+/// `D3DTSS_CONSTANT`, and the unnamed type 0, read and write
+/// `D3DTSS_CONSTANT`. An index already in the table is returned unchanged.
+#[must_use]
+pub const fn clamp_texture_stage_state(stage: u32, ty: u32) -> (u32, u32) {
+    let stage = if stage > LAST_TEXTURE_STAGE {
+        LAST_TEXTURE_STAGE
+    } else {
+        stage
+    };
+    let ty = if ty == 0 || (ty as usize) >= TEXTURE_STAGE_STATE_COUNT {
+        D3DTSS_CONSTANT
+    } else {
+        ty
+    };
+    (stage, ty)
 }
 
 /// Route a `D3DTSS_*` slot to the snapshot piece that reads it.
@@ -2475,23 +2491,18 @@ pub struct FfStateSnapshot {
     world_palette_high_water: u16,
     texture_transforms: [D3DMATRIX; 8],
     material: D3DMATERIAL9,
-    lights: [D3DLIGHT9; 8],
-    light_enabled: u8,
-    light_defined_mask: u8,
-    /// The three setter-maintained light masks travel with the lights array.
+    /// Every light defined at capture, at any index, in ascending index order.
     ///
-    /// They cannot be re-derived from it after a restore, because an untouched
-    /// slot's `D3DLIGHT9::default()` carries a directional type yet must not
-    /// contribute (its `light_set_mask` bit is clear).
-    light_set_mask: u8,
-    light_directional_mask: u8,
-    light_spot_mask: u8,
+    /// Restoring sets each one back through the light setters, which keep
+    /// the type and enable masks, and leaves a light defined after the
+    /// capture as it is: a block applies only the lights it captured.
+    lights: Vec<CapturedLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
 }
 
 impl FfStateSnapshot {
     #[must_use]
-    pub const fn from(state: &FfState) -> Self {
+    pub fn from(state: &FfState) -> Self {
         Self {
             view: state.view,
             projection: state.projection,
@@ -2499,12 +2510,7 @@ impl FfStateSnapshot {
             world_palette_high_water: state.world_palette_high_water,
             texture_transforms: state.texture_transforms,
             material: state.material,
-            lights: state.lights,
-            light_enabled: state.light_enabled,
-            light_defined_mask: state.light_defined_mask,
-            light_set_mask: state.light_set_mask,
-            light_directional_mask: state.light_directional_mask,
-            light_spot_mask: state.light_spot_mask,
+            lights: capture_lights(state),
             texture_stage_states: state.texture_stage_states,
         }
     }
@@ -2516,12 +2522,7 @@ impl FfStateSnapshot {
         ff.world_palette_high_water = self.world_palette_high_water;
         ff.texture_transforms = self.texture_transforms;
         ff.material = self.material;
-        ff.lights = self.lights;
-        ff.light_enabled = self.light_enabled;
-        ff.light_defined_mask = self.light_defined_mask;
-        ff.light_set_mask = self.light_set_mask;
-        ff.light_directional_mask = self.light_directional_mask;
-        ff.light_spot_mask = self.light_spot_mask;
+        self.restore_lights(ff);
         ff.texture_stage_states = self.texture_stage_states;
         ff.recompute_tt_active_mask();
         // The arrays were written past the setters, so the constant sections
@@ -2539,16 +2540,15 @@ impl FfStateSnapshot {
     /// - transforms (view / projection / world palette / texture transforms)
     ///   and material are `D3DSBT_ALL`-only — neither filtered block captures
     ///   them;
-    /// - lights (and the enable / defined masks that travel with them) belong
-    ///   to the vertex pipeline (`Vertex` and `All`);
+    /// - the captured lights, with their enables, belong to the vertex
+    ///   pipeline (`Vertex` and `All`);
     /// - texture-stage states are filtered per index via
     ///   [`StateBlockType::includes_tss`].
     ///
-    /// As with [`Self::restore_into`], the captured light masks travel with the
-    /// lights array (they are not derivable from it — see the field doc),
-    /// while `tt_active_mask` re-derives from the restored stage states via
-    /// `FfState::recompute_tt_active_mask`; both are normally maintained
-    /// incrementally by setters, which a bulk array restore bypasses.
+    /// As with [`Self::restore_into`], the lights go back through their
+    /// setters, which keep the light masks, while `tt_active_mask` re-derives
+    /// from the restored stage states via `FfState::recompute_tt_active_mask`,
+    /// since a bulk array restore bypasses the setter that maintains it.
     pub fn restore_filtered(&self, ff: &mut FfState, block_type: StateBlockType) {
         // Transforms + material: D3DSBT_ALL only.
         if matches!(block_type, StateBlockType::All) {
@@ -2562,12 +2562,7 @@ impl FfStateSnapshot {
         // Lights (+ enable / defined / type masks): vertex pipeline →
         // Vertex | All.
         if !matches!(block_type, StateBlockType::Pixel) {
-            ff.lights = self.lights;
-            ff.light_enabled = self.light_enabled;
-            ff.light_defined_mask = self.light_defined_mask;
-            ff.light_set_mask = self.light_set_mask;
-            ff.light_directional_mask = self.light_directional_mask;
-            ff.light_spot_mask = self.light_spot_mask;
+            self.restore_lights(ff);
         }
         // Texture-stage states: whole-array for All, per-index otherwise. The
         // `0u32..` counter zipped with the per-stage array yields the `D3DTSS_*`
@@ -2598,6 +2593,75 @@ impl FfStateSnapshot {
             StateBlockType::Pixel => FfVsDirty::TT,
         };
     }
+
+    /// Keep the light set `created` captured, refreshed to this snapshot's values.
+    ///
+    /// A `Capture` of a block `CreateStateBlock` made refreshes the lights the
+    /// block was created with and adds none: D3D9 fixes a block's light set
+    /// when it creates the block. A light of that set this snapshot did not
+    /// find, one a `Reset` undefined since, is kept as the default light
+    /// `LightEnable` would create, disabled, so the set never shrinks.
+    pub fn keep_light_set_of(&mut self, created: &Self) {
+        let fresh = core::mem::take(&mut self.lights);
+        self.lights = created
+            .lights
+            .iter()
+            .map(|kept| {
+                fresh
+                    .iter()
+                    .find(|light| light.index == kept.index)
+                    .map_or_else(
+                        || CapturedLight {
+                            index: kept.index,
+                            light: FfState::enable_default_light(),
+                            enabled: false,
+                        },
+                        |light| CapturedLight {
+                            index: light.index,
+                            light: light.light,
+                            enabled: light.enabled,
+                        },
+                    )
+            })
+            .collect();
+    }
+
+    /// Set each captured light back, leaving every light the snapshot did not capture alone.
+    fn restore_lights(&self, ff: &mut FfState) {
+        for captured in &self.lights {
+            ff.set_light_at(captured.index, &captured.light);
+            ff.set_light_enabled_at(captured.index, captured.enabled);
+        }
+    }
+}
+
+/// One light an [`FfStateSnapshot`] captured.
+struct CapturedLight {
+    index: u32,
+    light: D3DLIGHT9,
+    enabled: bool,
+}
+
+/// Every light `state` has defined, fast-path slots first, each with its enable.
+fn capture_lights(state: &FfState) -> Vec<CapturedLight> {
+    let fast = (0u32..)
+        .zip(&state.lights)
+        .enumerate()
+        .filter(|&(slot, _)| state.light_defined(slot))
+        .map(|(slot, (index, light))| CapturedLight {
+            index,
+            light: *light,
+            enabled: state.light_enabled(slot),
+        });
+    let overflow = state
+        .overflow_lights
+        .iter()
+        .map(|(&index, slot)| CapturedLight {
+            index,
+            light: slot.light,
+            enabled: slot.enabled,
+        });
+    fast.chain(overflow).collect()
 }
 
 fn d3dcolor_to_rgba(c: u32) -> [f32; 4] {

@@ -23,7 +23,7 @@ mod win32;
 pub use d3d8::resources;
 pub use d3d8::{D3D8Harness, D3D8Surface, D3D8SwapChain, D3D8Texture};
 pub use harness::{
-    DrawIndexedUpParams, Harness, HarnessConfig, config_value, config_var,
+    DrawIndexedUpParams, Harness, HarnessConfig, UNWRITTEN, config_value, config_var,
     render_scale_is_identity, run_child,
 };
 pub use in_flight::spawn_scoped;

@@ -46,6 +46,8 @@ pub struct VertexDeclInner {
     hash: u64,
     /// Bit `s` set: some element lives on stream `s`.
     stream_mask: u16,
+    /// The FVF `SetFVF` built this declaration for, 0 for one the game created.
+    fvf: u32,
 }
 
 impl VertexDeclInner {
@@ -67,11 +69,22 @@ impl VertexDeclInner {
     pub const fn stream_mask(&self) -> u16 {
         self.stream_mask
     }
+
+    /// The FVF this declaration stands for, which `GetFVF` reports while it is bound.
+    ///
+    /// The FVF belongs to the declaration rather than to the call that bound
+    /// it: the declaration `SetFVF` built for an FVF reports that FVF however
+    /// it is bound, and a declaration the game created reports 0.
+    pub const fn fvf(&self) -> u32 {
+        self.fvf
+    }
 }
 
 pub struct VertexDeclCreateInfo<'a> {
     pub device_inner: *mut DeviceInner,
     pub elements: &'a [D3DVERTEXELEMENT9],
+    /// The FVF the declaration is built for, 0 for `CreateVertexDeclaration`.
+    pub fvf: u32,
 }
 
 impl Direct3DVertexDeclaration9 {
@@ -85,6 +98,7 @@ impl Direct3DVertexDeclaration9 {
             elements_with_end: packed.elements_with_end,
             hash: packed.hash,
             stream_mask: packed.stream_mask,
+            fvf: info.fvf,
         }));
         Some(Self {
             vtbl: &raw const DIRECT3D_VERTEX_DECLARATION9_VTBL,
@@ -183,12 +197,6 @@ unsafe fn finalize_vertex_decl(this: *mut Direct3DVertexDeclaration9) {
 }
 
 impl ComUnknown for Direct3DVertexDeclaration9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }

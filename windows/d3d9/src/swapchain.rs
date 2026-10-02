@@ -260,14 +260,6 @@ unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
 }
 
 impl ComUnknown for Direct3DSwapChain9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        swapchain_add_ref
-    }
-
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        swapchain_release
-    }
-
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }
@@ -288,10 +280,10 @@ impl ComUnknown for Direct3DSwapChain9 {
 
 extern "system" fn swapchain_present(
     this: *mut c_void,
-    _source_rect: *const c_void,
-    _dest_rect: *const c_void,
-    _dest_window_override: usize,
-    _dirty_region: *const c_void,
+    source_rect: *const c_void,
+    dest_rect: *const c_void,
+    dest_window_override: usize,
+    dirty_region: *const c_void,
     _flags: u32,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
@@ -299,6 +291,12 @@ extern "system" fn swapchain_present(
     let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    crate::device::warn_ignored_present_arguments(
+        source_rect,
+        dest_rect,
+        dest_window_override != 0,
+        dirty_region,
+    );
     if !obj.inner().owned_by_device {
         // SAFETY: the live chain retains its device and owns its cached back buffer.
         let device = unsafe { InPtr::<crate::device::Direct3DDevice9>::new(obj.device_wrapper()) };
