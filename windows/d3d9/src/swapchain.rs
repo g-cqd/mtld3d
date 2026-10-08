@@ -201,8 +201,10 @@ extern "system" fn swapchain_release(this: *mut c_void) -> u32 {
 
 /// Destroy an app-owned `Direct3DSwapChain9` wrapper once both refcounts reach zero.
 ///
-/// The device-owned implicit swapchain is never finalized (its shell is leaked
-/// at device teardown).
+/// Its back buffer goes with it, so this runs only once nothing references
+/// the back buffer either: the last public `Release`, or the last binding
+/// reference's private release after it. The device-owned implicit swapchain
+/// is never finalized (its shell is leaked at device teardown).
 ///
 /// # Safety
 /// `this` must point to a live, app-owned `Direct3DSwapChain9` wrapper at
@@ -215,6 +217,7 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     // Finalize the swapchain-owned cached backbuffer surface (a `Backbuffer`-kind
     // surface never freed by its own `Release` — destroyed with its owner here,
     // mirroring how `device_release` finalizes the implicit RT/DS surfaces).
+    // Its references retain this swap chain, so nothing references it now.
     // SAFETY: `inner` is live (sole owner); read the cached pointer before the
     // box is freed.
     let backbuffer_surface = unsafe { (*inner).backbuffer_surface };
@@ -230,8 +233,9 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     drop(unsafe { Box::from_raw(this) });
 }
 
-// SAFETY: `refcount_mut` exposes this wrapper's own counter; `finalize` frees an
-// app-owned swapchain exactly once at refcount zero. The device-owned implicit
+// SAFETY: `refcount_mut` exposes this wrapper's own counter and
+// `private_refcount` the binding references to its back buffer; `finalize` frees an app-owned
+// swapchain exactly once when both are zero. The device-owned implicit
 // swapchain forwards its refcount to the device and is never finalized here.
 unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
     fn refcount_mut(&mut self) -> &mut u32 {

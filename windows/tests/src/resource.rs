@@ -1101,6 +1101,16 @@ impl CubeTexture<'_> {
         }
     }
 
+    /// `UnlockRect` of one cube face and mip level, returning the hr.
+    ///
+    /// For a lock taken through another object that maps the same
+    /// subresource, such as the face's own surface.
+    #[must_use]
+    pub fn unlock_rect(&self, face: u32, level: u32) -> i32 {
+        // SAFETY: live cube texture; face and level are forwarded as given.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, face, level) }
+    }
+
     /// Get a parent-backed face surface.
     ///
     /// # Panics
@@ -1322,6 +1332,17 @@ impl Surface<'_> {
         (hr, out)
     }
 
+    /// `ReleaseDC` on this surface with the `HDC` another surface's `GetDC` returned.
+    ///
+    /// Returns the hr. The guard keeps its DC: a refused call leaves it held
+    /// for its own surface's `ReleaseDC`.
+    #[must_use]
+    pub fn release_dc_of(&self, dc: &SurfaceDc<'_>) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and the handle is one a
+        // live guard holds, passed through for the implementation to check.
+        unsafe { (self.vtbl().release_dc)(self.ptr, dc.hdc) }
+    }
+
     /// `GetDC`, asserting success and returning a guard over the memory DC.
     ///
     /// The guard reads and writes pixels through GDI and releases the DC on
@@ -1371,6 +1392,34 @@ impl Surface<'_> {
     pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the surface dies; for an implicit surface that is the
+    /// device's destruction.
+    ///
+    /// # Safety
+    /// `punk` is a live COM object that stays live until the runtime releases
+    /// the reference it takes here.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub unsafe fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, live per the contract above.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
     }
 }
 

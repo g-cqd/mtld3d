@@ -19,7 +19,12 @@ use objc2_metal::{
     MTLRenderPipelineState,
 };
 
-use super::{DestroyKind, StageLibHandles, WarmCache, destroy_resources_bulk};
+use super::{
+    BufferGpuState, DepthSnapshot, DestroyKind, MipStagingBuffer, StageLibHandles, StretchScratch,
+    TextureGpuState, WarmCache, cached_buffer_handles, destroy_resources_bulk,
+    drain_source_scratch, staging_wrapped_bytes, take_released_buffer,
+    take_released_staging_wrapper, take_source_scratch, take_staging_wrapper,
+};
 
 struct NativeObjects {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
@@ -312,4 +317,349 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     assert_eq!(pool.len(), usize::try_from(created).unwrap());
     assert_eq!(chunk_total, 2 * (created + 1));
     assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
+}
+
+/// An opaque texture handle, never dereferenced.
+fn texture(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A destroyed source takes its depth snapshot and `StretchRect` scratch with it.
+///
+/// Both caches are keyed by the source texture's handle. A source destroyed
+/// without its entries leaked a full-size Private copy per recreated depth
+/// target or back buffer, and a texture Metal later created at the same
+/// address was handed the old copy. Shutdown takes whatever is left.
+#[test]
+fn a_destroyed_source_takes_its_scratch_copies_and_leaves_the_others() {
+    let mut snapshots = rustc_hash::FxHashMap::default();
+    let mut scratch = rustc_hash::FxHashMap::default();
+    for (source, copy) in [(0x100, 0x1100), (0x200, 0x1200)] {
+        snapshots.insert(
+            source,
+            DepthSnapshot {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Depth32Float,
+                epoch: 0,
+            },
+        );
+    }
+    for (source, copy) in [(0x100, 0x2100), (0x300, 0x2300)] {
+        scratch.insert(
+            source,
+            StretchScratch {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra8Unorm,
+            },
+        );
+    }
+
+    let taken = take_source_scratch(&mut snapshots, &mut scratch, 0x100);
+    assert_eq!(
+        taken.map(|copy| copy.map(MetalHandle::raw)),
+        [Some(0x1100), Some(0x2100)],
+        "both copies of the destroyed source are handed back for retirement"
+    );
+    assert_eq!(
+        take_source_scratch(&mut snapshots, &mut scratch, 0x100).map(|copy| copy.is_some()),
+        [false, false],
+        "a texture created later at the same address finds no copy of the old one"
+    );
+    assert!(
+        snapshots.contains_key(&0x200),
+        "another source keeps its snapshot"
+    );
+    assert!(
+        scratch.contains_key(&0x300),
+        "another source keeps its scratch"
+    );
+
+    let mut rest: Vec<u64> = drain_source_scratch(&mut snapshots, &mut scratch)
+        .into_iter()
+        .map(MetalHandle::raw)
+        .collect();
+    rest.sort_unstable();
+    assert_eq!(rest, [0x1200, 0x2300], "shutdown takes every copy left");
+    assert!(snapshots.is_empty() && scratch.is_empty());
+}
+
+/// An opaque buffer handle, never dereferenced.
+fn buffer(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLBufferKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A `Staged` entry whose CPU backing was released, the shape a `WRITEONLY` DEFAULT buffer reaches.
+fn staged(device_buffer: u64, last_submit_seq: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: MetalHandle::NULL,
+        device_buffer: buffer(device_buffer),
+        is_staged: true,
+        backing_ptr: 0,
+        length: 4096,
+        backing_generation: 0,
+        last_submit_seq,
+    }
+}
+
+/// A `Direct` entry wrapping a CPU backing.
+fn direct(wrapper: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: buffer(wrapper),
+        device_buffer: MetalHandle::NULL,
+        is_staged: false,
+        backing_ptr: 0x10_0000,
+        length: 4096,
+        backing_generation: 1,
+        last_submit_seq: 3,
+    }
+}
+
+/// A released `Staged` buffer with no backing hands its device buffer to the retention queue.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy after
+/// its upload, so its release sends no backing through the retention intake,
+/// the one path that took the entry out before; its Private device buffer
+/// leaked on every release, and every DEFAULT buffer is recreated around a
+/// `Reset`. The destroy waits for the later of the frame that released the
+/// buffer and the last frame that drew with it.
+#[test]
+fn a_released_staged_buffer_retires_its_device_buffer() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    let (released, kept, wrapped) = (
+        BufferId::from_raw(1),
+        BufferId::from_raw(2),
+        BufferId::from_raw(3),
+    );
+    cache.insert(released, staged(0xD100, 7));
+    cache.insert(kept, staged(0xD200, 7));
+    cache.insert(wrapped, direct(0xC300));
+
+    let entry = take_released_buffer(&mut cache, released, 5).expect("the device buffer retires");
+    assert!(matches!(entry.kind, DestroyKind::Buffer));
+    assert_eq!(entry.handle, 0xD100);
+    assert_eq!(entry.seq, 7, "gated on the last frame that drew with it");
+    assert!(entry.page_box.is_none(), "no CPU backing rides along");
+    assert!(!cache.contains_key(&released));
+    assert!(
+        take_released_buffer(&mut cache, released, 9).is_none(),
+        "a second destroy finds nothing"
+    );
+    assert_eq!(
+        take_released_buffer(&mut cache, kept, 9).map(|entry| entry.seq),
+        Some(9),
+        "a release after the last draw waits for its own frame"
+    );
+    assert!(
+        take_released_buffer(&mut cache, wrapped, 9).is_none(),
+        "a Direct wrapper retires with its backing, not here"
+    );
+    assert!(cache.contains_key(&wrapped));
+}
+
+/// Shutdown collects the `Staged` device buffers as well as the `Direct` wrappers.
+#[test]
+fn shutdown_collects_staged_device_buffers_and_direct_wrappers() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(BufferId::from_raw(1), staged(0xD100, 1));
+    cache.insert(BufferId::from_raw(2), direct(0xC200));
+    // A staged entry whose warmup create failed holds no buffer yet.
+    cache.insert(BufferId::from_raw(3), staged(0, 1));
+
+    let mut handles = cached_buffer_handles(&cache);
+    handles.sort_unstable();
+    assert_eq!(handles, [0xC200, 0xD100]);
+}
+
+/// A cached level wrapper over `length` staging bytes, or an empty slot for a null `handle`.
+fn wrapper(handle: u64, length: u64) -> MipStagingBuffer {
+    MipStagingBuffer {
+        handle: buffer(handle),
+        backing_ptr: handle << 16,
+        length,
+        keepalive: None,
+        kept_after_release: false,
+    }
+}
+
+/// A cached texture whose level slots are `levels`.
+fn wrapped_texture(levels: Vec<MipStagingBuffer>) -> TextureGpuState {
+    TextureGpuState {
+        views: mtld3d_shared::texture_views::TextureViews::EMPTY,
+        mip_staging_buffers: levels,
+    }
+}
+
+/// The wrapper gauge sums every populated level slot of every cached texture.
+///
+/// An empty slot (a level never uploaded, or one whose wrapper was parked)
+/// adds nothing, whatever length it last recorded.
+#[test]
+fn the_wrapper_gauge_counts_populated_level_slots_only() {
+    let mut cache = rustc_hash::FxHashMap::default();
+    assert_eq!(staging_wrapped_bytes(&cache), 0);
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(1),
+        wrapped_texture(vec![
+            wrapper(0x10, 64 << 10),
+            wrapper(0x11, 16 << 10),
+            wrapper(0, 32 << 10),
+        ]),
+    );
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(2),
+        wrapped_texture(vec![wrapper(0, 16 << 10), wrapper(0x20, 1 << 20)]),
+    );
+    assert_eq!(
+        staging_wrapped_bytes(&cache),
+        (64 << 10) + (16 << 10) + (1 << 20)
+    );
+}
+
+/// Retiring a level's wrapper empties exactly that slot and hands back its keepalive.
+///
+/// The keepalive is the native owner of the guest pages, so it has to travel
+/// with the wrapper into the retention queue rather than stay in the cache;
+/// an empty slot, another level, an uncached texture and an index past the
+/// texture's levels hand back nothing.
+#[test]
+fn taking_a_staging_wrapper_empties_its_slot_and_keeps_the_others() {
+    let pages = std::sync::Arc::new(mtld3d_core::page_box::PageBox::new_zeroed(2));
+    let id = mtld3d_core::ids::TextureId::from_raw(7);
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(
+        id,
+        wrapped_texture(vec![
+            MipStagingBuffer {
+                keepalive: Some(std::sync::Arc::clone(&pages)),
+                ..wrapper(0x70, 32 << 10)
+            },
+            wrapper(0x71, 16 << 10),
+            wrapper(0, 16 << 10),
+        ]),
+    );
+
+    let taken = take_staging_wrapper(&mut cache, id, 0).expect("level 0 is wrapped");
+    assert_eq!(taken.handle.raw(), 0x70);
+    assert!(
+        taken
+            .keepalive
+            .as_ref()
+            .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &pages)),
+        "the pages' owner leaves the cache with the wrapper"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 0).is_none(),
+        "the slot is empty afterwards, so a later upload creates a fresh wrapper"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 2).is_none(),
+        "an empty slot"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 3).is_none(),
+        "past the levels"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, mtld3d_core::ids::TextureId::from_raw(8), 0).is_none(),
+        "an uncached texture"
+    );
+    assert_eq!(
+        staging_wrapped_bytes(&cache),
+        16 << 10,
+        "the other level keeps its wrapper"
+    );
+    drop(taken);
+    assert_eq!(std::sync::Arc::strong_count(&pages), 1);
+}
+
+/// A release answer retires a level's wrapper once per backing.
+///
+/// The first answer takes the wrapper and leaves the backing's address in
+/// the slot. An upload that wraps the same backing again shows the PE side
+/// kept it (a level rewritten every frame, whose answer a newer upload
+/// overtakes), so that wrapper stays cached through later answers instead
+/// of being created and destroyed every frame. A different backing starts
+/// over, and a backing change still retires a kept wrapper.
+#[test]
+fn a_release_retires_a_levels_wrapper_once_per_backing() {
+    let id = mtld3d_core::ids::TextureId::from_raw(9);
+    let pages = std::sync::Arc::new(mtld3d_core::page_box::PageBox::new_zeroed(2));
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(id, wrapped_texture(vec![wrapper(0x90, 32 << 10)]));
+    let slot = |cache: &rustc_hash::FxHashMap<_, TextureGpuState>| {
+        let state: &TextureGpuState = &cache[&id];
+        let slot = &state.mip_staging_buffers[0];
+        (slot.handle.raw(), slot.backing_ptr, slot.kept_after_release)
+    };
+
+    let first = take_released_staging_wrapper(&mut cache, id, 0).expect("first release");
+    assert_eq!(first.handle.raw(), 0x90);
+    assert_eq!(
+        slot(&cache),
+        (0, 0x90 << 16, false),
+        "the emptied slot remembers the backing"
+    );
+    assert!(
+        take_released_staging_wrapper(&mut cache, id, 0).is_none(),
+        "an empty slot has nothing to retire"
+    );
+
+    let state = cache.get_mut(&id).expect("cached");
+    let prior = &state.mip_staging_buffers[0];
+    let again = MipStagingBuffer::created(
+        buffer(0x91),
+        0x90 << 16,
+        32 << 10,
+        std::sync::Arc::clone(&pages),
+        prior,
+    );
+    state.mip_staging_buffers[0] = again;
+    assert_eq!(slot(&cache), (0x91, 0x90 << 16, true));
+    assert!(
+        take_released_staging_wrapper(&mut cache, id, 0).is_none(),
+        "the second wrapper over the same backing stays cached"
+    );
+    assert_eq!(staging_wrapped_bytes(&cache), 32 << 10);
+    assert!(
+        take_staging_wrapper(&mut cache, id, 0).is_some(),
+        "a backing change still retires a kept wrapper"
+    );
+
+    for (prior, backing, length) in [
+        (wrapper(0, 32 << 10), 0x90 << 16, 32 << 10),
+        (wrapper(0x92, 32 << 10), 0x92 << 16, 32 << 10),
+        (
+            MipStagingBuffer {
+                handle: buffer(0),
+                backing_ptr: 0x90 << 16,
+                length: 32 << 10,
+                ..MipStagingBuffer::default()
+            },
+            0x90 << 16,
+            16 << 10,
+        ),
+    ] {
+        let fresh = MipStagingBuffer::created(
+            buffer(0x93),
+            backing,
+            length,
+            std::sync::Arc::clone(&pages),
+            &prior,
+        );
+        assert!(
+            !fresh.kept_after_release,
+            "a never-released slot, a live wrapper and another length start over"
+        );
+    }
+    drop(first);
 }

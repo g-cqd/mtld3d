@@ -250,8 +250,8 @@ fields_codec!(FfVsKey {
     specular_source,
     emissive_source,
     fog_mode,
-    tci_modes,
-    tci_coord_indices,
+    tci,
+    passthrough,
     tex_coord_dims,
     tt_flags,
     vertex_blend_count,
@@ -278,7 +278,7 @@ fields_codec!(FfPsKey {
 });
 
 fields_codec!(VariantKey {
-    reserved,
+    linked_input_mask,
     alpha_func,
     fog_mode,
     fog_table_mode,
@@ -297,7 +297,8 @@ fields_codec!(VariantKey {
 
 fields_codec!(VsSamplerKinds {
     volume_mask,
-    cube_mask
+    cube_mask,
+    lod_table
 });
 
 fields_codec!(StencilFaceState {

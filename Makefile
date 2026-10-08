@@ -373,12 +373,14 @@ DENY_WARNINGS := --config 'build.warnings="deny"'
 # name the same clone, and the install loops must write it once.
 INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 
-# Both overridable, unlike the rest of these: the HUD and the validation layer
-# are here to catch Metal misuse on a real GPU, and a caller running against a
-# paravirtual one (a CI runner) has reason to turn them off, since neither has
-# anything useful to say about a device that does not implement the counters they
-# read.
-export MTL_HUD_ENABLED ?= 1
+# Both overridable, unlike the rest of these. The validation layer is on: it
+# is here to catch Metal misuse on a real GPU. The Metal HUD is off: no test
+# reads it, and it hooks every drawable present and reads the view's safe-area
+# insets, an AppKit call, from the dispatch thread on which Metal runs the
+# scheduled present. That read races AppKit's own work on the main thread and
+# can abort a test process inside AppKit. MTL_HUD_ENABLED=1 on the command line
+# or in the environment turns it back on to watch a run.
+export MTL_HUD_ENABLED ?= 0
 export MTL_DEBUG_LAYER ?= 1
 # Apple's variable, read by the Main Thread Checker that the test config below
 # loads into every test process (`debug.mainThreadChecker=true`): with it set,
@@ -682,8 +684,7 @@ for f in $(1); do \
 	esac ; \
 	if [ -n "$$hits" ]; then echo "production-assert-gate: $$f imports the C assertion handler $$hits: a C or C++ object was built without NDEBUG" >&2; exit 1; fi ; \
 	if LC_ALL=C grep -a -q -F 'assert fail: {} in {} on {} ' $$f; then echo "production-assert-gate: $$f carries snmalloc's assertion message: snmalloc was built without NDEBUG" >&2; exit 1; fi ; \
-done ; \
-echo "production-assert-gate: no C or C++ assertion path in $(1)"
+done
 endef
 PRODUCTION_ASSERT_CHECK = $(if $(filter production,$(PROFILE)),$(call PRODUCTION_ASSERT_GATE,$(1)))
 
@@ -732,8 +733,7 @@ printf '%s\n' "$$funcs" | while read -r rva size name; do \
 			printf '%s\n' "$$code" | grep -E "(call[a-z]*|j[a-z]+)[[:space:]]+$$target" >&2 ; exit 1 ;; \
 		esac ; \
 	done ; \
-done || exit 1 ; \
-echo "mem-routine-gate: $$(printf '%s\n' "$$funcs" | wc -l | tr -d ' ') functions of the memory routines in $$dll, none branches to one of the four"
+done || exit 1
 endef
 
 mem-routine-gate:
@@ -1066,7 +1066,8 @@ stage: all
 #     it is made (MTC_CRASH_ON_REPORT, exported above) instead of surfacing as
 #     a rare death later in Wine's own code.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
-# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
+# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests;
+# MTL_HUD_ENABLED stays off (inherited), for the reason given beside it.
 #
 # SCALE=<n> additionally reruns the whole e2e suite at `render.scale = <n>`,
 # i.e. rasterizing the back buffer smaller than the resolution D3D9 reports and
@@ -2008,14 +2009,19 @@ bench-compare:
 
 # `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
 # calibrates a benchmark's scene against a game: it reads the last complete
-# frame the game dumped with F12 into passes and prints them beside the
+# frame the game dumped with Ctrl+Shift+P into passes and prints them beside the
 # benchmark's `shape` lines, flagging draw counts off by more than 10 %,
 # fixed-function shares off by more than 10 points, textures per draw off by
-# more than 1.0, and a different pass count. Exit 1 when anything is flagged.
+# more than 1.0, and a different pass count. Where the `shape` lines carry a
+# state mix, it also flags blend, alpha-test, depth-write-off, cull-none and
+# colour-mask-0 shares off by more than 10 points, and shader, texture and
+# state switch counts and distinct shader and texture counts off by more than
+# 15 % of the game's count or 5, whichever is larger. Exit 1 when anything is
+# flagged.
 # It runs nothing under Wine and judges no build; it is run by hand.
 bench-shape:
 	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
-		{ echo "make bench-shape needs GAME_LOG=<a layer log with an F12 dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
+		{ echo "make bench-shape needs GAME_LOG=<a layer log with a Ctrl+Shift+P dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-shape --game-log '$(abspath $(GAME_LOG))' \
 		--metrics '$(abspath $(BENCH_METRICS))'
 

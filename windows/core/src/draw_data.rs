@@ -218,35 +218,51 @@ pub fn stream_layouts(
     source: &VertexSource,
     attrs: &AttrSnapshot,
 ) -> [StreamLayout; MAX_STREAMS as usize] {
-    stream_layouts_with(attrs, |stream, extent| match source.feed(stream) {
-        StreamFeed::Inline { stride } => StreamLayout {
-            stride: layout_stride(stride, extent),
-            step: VertexStepFunction::PerVertex,
-            step_rate: 1,
+    let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+    stream_layouts_with(
+        &mut layouts,
+        attrs,
+        |stream, extent| match source.feed(stream) {
+            StreamFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
+            StreamFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
         },
-        StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
-        StreamFeed::Null => StreamLayout {
-            stride: extent,
-            step: VertexStepFunction::Constant,
-            step_rate: 0,
-        },
-    })
+        &mut 0,
+    );
+    layouts
 }
 
-/// Compute declaration layouts while borrowing stream fields from their capture owner.
-#[must_use]
+/// Write declaration layouts into `layouts` while borrowing stream fields from their owner.
+///
+/// Every stream the declaration does not read becomes
+/// [`StreamLayout::UNUSED`]. Also sets in `crossing` the streams whose layout
+/// steps by less than the extent of the elements the shader consumes on them,
+/// bit `n` for stream `n`: the draw fetches those through a
+/// [`crate::streams::CrossingFetch`].
 pub fn stream_layouts_with(
+    layouts: &mut [StreamLayout; MAX_STREAMS as usize],
     attrs: &AttrSnapshot,
     mut layout: impl FnMut(u32, u32) -> StreamLayout,
-) -> [StreamLayout; MAX_STREAMS as usize] {
-    let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+    crossing: &mut u16,
+) {
+    *layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
     let mut used = attrs.used_streams();
     while used != 0 {
         let stream = used.trailing_zeros();
         used &= used - 1;
-        layouts[stream as usize] = layout(stream, attrs.extents()[stream as usize]);
+        let extent = attrs.extents()[stream as usize];
+        let stream_layout = layout(stream, extent);
+        *crossing |= u16::from(stream_layout.stride < extent) << stream;
+        layouts[stream as usize] = stream_layout;
     }
-    layouts
 }
 
 /// Where the index data comes from (or whether the draw is non-indexed).
@@ -319,6 +335,11 @@ pub enum IndexSource {
 #[repr(C, align(8))]
 pub struct StageBinding {
     pub texture_id: crate::ids::TextureId,
+    /// The stage's `D3DSAMP_*` states, indexed by state.
+    ///
+    /// Index [`crate::sampler_state::TEXTURE_LOD_SLOT`], which names no
+    /// sampler state, carries the bound texture's `SetLOD`, which the sampler
+    /// translation and the explicit-LOD rows read on the encoder thread.
     pub sampler_state: [u32; SAMPLER_STATE_COUNT],
 }
 
@@ -398,8 +419,8 @@ unsafe impl crate::encoder_records::CommandRecord for DeclarationHeader {}
 
 // SAFETY: AttrSnapshot.ptr aliases immutable bytes in the retained command arena
 // or native per-frame ScratchArena owned by the frame being encoded.
-// CurrentSnapshot lives on FrameEncoder (encoder-thread-only). Send is
-// permitted but never actually crossed.
+// CurrentSnapshot lives on the packet's DrawReader, which only the encoder
+// thread replays. Send is permitted but never actually crossed.
 unsafe impl Send for AttrSnapshot {}
 
 impl AttrSnapshot {
@@ -443,41 +464,6 @@ impl AttrSnapshot {
         // SAFETY: per type invariant the (ptr, len) refer to a live
         // slice in the current frame's ScratchArena.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.header().count as usize) }
-    }
-}
-
-/// Cached pointer to a scratch-allocated `CurrentSnapshot`.
-///
-/// Wrapped in a newtype so it can be `Copy` + `Send` while making the
-/// unsafe deref site explicit at the read.
-#[derive(Clone, Copy)]
-pub struct CurrentSnapshotPtr(NonNull<CurrentSnapshot>);
-
-// SAFETY: see `AttrSnapshot`. The CurrentSnapshot struct lives in the
-// current frame's ScratchArena owned by the encoder thread for the
-// duration of `run_frame`.
-unsafe impl Send for CurrentSnapshotPtr {}
-
-impl CurrentSnapshotPtr {
-    /// Bind a snapshot to its frame-retained arena.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` addresses an initialized `CurrentSnapshot`. Keep it and all referenced
-    /// storage immutable and allocated until every copy of this token is forgotten.
-    #[must_use]
-    pub const unsafe fn new(ptr: NonNull<CurrentSnapshot>) -> Self {
-        Self(ptr)
-    }
-
-    /// Raw `*mut CurrentSnapshot` for lifetime-laundered reads inside `emit_draw`.
-    ///
-    /// Direct `as_ref` is intentionally not provided — `as_ref` returns
-    /// `&CurrentSnapshot` whose lifetime is tied to `self`, which in turn
-    /// lives on `FrameEncoder` and prevents the usual `&mut enc` reborrows.
-    #[must_use]
-    pub const fn as_ptr(&self) -> *mut CurrentSnapshot {
-        self.0.as_ptr()
     }
 }
 
@@ -681,17 +667,14 @@ bitflags::bitflags! {
 
 /// Encoder-thread state representing what's currently "bound" for `emit_draw`.
 ///
-/// Lives in the per-frame `ScratchArena`; `FrameEncoder` holds an
-/// `Option<CurrentSnapshotPtr>` that a draw carrying changed state
-/// updates. `emit_draw` borrows `&CurrentSnapshot` once via lifetime
-/// laundering and reads fields directly — no struct copies on the encoder
-/// side.
+/// The packet's `DrawReader` owns it and applies each changed snapshot
+/// record to it in place; `emit_draw` borrows it from the reader and reads
+/// fields directly, so the encoder never copies the struct.
 ///
 /// Intentionally NOT `Copy` / `Clone` — accidental whole-struct copies
 /// would be a per-draw pessimisation. The large FF keys (`FfVsKey` /
 /// `FfPsKey`) live behind lease-bound `VsSourcePtr` / `PsSourcePtr` tokens
-/// rather than inline, so the wrapper that gets memcpy'd per draw is
-/// ~160 B (pointers + scalars) and the FF source is only bumped when
+/// rather than inline, and the FF source is only re-sent when
 /// `VS_SOURCE` / `PS_SOURCE` is dirty.
 pub struct CurrentSnapshot {
     pub render_state: Option<RenderStatePtr>,
@@ -870,6 +853,20 @@ impl PsKey {
     }
 }
 
+/// The fallback texture for a bound pixel stage whose own Metal texture is missing.
+///
+/// The fragment function types the slot from the texture bound to it. A
+/// depth texture is declared `depth2d<float>` whether it is sampled with a
+/// comparison or read raw, so it falls back to the depth kind; every other
+/// slot takes the black texture of its declared dimension.
+#[must_use]
+pub const fn missing_texture_kind(variant: VariantKey, slot: u16) -> NullTextureKind {
+    if slot < 16 && variant.depth_sampler_mask & (1u16 << slot) != 0 {
+        return NullTextureKind::Depth2D;
+    }
+    null_texture_kind(crate::dxso::bound_sampler_type(variant, slot))
+}
+
 /// The black-fallback texture of the kind an emitted sampler argument carries.
 ///
 /// Both stages type their `[[texture(n)]]` arguments from the texture bound to
@@ -1006,6 +1003,39 @@ pub unsafe fn arena_alloc_bytes(scratch: &mut ScratchArena, bytes: &[u8]) -> Scr
     let ptr = scratch.alloc(bytes);
     let len = u32::try_from(bytes.len()).expect("constants slice fits u32");
     let nn = NonNull::new(ptr as *mut u8).expect("ScratchArena::alloc returned non-null");
+    ScratchSlice { ptr: nn, len }
+}
+
+/// Copy `bytes` into the arena followed by zeros up to `len` bytes.
+///
+/// The copy of a UP vertex stream whose last crossing attribute ends past the
+/// vertices the application supplied: D3D9 promises only `count * stride`
+/// readable bytes behind its pointer, and the attribute reads zero past them.
+///
+/// # Panics
+///
+/// Panics if `len` is below `bytes.len()` or 0, or exceeds `u32::MAX`.
+///
+/// # Safety
+///
+/// As [`arena_alloc_bytes`].
+pub unsafe fn arena_alloc_zero_padded(
+    scratch: &mut ScratchArena,
+    bytes: &[u8],
+    len: usize,
+) -> ScratchSlice {
+    let padding = len
+        .checked_sub(bytes.len())
+        .expect("the padded length covers the copied bytes");
+    let ptr = scratch.alloc_uninit_slice::<u8>(len);
+    // SAFETY: the arena reserved `len` bytes at `ptr`, disjoint from `bytes`.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    // SAFETY: `bytes.len() + padding == len` stays inside the reservation.
+    let tail = unsafe { ptr.add(bytes.len()) };
+    // SAFETY: `tail` addresses `padding` reserved bytes.
+    unsafe { tail.write_bytes(0, padding) };
+    let len = u32::try_from(len).expect("UP vertex payload fits u32");
+    let nn = NonNull::new(ptr).expect("ScratchArena reservation is non-null");
     ScratchSlice { ptr: nn, len }
 }
 

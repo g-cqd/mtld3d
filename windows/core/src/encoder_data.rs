@@ -15,7 +15,7 @@ use mtld3d_types::SAMPLER_STATE_COUNT;
 use crate::{
     buffer_rename::BufferMapMode,
     dirty_rect::DirtyRect,
-    draw_data::{CurrentSnapshotPtr, DrawOp, ScratchSlice},
+    draw_data::{DrawOp, ScratchSlice},
     encoder_reply::{ReplyBool, ReplyU64},
     ids::{BufferId, ProgramId, TextureId},
     page_box::{PageBox, PageBoxRead},
@@ -197,6 +197,39 @@ pub struct StretchSurfaceInfo {
     pub msaa_srgb: MetalHandle<MTLTextureKind>,
     /// Sample count of the surface, 1 when it is single-sampled.
     pub sample_count: u8,
+}
+
+impl StretchSurfaceInfo {
+    /// Name the surface class `StretchRect` eligibility is judged on, for a rejection line.
+    ///
+    /// A standalone colour surface is the back buffer or a `CreateRenderTarget`
+    /// surface. Both report `D3DUSAGE_RENDERTARGET`, so the name does not tell
+    /// them apart.
+    #[must_use]
+    pub const fn class_name(&self) -> &'static str {
+        match self.kind {
+            StretchKind::DepthStencil(_) => "depth-stencil surface",
+            StretchKind::Backbuffer(_) => "standalone render target",
+            StretchKind::Texture(_) => {
+                if self
+                    .flags
+                    .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
+                {
+                    "offscreen-plain surface"
+                } else if self.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+                    if self.slice.is_some() {
+                        "render-target cube face"
+                    } else {
+                        "render-target texture level"
+                    }
+                } else if self.slice.is_some() {
+                    "cube face"
+                } else {
+                    "texture level"
+                }
+            }
+        }
+    }
 }
 
 /// Render target 0 as the encoder binds it.
@@ -473,6 +506,10 @@ pub struct SetViewportOp {
 
 pub struct SetVertexSamplerOp {
     pub slot: u8,
+    /// The vertex sampler's `D3DSAMP_*` states, indexed by state.
+    ///
+    /// Index [`crate::sampler_state::TEXTURE_LOD_SLOT`] is always 0: a vertex
+    /// sample names its level, so no texture LOD reaches a vertex row.
     pub state: [u32; SAMPLER_STATE_COUNT],
 }
 
@@ -503,6 +540,16 @@ pub struct UnbindExtraColorOp {
 
 pub struct DestroyTextureOp {
     pub tex_id: TextureId,
+}
+
+/// A vertex or index buffer released with no CPU backing left to retire.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy once
+/// an upload has carried every byte, so its release has no `PageBox` to send
+/// through the retention queue. The device buffer the draws bind is still
+/// cached on the encoder, and this is what takes it out.
+pub struct DestroyBufferOp {
+    pub buffer_id: BufferId,
 }
 
 pub struct ReadColorHandleOp {
@@ -738,8 +785,6 @@ pub enum Op {
         rows: u16,
         data: ScratchSlice,
     },
-    /// Install decoded native state before dependent draws.
-    SetSnapshot(CurrentSnapshotPtr),
     /// Issue a draw using the current snapshot.
     Draw(DrawOp),
     SetViewport(
@@ -773,6 +818,10 @@ pub enum Op {
     DestroyTexture(
         #[cfg(windows)] DestroyTextureOp,
         #[cfg(not(windows))] Box<DestroyTextureOp>,
+    ),
+    DestroyBuffer(
+        #[cfg(windows)] DestroyBufferOp,
+        #[cfg(not(windows))] Box<DestroyBufferOp>,
     ),
     ReadColorHandle(
         #[cfg(windows)] ReadColorHandleOp,
@@ -924,14 +973,14 @@ bitflags::bitflags! {
         /// texture safe to read from the subsequent readback-blit command
         /// buffer.
         const NO_PRESENT = 1 << 1;
-        /// First frame of an F12 run: start the Metal GPU capture before it.
+        /// First frame of a Ctrl+Shift+P run: start the Metal GPU capture before it.
         ///
         /// Set by `frame_dump_present` on the frame it arms. The encoder
         /// drains the submit thread, starts the capture and runs every frame
         /// synchronously until `GPU_CAPTURE_STOP` so each `SubmitFrame`
         /// thunk falls inside the bracket.
         const GPU_CAPTURE_START = 1 << 2;
-        /// Last frame of an F12 run: stop the Metal GPU capture after it.
+        /// Last frame of a Ctrl+Shift+P run: stop the Metal GPU capture after it.
         ///
         /// A frame swap that does not present moves this bit onto the
         /// continuation, so the capture ends with the piece the closing
@@ -1622,3 +1671,6 @@ pub const fn capture_op<T>(value: T) -> T {
 pub fn capture_op<T>(value: T) -> Box<T> {
     Box::new(value)
 }
+
+#[cfg(test)]
+mod tests;

@@ -46,9 +46,16 @@ answer, `intel.managedMemory` and `intel.linearAlign256`, must move no count
 at all, and a site that fails only under the variant is expected to trace to
 one of the two caps keys. The `@mac2` entries are recorded by CI, whose
 Intel image is the one Mac2 machine the project runs on: dispatch the
-workflow with `record_intel_baseline` and copy the `@mac2` sections out of
-the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
-Silicon machine leaves them untouched, the merge being leg-scoped).
+workflow with `record_intel_baseline` (and `intel_only`, so only the Intel
+legs run) and copy the `@mac2` sections out of the `baseline-mac2-<arch>`
+artifacts (`make conformance-baseline` on an Apple Silicon machine leaves
+them untouched, the merge being leg-scoped). Pull requests do not run the
+Intel image, so a change that fixes a site updates the Apple entries and
+leaves the site's `@mac2` pin above the new count; the next nightly Intel run
+then fails on a stale baseline, not a regression. The fix is that same
+dispatch, `record_intel_baseline` with `intel_only`, best made on the pull
+request's branch before it merges so the `@mac2` sections land with it, or
+on `main` once the nightly shows the stale pin.
 
 ### The arm64-runtime legs
 
@@ -87,8 +94,10 @@ drops afterwards) stops the subtest at once and ends the leg: exit code 3, no
 verdict, no baseline write. Every count after that line is a read off a GPU
 that runs nothing, and waiting out the subtest's budget would only make the
 same non-verdict cost minutes. On the Intel CI image the paravirtual GPU stays
-hung for the rest of the machine's life, so the later subtests would hang too
-and the job names the re-run of the failed jobs, which lands on a fresh runner.
+hung for the rest of the machine's life, so the later subtests would hang too.
+The job marks the leg with a `GPU hang` annotation, and the answer is a re-run
+of the failed jobs, which lands them on fresh runners; CI does that once by
+itself (`CONTRIBUTING.md`, "Pull requests", says when).
 A hang on a real GPU is worth a look on its own (a shader that hangs the GPU is
 a bug), but the leg has to run again for its counts either way.
 
@@ -292,10 +301,100 @@ record. A knob, where one makes sense, is named with its default.
   presents into rather than on the one that holds focus. Sites: `test_wndproc`
   and `test_wndproc_windowed` for where the hook sits,
   `test_device_window_reset` for its following a retarget, all below. No knob.
+- **A rejected `Reset` leaves render target 0 on the back buffer and the
+  depth stencil on the implicit surface.** Like a successful one it releases
+  every binding and returns every state to its default before it fails, and
+  it leaves the attachments a successful `Reset` leaves. Wine and DXVK unbind
+  both before their outstanding-resource check and do not bind them again on
+  failure, so `GetRenderTarget(0)` and `GetDepthStencilSurface` answer
+  `D3DERR_NOTFOUND` there. What Windows answers is not observable: no d3d9
+  test reads the device after a rejected `Reset`, and Wine's d3d8
+  `test_reset` keeps its `GetIndices` after one under `if (0)` because it
+  crashes on Windows. The layer has no state without render target 0: the
+  pass machine, the snapshot and every draw path assume one, so an unbound
+  slot 0 would be a new device state for a device that can do nothing but
+  `Reset` again. No site observes it. No knob.
+- **A texture whose Metal allocation is refused at an extent within the
+  reported limits still creates.** `CreateTexture`, `CreateCubeTexture` and
+  `CreateVolumeTexture` record the Metal texture's creation into the frame
+  and return; the encoder thread makes it before any operation that uses it.
+  When Metal returns nil there, the refusal is logged with the descriptor and
+  the device's memory figures, the texture samples as opaque black, and the
+  uploads into it and draws and copies through it are dropped, each logged.
+  Wine and DXVK allocate at the create and answer `E_OUTOFMEMORY` or
+  `D3DERR_OUTOFVIDEOMEMORY` when it fails. Answering at the create here would
+  make every texture create wait on the encoder thread, which owns the
+  texture records, or move the allocation onto the API thread, on the
+  streaming path that loads thousands of textures, for a failure Metal
+  reports only when the GPU is out of memory. A width or height past
+  `MaxTextureWidth` or `MaxTextureHeight` is refused at the create with
+  `D3DERR_NOTAVAILABLE`, as Wine refuses a texture past its 2D limit. A
+  volume past `MaxVolumeExtent` on any axis is refused the same way, which is
+  ours alone: Wine checks no 3D limit and DXVK checks no size, but Metal
+  aborts the process on a 3D descriptor past it. No site observes the
+  deferred refusal. No knob.
+- **`ATI1` creates where no query offers it.** `CreateTexture` makes a 2D
+  `ATI1` texture in every pool and `CreateOffscreenPlainSurface` a plain
+  surface in every pool it takes, backed by BC4, while `CheckDeviceFormat`
+  answers `D3DERR_NOTAVAILABLE` for the format on every resource type. The
+  lock of such a level reports the BC4 block pitch, eight bytes per
+  four-texel block row, where D3D9 drivers report the format as if it held a
+  byte per texel and the application works the block layout out itself.
+  Advertising the format would move titles that probe for it, Half-Life 2
+  and Team Fortress 2 among them, onto a path no tested title runs; refusing
+  the create would end a title that makes one without probing. Reporting the
+  D3D9 pitch would need staging sized to that pitch and lock offsets in it
+  rather than in the block layout the upload reads, on every lock path.
+  Wine's `test_surface_blocks` accepts a create of an extension format the
+  queries refuse (`may_succeed`), so no site observes the split. No knob:
+  either side of it is a behaviour change for a title, not a trade.
+- **`D16_LOCKABLE` and `D32F_LOCKABLE` create where no query offers them.**
+  The auto depth-stencil of `CreateDevice` and `Reset`, and a
+  `CreateTexture` with `D3DUSAGE_DEPTHSTENCIL`, take either format and serve
+  its depth on `Depth32Float`, while `CheckDeviceFormat`,
+  `CheckDepthStencilMatch` and a standalone `CreateDepthStencilSurface`
+  refuse both. What the formats promise beyond depth is a `LockRect` of the
+  depth surface, and the layer keeps no CPU copy of depth to hand back, so
+  that lock answers `D3DERR_INVALIDCALL`, warned once. They are
+  single-sampled; a multisampled swap chain refuses them, as
+  `CheckDeviceMultiSampleType` does, which DXVK refuses too. Wine serves
+  both formats and DXVK serves each on some vendors, so a title can ask for
+  one as its auto depth-stencil without probing; refusing the create would
+  end that title where it otherwise runs with a working depth test and only
+  the lock missing. Advertising them would promise the lock. Wine's tests
+  probe both formats before using them (`test_clear_different_size_surfaces`
+  falls back to D24S8, and the fetch4 and shadow tests skip them), so no
+  site observes the split. No knob: the lock a knob would restore does not
+  exist.
+- **`CreateDevice` and `Reset` substitute a BGRA8 back buffer for any
+  format.** The layer presents one drawable format, so a back buffer asked
+  for in R5G6B5, A1R5G5B5, X1R5G5B5, A2R10G10B10, a float or any other
+  format is created BGRA8, warned once, and reports X8R8G8B8 from
+  `GetDesc`; A8R8G8B8 and X8R8G8B8 keep their own. D3D9 refuses a format
+  outside its back-buffer set (DXVK answers `D3DERR_INVALIDCALL`), and a
+  16-bit back buffer would need a conversion pass on every present.
+  `CheckDeviceType` answers only formats inside that set, the 16-bit ones
+  where the device renders into them as `test_display_formats` requires, so
+  a title that probes lands on a standard format; one that skips the probe
+  keeps a device rather than losing it. No knob.
 - **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
+- **A `D3DSAMP_BORDERCOLOR` other than the three Metal presets reads as
+  opaque black.** Under `D3DTADDRESS_BORDER` D3D9 returns the colour the game
+  set, and the reference implementations pass it to their samplers. A Metal
+  sampler takes only transparent black, opaque black or opaque white
+  (`MTLSamplerBorderColor`), so those three map exactly and every other
+  colour takes opaque black, logged once per colour. Returning an arbitrary
+  colour would take a coordinate test and a select around every sample of a
+  stage that addresses by border, carried in each shader as a variant bit and
+  a per-stage colour uniform, while the common use, a shadow map whose
+  outside reads as lit or as shadowed, needs white or black. Wine's suite
+  sets a non-preset border colour only on a cube texture, where the border is
+  never read, so no site observes it. No knob: the behaviour a knob would
+  restore needs a shader path the layer does not have, so there is nothing
+  to trade.
 - **The adapter mode list leaves out the display sizes win32u cannot scale
   the monitor to.** After a mode-set, win32u recomputes the monitor's scale
   as `dpi * physical / size` on each axis, reduces it by the greatest common
@@ -348,6 +447,37 @@ record. A knob, where one makes sense, is named with its default.
   such as a screenshot, sees the frame as drawn, skipped draws included. The
   runner pins the knob off, so no site observes it. Knob:
   `shader.asyncCompile`, default `true`.
+- **`GetRenderTargetData` from an X render target into its A counterpart
+  copies the padding as alpha.** An X8R8G8B8 render target read into an
+  A8R8G8B8 system-memory surface (and X8B8G8R8 into A8B8G8R8, X1R5G5B5 into
+  A1R5G5B5) is accepted, and the read-back copies the bytes, so the
+  destination's alpha holds whatever the source's padding holds where D3D9
+  reads an X surface's alpha as one. The colour channels are exact. A
+  read-back is one blit of the bytes into the destination's memory, and
+  forcing alpha would add a render pass into a scratch texture or a CPU pass
+  over every pixel of every read-back, the path an application takes for
+  each screenshot and the end-to-end harness for every pixel it checks.
+  `StretchRect` from an X surface into an A one does write alpha one. No
+  conformance site is known to observe it. No knob: an application reading
+  such a surface asked for the colour, and a knob would only add a second
+  read-back path to keep in step.
+- **The fixed-function specular add clamps before fog.** With
+  `D3DRS_SPECULARENABLE` on, the interpolated specular colour joins the
+  cascade result after the last texture stage, RGB only, and the sum is
+  clamped to [0, 1] before fog blends it with the fog colour. wined3d
+  (`ffp_varying_specular * specular_enable + ret`) and DXVK
+  (`state.current.xyz += in_Color1.xyz;`) both fog the unclamped sum, so a
+  fogged pixel whose diffuse and specular add past one comes out brighter
+  there; without fog the render target's clamp makes the two agree on a
+  normalized target. The clamp follows the colour-sum stage of
+  fixed-function hardware, which OpenGL's fixed pipeline specifies as
+  clamped to [0, 1] before fog, and World of Warcraft draws fogged scenes
+  through this path with the add switched on, so the reference behaviour is
+  not adopted on reference agreement alone.
+  What Windows draws is not measured, and no site observes it: Wine's suite
+  turns the specular add on only in tests that leave fog off. Reopen on a game
+  that shows fogged highlights brighter or darker than on Windows. No knob:
+  the alternative is a different shader, not a trade.
 
 ## Range-fog coverage
 
@@ -405,6 +535,23 @@ behavior that depends on which later state update refreshed a cached request.
 Complete native AMD behavior for these mixed sequences has not been measured.
 The local sequence tests define this policy; Wine's AMD visual branch covers
 only enable, disable and VERTEX-state-block restoration.
+
+## Fetch4 state-block membership
+
+The Fetch4 latch that `D3DSAMP_MIPMAPLODBIAS` GET4 and GET1 commands set and
+clear is a hidden component of the sampler state, beside the raw DWORD that
+`GetSamplerState` returns. ALL and PIXEL state blocks capture and restore the
+latch of every pixel sampler with the raw value; VERTEX blocks restore
+neither. Recorded blocks follow the A2M rule: a recorded GET4 or GET1 carries
+the latch, which a Capture refreshes from the device, while a recorded numeric
+bias carries none, and a Capture cannot add it. Reset clears the latch.
+
+This is a compatibility policy. Wine has no Fetch4. DXVK captures only the raw
+DWORD and decodes it again on Apply, so a block captured while a numeric bias
+follows GET4 does not restore the latch there. mtld3d restores the latch the
+block saw, for the same reason as the A2M latch: the result does not depend on
+which bias write came last. Native AMD behavior for these sequences has not
+been measured; `samplers.rs` defines the policy.
 
 ## Dynamic depth texture coverage
 
@@ -470,8 +617,10 @@ argument modifiers and saturation before a following texture stage.
 An implicit-only missing texture uses zero alpha, following the native
 observation recorded in DXVK commit `0b49a39896f25896b83ed01c0609393dfc3bb85c`.
 This is a reference choice, not a new native measurement: Wine's D3D9 GL
-dummy texture uses alpha one. Existing explicit-unbound-argument handling
-and ordinary `BLENDTEXTUREALPHA` behavior remain unchanged.
+dummy texture uses alpha one. The ordinary `BLENDTEXTUREALPHA` follows the
+same rule, so with no texture bound and no argument naming it the stage
+yields its second argument, for colour and alpha alike; wined3d yields the
+first. Existing explicit-unbound-argument handling remains unchanged.
 
 ## What the baseline records — and where classes live
 
@@ -540,15 +689,21 @@ hard-to-fix or low-value defect is still `real`):
   macdrv window-manager timing). Count changes in either direction never gate.
   Tag reactively — only once a flutter actually trips the gate — and pin the
   HIGHER observed count so a flutter back up is not a false regression.
-- **`ceiling`** — the pinned count is a cross-environment MAXIMUM, not an exact
-  value: the same baseline serves environments where the site legitimately
-  reads lower (a CI runner's virtual display accepts the mode changes this
-  machine's macdrv rejects, so the desktop-mode sites read zero there; the
-  fetch4 counts wobble with the attached display). Reading below the pin is
-  tolerated and does not demand a re-record; reading above it gates like any
-  regression. The tag adds only that tolerance — the divergence's nature stays
-  in the cluster prose, and like `flaky` it is assigned reactively, from a
-  measured cross-environment delta, never speculatively.
+- **`ceiling`**: the pinned count is a MAXIMUM, not an exact value, in two
+  cases. First, the same baseline serves environments where the site
+  legitimately reads lower (a CI runner's virtual display accepts the mode
+  changes this machine's macdrv rejects, so the desktop-mode sites read zero
+  there; the fetch4 counts wobble with the attached display). Second, the
+  site's count flaps below the pin on one environment, and only a read above
+  the pin would mean something (test_wndproc 4319, and 4302/4328/4329).
+  Reading below the pin is tolerated and does not demand a re-record; reading
+  above it gates like any regression. The tag adds only that tolerance; the
+  divergence's nature stays in the cluster prose. Like `flaky` it is assigned
+  reactively, from a measured cross-environment delta or after the flap
+  tripped the gate, never speculatively. For a flapping site, choose
+  `ceiling` over `flaky` when a count above the highest observed one would
+  be a real failure (for instance every iteration of a loop failing), and
+  `flaky` only when the count carries no meaning in either direction.
 - **`crash`** — a site attributed to a crash/abort path.
 - **`untriaged`** — an explicit placeholder for a site a human has not yet
   triaged. Normally untriaged means *absent from this document* (the sync test
@@ -585,9 +740,12 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-09-30: 0 `real`, 120 `expected`, 1 `caps`,
-22 `ceiling`, 3 `flaky`, 0 `untriaged`, 146 unique sites in all.
+`Sites:` tokens below on 2026-10-05: 0 `real`, 119 `expected`, 1 `caps`,
+25 `ceiling`, 3 `flaky`, 0 `untriaged`, 148 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+(2026-10-05: test_wndproc 4302 moved from `expected` to `ceiling`, and
+4328/4329 joined it, pinned at one on the `i686` and `i686+intel` device
+legs; the cluster says why.)
 (2026-09-30: the adapter mode table stopped leaving out sizes more than 15 %
 from the desktop's aspect, which made 640x480 a settable mode on the Intel CI
 image: its display runs 3840x2160 and user32 lists 640x480 for it, so a
@@ -781,8 +939,9 @@ none today.
 Empty. No failing site is classified `real` on any leg.
 
 Every other failing site is a recorded decision (`expected`), a capability we
-do not advertise (`caps`), a pin that reads zero on other hardware
-(`ceiling`), or a known flap (`flaky`), each with its rationale in the
+do not advertise (`caps`), a pin above the usual read, because the site
+reads lower on other hardware or flaps below it here (`ceiling`), or a known
+flap (`flaky`), each with its rationale in the
 per-cluster section below.
 
 The `device` subtest used to die silently inside test_volume_get_container
@@ -803,7 +962,8 @@ baseline.
 ### device.c/test_wndproc
 Sites: 4207=expected 4212=expected 4214=expected 4219=expected
 Sites: 4223=expected 4248=expected 4257=expected 4293=expected
-Sites: 4298=expected 4302=expected 4319=ceiling 4340=expected 4420=expected
+Sites: 4298=expected 4302=ceiling 4319=ceiling 4328=ceiling 4329=ceiling
+Sites: 4340=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
 Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=expected 4475=flaky
 Sites: 4480=flaky
@@ -836,6 +996,28 @@ remain unknown. `ceiling` retains the pin of two while tolerating lower
 message-observation counts; unlike `flaky`, it still rejects counts above
 the pin. This changes no focus or activation behavior and does not establish
 that the message contract is fixed.
+
+4302, 4328 and 4329 move together now and then on i686: in one iteration
+4302 passes, and 4328/4329, the desktop mode read back after the hidden
+device window loses focus, fail, so the device reads `4302 2 -> 1`,
+`4328 0 -> 1` and `4329 0 -> 1`. That happened on 2026-09-13 and again on
+2026-10-04, the second time with no other Wine session on the machine, in
+one of about a hundred local i686 device runs between 2026-10-01 and
+2026-10-05. None of the 985 i686 device legs CI ran between 2026-09-21 and
+2026-10-05 showed it, and neither local run kept a raw capture. The reading
+the counts allow, which is conjecture: a deactivation that macdrv delivers
+late restores the registry mode before 4302 reads it, the app is then
+inactive when the test's `Reset` sets the device's mode again, and the
+second `SetForegroundWindow(GetDesktopWindow())` changes no activation, so
+no `WM_ACTIVATEAPP(FALSE)` arrives to restore it. 4302 stays the decision
+recorded above; `ceiling` keeps its pin of two and tolerates one. 4328 and
+4329 are pinned at one on the two i686 device legs recorded on this machine
+(`i686`, and `i686+intel`, which carries the native leg's pins);
+`i686+scale` is recorded on CI, where they read zero, and a first read there
+or on any other leg is a new site. A read of two, both iterations failing to
+restore the registry mode on focus loss, still fails the gate. A re-record
+on a run where they read zero drops the 4328/4329 pins from both legs, and
+they must be put back by hand.
 
 4257/4298/4424/4487 are the kept device-loss divergence, not an unwritten
 stub: no exclusive mode is ever taken, so nothing is ever lost, and
@@ -1180,11 +1362,14 @@ Sites: 16433=expected
 
 VS special-float ops on NaN/±inf: the test accepts four distinct vendor
 results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
-GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
-result matching no vendor's encoding. Matching a specific vendor is neither
-feasible nor desirable. No capability involved (old `caps` tag incoherent).
-The `@mac2` legs count three, not two: the paravirtual device encodes one
-more instruction's result its own way.
+GPU-defined, not spec-mandated. The one failure left on the Apple family is
+the `def1` case, a `def` constant holding a NaN moved into the output: our
+Metal GPU produces a fifth valid IEEE result matching no vendor's encoding
+(0x008000ff). Matching a specific vendor is neither feasible nor desirable.
+No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
+returns its source, the zero vector the test's hardware gives, so it passes.
+The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
+device encodes its own way (0x00808000; `def1` reads the same value there).
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
 Sites: 5090=expected 5169=expected 6034=expected 18787=expected

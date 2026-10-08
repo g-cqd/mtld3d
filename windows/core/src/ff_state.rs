@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 
 use bitflags::bitflags;
 use mtld3d_types::{
-    D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX,
-    D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
+    D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9,
+    D3DMATRIX, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_COLORVERTEX, D3DRS_DEPTHBIAS, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
     D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE,
@@ -39,7 +39,8 @@ use crate::{
     caps::{FF_TEXTURE_STAGES, texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
-        FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
+        FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
+        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey, tci_entry,
     },
     scratch::ScratchArena,
 };
@@ -52,23 +53,6 @@ use crate::{
 /// `caps::fill` reports this value as `D3DCAPS9::MaxActiveLights`, so the
 /// advertised cap cannot drift from the number of slots the FF VS has.
 pub const MAX_ACTIVE_LIGHTS: u32 = 8;
-
-/// First FF VS constant row of the world-matrix palette.
-///
-/// Every section below it has a fixed row range (`FfVsDirty` names each one);
-/// the palette runs from here to the end of the constant block, four rows per
-/// matrix, and the emitted FF VS reads it as `vs_c + 95 + idx * 4`.
-pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
-
-/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
-///
-/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
-/// crate, which asserts that its mirror still holds this index), so rows
-/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
-/// are inside the block. `caps::fill` reports it as
-/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
-/// palette from the cap never asks for a matrix the layout has no rows for.
-pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
 
 bitflags! {
     /// Per-section dirty bits for the FF VS const buffer.
@@ -188,7 +172,7 @@ pub struct FfState {
     ///
     /// D3D9 caps `MaxActiveLights` at 8, so `u8` covers every slot.
     light_enabled: u8,
-    /// Bit `i` set iff `SetLight(i, &light)` was called with `light.Type != 0`.
+    /// Bit `i` set iff `SetLight(i, &light)` was called with a POINT, SPOT or DIRECTIONAL type.
     ///
     /// Updated incrementally by `set_light`. `light_active_mask()` = this
     /// AND `light_enabled` — the FF VS reads constants only for slots that
@@ -198,7 +182,7 @@ pub struct FfState {
     ///
     /// I.e. `SetLight(i, ..)` or `LightEnable(i, ..)` has been called at least
     /// once. Distinct from `light_set_mask` (which gates the FF lighting
-    /// contribution on a non-zero type): a defined light may have type 0.
+    /// contribution on a valid type): a defined light may have type 0.
     /// `GetLight`/`GetLightEnable` return `INVALIDCALL` for an undefined slot,
     /// per the D3D9 get-before-set contract.
     light_defined_mask: u8,
@@ -219,7 +203,7 @@ pub struct FfState {
     /// `MaxActiveLights` (8) caps only how many lights simultaneously contribute
     /// to a draw, not the addressable index range. Slots `0..8` live in the
     /// `lights` array with their masks, the fast path; higher indices live
-    /// here. An enabled overflow light with a non-zero type feeds FF lighting:
+    /// here. An enabled overflow light of a valid type feeds FF lighting:
     /// [`Self::resolve_active_lights`] packs it after the active fast-path
     /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
     /// section like a fast-path write. [`FfStateSnapshot`] captures them with
@@ -518,7 +502,7 @@ impl FfState {
         self.lights[index] = *light;
         let bit = 1u8 << index;
         self.light_defined_mask |= bit;
-        if light.type_ != 0 {
+        if light_type_contributes(light.type_) {
             self.light_set_mask |= bit;
         } else {
             self.light_set_mask &= !bit;
@@ -538,7 +522,7 @@ impl FfState {
 
     /// Bit `i` set iff slot `i` contributes constants to the FF VS.
     ///
-    /// I.e. has a non-zero D3DLIGHT9 type AND is enabled via `LightEnable`.
+    /// I.e. has a POINT, SPOT or DIRECTIONAL type AND is enabled via `LightEnable`.
     /// Source of truth for `FfVsKey::light_active_mask` and the inline
     /// `max_const_row` derivation in [`Self::ff_vs_row_count`].
     #[inline]
@@ -556,7 +540,7 @@ impl FfState {
     /// `0..8` (bit set in `light_set_mask & light_enabled`) first, then the
     /// sparse `overflow_lights` (indices ≥ 8, already ascending in the
     /// `BTreeMap`) — and truncate to [`MAX_ACTIVE_LIGHTS`]. An overflow entry
-    /// contributes only when enabled and carrying a non-zero light type,
+    /// contributes only when enabled and carrying a POINT, SPOT or DIRECTIONAL type,
     /// mirroring the `light_set_mask & light_enabled` gate the fast path uses.
     ///
     /// For the common contiguous layout (lights at 0,1,2,…) the result is
@@ -588,7 +572,7 @@ impl FfState {
             if out.len == MAX_ACTIVE_LIGHTS as usize {
                 return out;
             }
-            if slot.enabled && slot.light.type_ != 0 {
+            if slot.enabled && light_type_contributes(slot.light.type_) {
                 out.lights[out.len] = ActiveLight {
                     light: slot.light,
                     ty: slot.light.type_,
@@ -746,7 +730,8 @@ impl FfState {
     /// The light D3D9 materializes when `LightEnable` targets a slot with no `SetLight`.
     ///
     /// White diffuse over the `D3DLIGHT9` default (directional, direction +Z).
-    fn enable_default_light() -> D3DLIGHT9 {
+    #[must_use]
+    pub fn enable_default_light() -> D3DLIGHT9 {
         D3DLIGHT9 {
             diffuse: D3DCOLORVALUE {
                 r: 1.0,
@@ -760,10 +745,15 @@ impl FfState {
 
     /// `SetLight` for any D3D9 light index.
     ///
-    /// Slots `0..8` take the fast path and feed FF lighting; higher indices
-    /// land in `overflow_lights` for `GetLight` round-trip only.
+    /// Slots `0..8` take the fast path; higher indices land in
+    /// `overflow_lights`, which `resolve_active_lights` packs after
+    /// them. A type outside POINT, SPOT and DIRECTIONAL is stored for
+    /// `GetLight` and lights nothing, warned once per type.
     #[inline]
     pub fn set_light_at(&mut self, index: u32, light: &D3DLIGHT9) {
+        if !light_type_contributes(light.type_) {
+            warn_light_type_lights_nothing(light.type_);
+        }
         if index < 8 {
             self.set_light(index as usize, light);
         } else {
@@ -1210,6 +1200,7 @@ impl FfState {
         render_states: &[u32; RENDER_STATE_COUNT],
         layout: FfVsLayout,
         bound_texture_mask: u8,
+        passthrough: [u8; MAX_LINKED_INPUTS],
     ) -> FfVsKey {
         // D3D9 spec: XYZRHW bypasses per-vertex lighting regardless of
         // D3DRS_LIGHTING. Encode that here so `emit_vs` doesn't gate on the
@@ -1244,7 +1235,7 @@ impl FfState {
         // chain, but programmable PS draws using FF VS still depend on the
         // VS routing the right coord-set to each stage the PS samples.
         // Stopping the loop at the first `COLOROP_DISABLE` would leave
-        // `tci_coord_indices[1..]` at their `[0; 8]` init for the very
+        // the `tci` sets of stages 1.. at their `[0; 8]` init for the very
         // common pattern of "game leaves stages 1..N at default
         // `COLOROP_DISABLE` while a programmable PS does its own sampling",
         // collapsing every VS texcoord output onto coord-set 0 (v4) — fine
@@ -1252,21 +1243,23 @@ impl FfState {
         // stages expect distinct coord sets (e.g. v4 = tiled distortion UV,
         // v5 = normalized scene UV, v6 = second scene UV).
         //
-        // `max_active_stage` and `tex_coord_count` keep the original FF-PS-
-        // aware semantics: default-state stages (COLOROP=MODULATE + no
-        // texture, or any COLOROP=DISABLE chain terminator) must NOT
-        // inflate `tex_coord_count`, or every draw on defaults would emit
-        // a dead varying and trip `passthru_rhs`'s out-of-range fallback
-        // warn. `input_tex_coord_count` stays pinned to the vertex-stream
-        // count so the `VertexIn` struct only declares attributes that
+        // `tex_coord_count` covers every stage that has a coordinate to
+        // write, whatever its COLOROP, for the same reason: a programmable
+        // PS samples the stages it names, and the key does not know whether
+        // one is bound. A stage has a coordinate when its TCI generates one
+        // or routes a set the stream carries; a stage on its defaults routes
+        // set `i`, so the count only grows past the stream's set count for a
+        // stage with a texture bound ahead of the chain terminator (which
+        // samples zero) or a TCI that reroutes or generates.
+        // `input_tex_coord_count` stays pinned to the vertex-stream count so
+        // the `VertexIn` struct only declares attributes that
         // `resolve_attrs_for_ff` populates in the MTLVertexDescriptor.
-        let mut tci_modes = [0u8; 8];
-        let mut tci_coord_indices = [0u8; 8];
+        let mut tci = [0u8; 8];
         let mut tt_flags = [0u8; 8];
         for (i, stage_state) in self.texture_stage_states.iter().enumerate() {
-            let raw = stage_state[D3DTSS_TEXCOORDINDEX as usize];
-            tci_modes[i] = raw.to_le_bytes()[2]; // bits 16..23
-            tci_coord_indices[i] = raw.to_le_bytes()[0]; // bits 0..7
+            let raw = stage_state[D3DTSS_TEXCOORDINDEX as usize].to_le_bytes();
+            // Mode from bits 16..23, coordinate set from bits 0..7.
+            tci[i] = tci_entry(raw[2], raw[0]);
             let ttff = stage_state[D3DTSS_TEXTURETRANSFORMFLAGS as usize];
             // Only D3DTTFF_COUNT2..4 trigger the texture-matrix multiply.
             // D3DTTFF_DISABLE (0), D3DTTFF_COUNT1 (1), and any value above
@@ -1299,20 +1292,35 @@ impl FfState {
                 max_active_stage = Some(index);
             }
         }
+        let mut routed_stage_count = 0u8;
+        for (count, &entry) in (1u8..).zip(&tci) {
+            if stage_has_coordinate(entry >> 4, entry & 0x0F, layout) {
+                routed_stage_count = count;
+            }
+        }
         // `.min(8)` is defensive: `ff_vs_layout_from_elements` already
         // clamps, but keep the invariant enforced here so a future layout
         // source can't reintroduce OOB into FfVsKey's [u8; 8] per-stage
-        // arrays (tci_modes, tci_coord_indices, tt_flags).
+        // arrays (tci, tt_flags).
         let tex_coord_count = layout
             .tex_coord_count
             .max(max_active_stage.map_or(0, |m| m + 1))
+            .max(routed_stage_count)
             .min(8);
         assert!(
             tex_coord_count <= 8,
             "FfState::build_vs_key clamp violated: tex_coord_count={tex_coord_count}"
         );
+        // A stage at or past `tex_coord_count` writes a zero coordinate
+        // whatever its TCI and transform flags, so they leave the key: a
+        // stale flag on a stage the draw does not reach forks no shader.
+        tci[usize::from(tex_coord_count)..].fill(0);
+        tt_flags[usize::from(tex_coord_count)..].fill(0);
 
-        let vertex_blend_indexed = render_states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] != 0;
+        // Indexed blending needs the indices it is named for: without a
+        // BLENDINDICES element the draw blends the sequential matrices.
+        let vertex_blend_indexed = render_states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] != 0
+            && layout.declared_indices();
         let vertex_blend_count = resolve_vertex_blend_count(
             render_states[D3DRS_VERTEXBLEND as usize],
             layout,
@@ -1330,6 +1338,20 @@ impl FfState {
             FfVsFlags::RANGE_FOG,
             matches!(fog_mode, 1..=3) && render_states[D3DRS_RANGEFOGENABLE as usize] != 0,
         );
+        // D3DRS_NORMALIZENORMALS only affects a draw that reads the eye
+        // normal: lighting, or a texgen stage the VS emits that generates
+        // from the normal. Gate the variant fork on those so the other draws
+        // don't multiply pipelines.
+        let texgen_reads_normal = !layout.has_rhw()
+            && tci[..usize::from(tex_coord_count)]
+                .iter()
+                .any(|&entry| matches!(entry >> 4, 1 | 3 | 4));
+        flags.set(
+            FfVsFlags::NORMALIZE_NORMALS,
+            (lighting_enabled || texgen_reads_normal)
+                && layout.has_normal()
+                && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
+        );
 
         FfVsKey {
             reserved: 0,
@@ -1339,25 +1361,32 @@ impl FfState {
             light_active_mask,
             light_directional_mask,
             light_spot_mask,
-            diffuse_source: clamp_material_source(
-                render_states[D3DRS_DIFFUSEMATERIALSOURCE as usize],
+            diffuse_source: material_source(
+                render_states,
+                flags,
+                D3DRS_DIFFUSEMATERIALSOURCE,
                 "DIFFUSEMATERIALSOURCE",
             ),
-            ambient_source: clamp_material_source(
-                render_states[D3DRS_AMBIENTMATERIALSOURCE as usize],
+            ambient_source: material_source(
+                render_states,
+                flags,
+                D3DRS_AMBIENTMATERIALSOURCE,
                 "AMBIENTMATERIALSOURCE",
             ),
-            specular_source: clamp_material_source(
-                render_states[D3DRS_SPECULARMATERIALSOURCE as usize],
+            specular_source: material_source(
+                render_states,
+                flags,
+                D3DRS_SPECULARMATERIALSOURCE,
                 "SPECULARMATERIALSOURCE",
             ),
-            emissive_source: clamp_material_source(
-                render_states[D3DRS_EMISSIVEMATERIALSOURCE as usize],
+            emissive_source: material_source(
+                render_states,
+                flags,
+                D3DRS_EMISSIVEMATERIALSOURCE,
                 "EMISSIVEMATERIALSOURCE",
             ),
             fog_mode,
-            tci_modes,
-            tci_coord_indices,
+            tci,
             tex_coord_dims: layout.tex_coord_dims,
             tt_flags,
             vertex_blend_count,
@@ -1368,6 +1397,11 @@ impl FfState {
                 0
             } else {
                 crate::vs_draw::clip_plane_count(render_states)
+            },
+            passthrough: if layout.has_rhw() {
+                passthrough
+            } else {
+                [0; MAX_LINKED_INPUTS]
             },
         }
     }
@@ -1384,12 +1418,27 @@ impl FfState {
         render_states: &[u32; RENDER_STATE_COUNT],
         bound_texture_mask: u8,
     ) -> FfPsKey {
-        let mut stages = [FfStage::default(); 8];
+        // The cascade ends at the first `D3DTOP_DISABLE` colour operation,
+        // narrowed as `build_vs_key` narrows it so both keys end the chain at
+        // one stage. Nothing reads that stage past its operation, or any
+        // stage after it, or their projected bits, so every such stage keys
+        // as a bare `DISABLE` and its bit stays clear: a game's leftover
+        // state on stages the draw never reaches forks no pixel shader.
+        let disabled = FfStage {
+            color_op: u8::try_from(D3DTOP_DISABLE).expect("D3DTOP_DISABLE fits u8"),
+            ..FfStage::default()
+        };
+        let mut stages = [disabled; 8];
+        let mut active_stages = stages.len();
         for (i, stage) in stages.iter_mut().enumerate() {
             let s = &self.texture_stage_states[i];
             let index = u8::try_from(i).expect("stage index ≤ 7 fits u8");
             let to_u8 = |ty: u32| stage_enum_value(s, index, ty);
             stage.color_op = to_u8(D3DTSS_COLOROP);
+            if u32::from(stage.color_op) == D3DTOP_DISABLE {
+                active_stages = i;
+                break;
+            }
             stage.color_arg0 = to_u8(D3DTSS_COLORARG0);
             stage.color_arg1 = to_u8(D3DTSS_COLORARG1);
             stage.color_arg2 = to_u8(D3DTSS_COLORARG2);
@@ -1398,8 +1447,8 @@ impl FfState {
             stage.alpha_arg1 = to_u8(D3DTSS_ALPHAARG1);
             stage.alpha_arg2 = to_u8(D3DTSS_ALPHAARG2);
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
-            // `FfVsKey::tci_modes` + `tci_coord_indices` (one entry per
-            // stage). The PS samples `Varyings.texcoord[stage]` 1:1.
+            // `FfVsKey::tci` (one entry per stage). The PS samples
+            // `Varyings.texcoord[stage]` 1:1.
             stage.flags.set(
                 FfStageFlags::HAS_TEXTURE,
                 (bound_texture_mask & (1 << i)) != 0,
@@ -1410,10 +1459,11 @@ impl FfState {
                 FfStageResult::Current
             });
         }
+        let active_mask = u8::try_from((1u16 << active_stages) - 1).expect("eight stages fit u8");
         FfPsKey {
             stages,
             specular_add: render_states[D3DRS_SPECULARENABLE as usize] != 0,
-            tt_projected_mask: self.tt_projected_mask(),
+            tt_projected_mask: self.tt_projected_mask() & active_mask,
         }
     }
 
@@ -1472,7 +1522,8 @@ impl FfState {
             render_states[D3DRS_POINTSPRITEENABLE as usize] != 0,
         );
         VariantKey {
-            reserved: 0,
+            // Derived on the encoder thread from the draw's two shaders.
+            linked_input_mask: 0,
             alpha_func: if alpha_test_on {
                 crate::render_state::enum_value(render_states, D3DRS_ALPHAFUNC)
             } else {
@@ -1909,11 +1960,13 @@ impl FfState {
                 (0.0, 0.0)
             };
             dst[base + 1].write([dir[0], dir[1], dir[2], light.falloff.max(1e-6)]);
-            dst[base + 2].write(colorvalue_to_rgba(&light.diffuse));
-            // Light-color alpha lanes are dead in the lighting math (the
-            // accumulated alpha is overwritten by the material diffuse
-            // alpha), so the ambient and specular rows donate .w to the
-            // spot params.
+            // The diffuse and ambient alphas are dead in the lighting math
+            // (the lit alpha is the material diffuse alpha), so the diffuse
+            // row carries the specular alpha the specular sum reads, and the
+            // ambient and specular rows donate .w to the spot params.
+            let spec = colorvalue_to_rgba(&light.specular);
+            let diffuse = colorvalue_to_rgba(&light.diffuse);
+            dst[base + 2].write([diffuse[0], diffuse[1], diffuse[2], spec[3]]);
             let amb = colorvalue_to_rgba(&light.ambient);
             dst[base + 3].write([amb[0], amb[1], amb[2], spot_offset]);
             dst[base + 4].write([
@@ -1922,7 +1975,6 @@ impl FfState {
                 light.attenuation2,
                 light.range,
             ]);
-            let spec = colorvalue_to_rgba(&light.specular);
             dst[base + 5].write([spec[0], spec[1], spec[2], spot_scale]);
         }
     }
@@ -2229,25 +2281,18 @@ fn build_vs_flags(
     let mut flags = FfVsFlags::empty();
     flags.set(FfVsFlags::HAS_NORMAL, layout.has_normal());
     flags.set(FfVsFlags::HAS_COLOR0, layout.has_color0());
-    flags.set(FfVsFlags::USES_VERTEX_DECL, layout.uses_vertex_decl());
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);
-    // D3DRS_NORMALIZENORMALS only affects a lit draw with a normal — gate the
-    // variant fork on those so unlit / no-normal draws don't multiply pipelines.
-    flags.set(
-        FfVsFlags::NORMALIZE_NORMALS,
-        lighting_enabled
-            && layout.has_normal()
-            && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
-    );
     flags.set(FfVsFlags::HAS_RHW, layout.has_rhw());
+    // Canonicalized: only the lit branch reads either, so an unlit draw
+    // keys neither and toggling them between unlit draws forks no variant.
     flags.set(
         FfVsFlags::COLOR_VERTEX,
-        render_states[D3DRS_COLORVERTEX as usize] != 0,
+        lighting_enabled && render_states[D3DRS_COLORVERTEX as usize] != 0,
     );
     flags.set(
         FfVsFlags::SPECULAR_ENABLE,
-        render_states[D3DRS_SPECULARENABLE as usize] != 0,
+        lighting_enabled && render_states[D3DRS_SPECULARENABLE as usize] != 0,
     );
     // Canonicalized: the emitter only computes V when lighting + specular
     // are both on, so the bit stays clear otherwise and toggling
@@ -2269,6 +2314,23 @@ fn build_vs_flags(
         !layout.has_rhw() && render_states[D3DRS_POINTSCALEENABLE as usize] != 0,
     );
     flags
+}
+
+/// Whether the FF VS writes a coordinate other than zero for a stage with this TCI.
+///
+/// `mode` and `set` are the two halves of an `FfVsKey::tci` entry. The four
+/// texgen modes always generate one, from a zero normal where the vertex has
+/// none; passthru and the undefined modes pass the set through. A
+/// pre-transformed layout generates nothing and passes every mode through.
+fn stage_has_coordinate(mode: u8, set: u8, layout: FfVsLayout) -> bool {
+    let routes_a_streamed_set = set.min(7) < layout.tex_coord_count;
+    if layout.has_rhw() {
+        return routes_a_streamed_set;
+    }
+    match mode {
+        1..=4 => true,
+        _ => routes_a_streamed_set,
+    }
 }
 
 /// A D3DTSS op or argument code, narrowed to the byte an `FfStage` carries.
@@ -2330,6 +2392,24 @@ fn stage_enum_value_outside(
         "FF: stage {stage} D3DTSS_{ty} = {value:#x} outside its value space → reading the D3D9 default {default:#x}"
     );
     default.to_le_bytes()[0]
+}
+
+/// The key's material source for `state`, `MCS_MATERIAL` wherever no vertex colour can apply.
+///
+/// The emitter reads a source only on a lit draw under `D3DRS_COLORVERTEX`,
+/// and takes the material constant otherwise, so every other draw keys the
+/// material and the render state forks no variant there.
+fn material_source(
+    render_states: &[u32; RENDER_STATE_COUNT],
+    flags: FfVsFlags,
+    state: u32,
+    which: &str,
+) -> u8 {
+    if flags.contains(FfVsFlags::COLOR_VERTEX) {
+        clamp_material_source(render_states[state as usize], which)
+    } else {
+        0
+    }
 }
 
 /// Clamp a raw D3DRS_*MATERIALSOURCE value into the [0..2] range.
@@ -2457,22 +2537,17 @@ fn resolve_vertex_blend_count(mode: u32, layout: FfVsLayout, indexed: bool) -> u
     // Sequential mode (mode = 1..=3) needs at least one explicit weight in
     // the decl; the implicit last weight comes from `1 - sum(explicit)`.
     // Indexed mode for D3DVBF_0WEIGHTS doesn't need BLENDWEIGHT but does
-    // need BLENDINDICES.
+    // need BLENDINDICES. `indexed` already requires a BLENDINDICES element,
+    // so a declaration without one blends the weighted modes sequentially.
     if mode != 256 && layout.declared_weights_count == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "FF vertex blend: D3DRS_VERTEXBLEND non-zero but vertex decl has no BLENDWEIGHT element → falling back to single-world-matrix"
         );
         return 0;
     }
-    if indexed && !layout.declared_indices() {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "FF vertex blend: D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE but vertex decl has no BLENDINDICES element → falling back to single-world-matrix"
-        );
-        return 0;
-    }
     if mode == 256 && !indexed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "FF vertex blend: D3DVBF_0WEIGHTS requires D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE → falling back to single-world-matrix"
+            "FF vertex blend: D3DVBF_0WEIGHTS needs D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE and a BLENDINDICES element → falling back to single-world-matrix"
         );
         return 0;
     }
@@ -2664,6 +2739,15 @@ fn capture_lights(state: &FfState) -> Vec<CapturedLight> {
     fast.chain(overflow).collect()
 }
 
+/// Whether a light of this `D3DLIGHT9::Type` contributes to fixed-function lighting.
+///
+/// `SetLight` stores any type and `GetLight` reports it back, but only
+/// POINT, SPOT and DIRECTIONAL light a vertex; zero and every value past
+/// DIRECTIONAL add nothing, even while the light is enabled.
+const fn light_type_contributes(ty: u32) -> bool {
+    D3DLIGHT_POINT <= ty && ty <= D3DLIGHT_DIRECTIONAL
+}
+
 fn d3dcolor_to_rgba(c: u32) -> [f32; 4] {
     crate::convert::d3dcolor_to_rgba_f32(c)
 }
@@ -2742,6 +2826,17 @@ const fn texture_op_warn_bit(slot: usize, op: u32) -> Option<u64> {
         return None;
     };
     Some(1u64 << (base + op))
+}
+
+/// Warn once per type that a light of a type outside POINT, SPOT and DIRECTIONAL lights nothing.
+#[cold]
+#[inline(never)]
+fn warn_light_type_lights_nothing(ty: u32) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(ty),
+        "SetLight: D3DLIGHT9 type {ty} is none of POINT, SPOT and DIRECTIONAL → stored, lights nothing"
+    );
 }
 
 /// Warn once per state that `SetTransform` dropped a `D3DTS_*` index nothing honours.

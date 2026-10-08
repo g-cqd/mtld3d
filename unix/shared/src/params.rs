@@ -2,8 +2,8 @@ use super::{
     Thunk, Thunks,
     mtl::{
         BufferKind, ColorSpacePolicy, CursorOverlayFlags, DestroyKind, DeviceCapsFlags, LoadAction,
-        PixelFormat, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle,
-        TextureUsage, VertexFormat, VertexStepFunction,
+        PixelFormat, PresentDebugFlags, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode,
+        StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -35,6 +35,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
+    assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
@@ -160,7 +161,8 @@ pub struct CreateCommandQueueParams {
     /// side copies them into the presenter state it creates for this queue.
     pub gate_file_ptr: u64, // in: *const u8
     pub gate_file_len: u32,                        // in: byte count
-    pub pad0: u32,
+    /// The queue's presenter switches, `debug.presentOccluded` among them.
+    pub present_debug: PresentDebugFlags, // in
 }
 
 impl Thunk for CreateCommandQueueParams {
@@ -408,15 +410,15 @@ pub struct VertexAttrDesc {
     pub format: VertexFormat, // in
 }
 
-/// One vertex buffer layout of a render pipeline: a D3D9 stream the draw reads.
+/// One vertex buffer layout of a render pipeline: a Metal vertex buffer slot the draw reads.
 ///
 /// Borrowed by native pipeline creation,
-/// one entry per stream that contributes an attribute. `stride` is never 0
+/// one entry per Metal vertex buffer slot that feeds an attribute. `stride` is never 0
 /// (Metal rejects it for every step function). `step_rate` is the instances
 /// per advance for `PerInstance`, 1 for `PerVertex`, 0 for `Constant`.
 #[repr(C, align(4))]
 pub struct VertexBufferLayoutDesc {
-    pub buffer_index: u32, // in: Metal vertex buffer slot (= D3D9 stream)
+    pub buffer_index: u32, // in: Metal vertex buffer slot (stream n at n, or a crossing slot)
     pub stride: u32,       // in: bytes per step
     pub step_function: VertexStepFunction, // in
     pub step_rate: u32,    // in

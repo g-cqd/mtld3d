@@ -6067,7 +6067,6 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
     for format in [
         mtld3d_types::D3DFMT_D16_LOCKABLE,
         mtld3d_types::D3DFMT_D32F_LOCKABLE,
-        mtld3d_types::D3DFMT_D24FS8,
     ] {
         assert_eq!(
             h.check_device_format(D3DFMT_X8R8G8B8, 0, mtld3d_types::D3DRTYPE_TEXTURE, format),
@@ -6082,6 +6081,7 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
         mtld3d_types::D3DFMT_D24X8,
         mtld3d_types::D3DFMT_D24S8,
         mtld3d_types::D3DFMT_D32,
+        mtld3d_types::D3DFMT_D24FS8,
         D3DFMT_INTZ,
     ] {
         assert_eq!(
@@ -6625,6 +6625,9 @@ fn managed_dirty_change_preserves_other_pool_contracts() {
 }
 
 /// Premultiplied texture alpha applies to both channels and implicit samples.
+///
+/// A stage that reads a missing texture only through the operation itself
+/// takes its alpha as zero, for the ordinary blend as for the premultiplied one.
 #[test]
 fn blend_texture_alpha_premultiplied() {
     use mtld3d_types::{
@@ -6777,6 +6780,30 @@ fn blend_texture_alpha_premultiplied() {
             post_modulate: false,
             ordinary: false,
             expected: 0x0040_8020,
+        },
+        Case {
+            name: "missing implicit texture ordinary blend",
+            texel: None,
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: true,
+            expected: 0x0080_2040,
+        },
+        Case {
+            name: "missing implicit texture ordinary alpha blend",
+            texel: None,
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: true,
+            post_modulate: false,
+            ordinary: true,
+            expected: 0x0080_8080,
         },
     ];
     let h = Harness::new();

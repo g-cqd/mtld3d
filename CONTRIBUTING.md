@@ -81,7 +81,10 @@ call rather than a walk of the file count, and falls back to `cp -c -R` and then
 to `cp -R` when the source sits on another volume or on a volume that is not
 APFS. Use it whenever another worktree may be testing or a game is running; a
 plain `make install` still targets the shared trees on purpose, since that is
-how the game gets a build. The clones and the persistent wineserver of the
+how the game gets a build. The display mode is the one thing a clone cannot
+separate: the tests that change or read it take turns across every run on the
+machine, as [`windows/tests/COVERAGE.md`](windows/tests/COVERAGE.md) describes.
+The clones and the persistent wineserver of the
 private prefix stay behind for the next run; `make clean-isolated` takes down
 the ones in the checkout you are in, and `make clean-isolated-orphans` the ones
 a removed checkout left behind. Either one ends the whole Wine session rather
@@ -163,7 +166,8 @@ verdict, even under `FAIL_FAST=0` or when the process itself exits cleanly.
 The runner watches stderr while the process runs, checks the layer log before
 it can launch another process, and keeps both accounts of the initiating
 process. Assertions after that report are not measurements of the source: the
-later results may reflect the hosted GPU's failed state.
+later results may reflect the hosted GPU's failed state. CI re-runs such a leg
+on a fresh machine; "Pull requests" below says when.
 
 When every test is accounted for but the process ends abnormally, the runner
 keeps its full captured stdout, stderr and exit status together in
@@ -183,12 +187,18 @@ while its sibling legs are green, re-run the failed jobs first (`gh run rerun
 <run-id> --failed`, which lands on a fresh machine) and read the command
 buffer errors in the artifact's log, since a hosted runner's GPU can fail that
 way with no hang line in the job log and nothing else tells it from a
-regression. A `CreateBackbuffer` failure on the Intel image is read the same
-way: its unix line names the request and the device, and a sane request (the
-window's size, `BGRA8Unorm`, a sample count the device answered for) that
-`newTextureWithDescriptor` refused on that image's GPU, the paravirtual
-`AppleParavirtGPUMetal`, is the same runner fault, so re-run the failed jobs.
-A line naming a zero dimension or a null handle is the layer's own bug.
+regression. The Intel image's GPU, the paravirtual `AppleParavirtGPUMetal`,
+refuses a texture or a view now and then while several threads create
+and release them, with its kernel logging `addObject: Object already exists`
+in the system log, so on a paravirtual device the layer asks again for up to
+a quarter of a second and logs each create it recovers that way. A
+`CreateBackbuffer` failure on the Intel image is therefore read from two
+lines. The unix line names the request and the device; a sane request (the
+window's size, `BGRA8Unorm`, a sample count the device answered for)
+together with the layer's `still refused after` line for it is that runner
+fault outlasting the retries, so re-run the failed jobs and add the leg to
+the issue that tracks the fault. A line naming a zero dimension or a null
+handle is the layer's own bug.
 
 Two things are worth knowing when a test process looks wrong. Once a device
 has existed, `d3d9.dll` terminates the process from the
@@ -331,6 +341,31 @@ levels are filled one after another, so a drain that misses one level's
 interval lands in the next level's, and only the last level's can leave
 the row.
 
+The per-call rows of `api_call_cost` (`ns_per_call.*`) time single calls of
+8 to 85 ns, and they move with where the linker places the layer's
+functions as well as with what the functions do: single setter rows have
+moved by 30 to 50 % in runs whose change did not touch the call. A
+comparison therefore fails a setter row only past 50 %, and a smaller
+change to the cost of a call is for the frame benchmarks to show. The draw
+rows (`ns_per_call.draw_*`) move far less and fail past 15 %. An A/A run
+(`BASE=HEAD`) builds one commit twice with the same code placement, so it
+does not reproduce this; it has still moved single setter rows by about
+30 % (`5f274cd66021`, `aad71d015386`), for a reason not established (data
+placement is a candidate). `RATIO_FLOOR_PER_CALL` in
+`unix/e2e/src/bench/compare.rs` gives the measurements.
+
+An exact count a change moved on purpose fails every comparison against a
+base from before that change, so such a run names it in `ACCEPT`, and only
+that run: the next change to the count fails again. Against v0.11.0 or an
+older base, `cold_start`'s `prewarm.shaders` reads 98 in the base and 92 in
+the candidate. Since #1050 an unlit fixed-function draw no longer keys
+`D3DRS_SPECULARENABLE` into its vertex shader (`build_vs_flags` in
+`windows/core/src/ff_state.rs`), and the benchmark's 24 fixed-function
+combinations toggle specular on 12 unlit ones, so six pairs of them share
+one shader. Nothing goes unprepared: both legs pre-warm 196 pipelines with
+none failed or skipped, and every shader the candidate's cache holds is
+pre-warmed. Such a run takes `ACCEPT=prewarm.shaders`.
+
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
@@ -344,7 +379,10 @@ are exact, so a change that alters the emitted code shows up there even when
 its time per shader stays inside the noise. A `BASE` older than the host
 benchmark runs neither leg's, and the run says so. The same caches are what
 `cold_start` measures in both legs. A cache only one build can read (a
-format change between them) is skipped for both with a note, while any
+format or schema change between them) is skipped for both with a note.
+`cold_start` counts a cache's records with the candidate's reader, so
+when the base's layer writes another schema the base leg reports its
+timings without those counts, and their rows read as added. Any
 other difference in what a benchmark ran, such as its own configuration
 entries or the depth path it took, stops the comparison: only the build and
 the run may differ between the legs.
@@ -371,11 +409,25 @@ fails the run like a changed exact metric unless `ACCEPT` names `shape` or
 `shape:<bench>`.
 
 `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
-checks a benchmark's scene against a frame a game dumped with F12: the pass
-count, and per pass the draw count, the fixed-function share and the
+checks a benchmark's scene against a frame a game dumped with Ctrl+Shift+P:
+the pass count, and per pass the draw count, the fixed-function share and the
 textures per draw, with render-target sizes shown relative to each side's
-back buffer. Run it by hand when building or reshaping a scene that stands
-for a game; it is no gate.
+back buffer. Each pass is also compared on its state mix, which a benchmark
+declares by appending these counts to its `shape` line: `blend=`, `atest=`,
+`zwrite_off=`, `cull_none=` and `cmask0=` count the draws with blending on,
+with alpha test on, whose depth-write field is 0, with cull mode NONE, and
+whose render target 0 colour write mask is 0, and are judged as shares of
+the pass's draws within 10 points. `vs_sw=`, `ps_sw=`, `tex_sw=`,
+`blend_sw=`, `atest_sw=` and `cull_sw=` count the draws after the pass's
+first whose vertex shader, pixel shader, stage-0 texture, whole blend tuple,
+whole alpha-test tuple or cull mode differs from the draw before (fixed
+function and no texture are values like any other), and `vs_n=`, `ps_n=`
+and `tex_n=` count the distinct programmable vertex and pixel shaders and
+the distinct textures on any stage. Those nine are judged within 15 % of the
+game's count, but never closer than 5. A `shape` line without the state keys
+still parses: its state mix prints as not reported and is not judged. Run it
+by hand when building or reshaping a scene that stands for a game; it is no
+gate.
 
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries
@@ -474,8 +526,8 @@ The rules that are easy to get wrong:
 - A classification records the nature of a divergence, never its difficulty or
   how much a game cares. A hard-to-fix real defect is still real.
 - Re-record the baseline in the same change as the fix that moves the counts, and
-  check the diff: a re-record drops flaky-pinned sites that happened to read zero
-  in that run.
+  check the diff: a re-record drops flaky- or ceiling-pinned sites that happened
+  to read zero in that run.
 - Derive the reason for a failing site from the upstream test source and from the
   raw actual-versus-expected values, which `MTLD3D_CONFORMANCE_RAW_DIR=<dir>`
   keeps. A site name is not a description of what the test exercises.
@@ -563,19 +615,35 @@ as steps of one job. Production bundles are built by the release job only.
 Every run on `main` has its own concurrency group so pending runs survive
 later pushes and every commit keeps its CI result. PR updates cancel the
 superseded run. The test machines carry no toolchain: they install the stage
-(`STAGE=<dir>`) and run the end-to-end and conformance suites on three
+(`STAGE=<dir>`) and run the end-to-end and conformance suites on up to three
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
-packed 16-bit formats, so it runs the Intel/AMD code paths for real. One
-more end-to-end leg, and one more conformance leg, run their suite at
-`render.scale = 0.75`, the evidence that the coordinates the tests assert on
-stay in the space D3D9 reports when the frame is rasterized smaller; a test
-that needs single-pixel resolution asks `render_scale_is_identity()` and pins
-its exact shape at the identity rather than failing that leg, and the
-conformance sites that cannot (a probe on a colour boundary) are classified
-under "The scaled leg" in `unix/conformance/CONFORMANCE.md`. Every image gates. The Intel image reads the conformance baseline's `@mac2` entries,
-which only it can record: dispatch the workflow with `record_intel_baseline`
-and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
+packed 16-bit formats, so it runs the Intel/AMD code paths for real. A pull
+request runs the two arm64 images, and every leg it runs gates it. The Intel
+image's paravirtual GPU hangs and reads multisampled results wrong by itself,
+with no Wine and no mtld3d involved, often enough that a pull request could
+not count on a green Intel leg, so its legs run every night on `main` and on
+a dispatch with `intel_only`, which run that image alone; a push to `main`
+and any other dispatch run all three images. An Intel failure in the nightly
+run that is not a GPU hang comes from the commits since the last green one:
+a regression, or a `@mac2` conformance pin left stale by a pull request that
+fixed a site and updated only the Apple entries, which is re-recorded rather
+than read as a regression (`unix/conformance/CONFORMANCE.md` has the
+procedure). So a pull request that moves conformance counts, edits
+`baseline.txt`, or touches an Intel code path (the `intel.*` keys, Managed
+memory, the packed 16-bit formats) dispatches the workflow with `intel_only`
+on its branch before it merges. A release waits for a green Intel run (see
+"Cutting a release"). One more end-to-end leg, and one more conformance leg,
+run their suite at `render.scale = 0.75`, the evidence that the coordinates
+the tests assert on stay in the space D3D9 reports when the frame is
+rasterized smaller; a test that needs single-pixel resolution asks
+`render_scale_is_identity()` and pins its exact shape at the identity rather
+than failing that leg, and the conformance sites that cannot (a probe on a
+colour boundary) are classified under "The scaled leg" in
+`unix/conformance/CONFORMANCE.md`. The Intel image reads the conformance
+baseline's `@mac2` entries, which only it can record: dispatch the workflow
+with `record_intel_baseline` (and `intel_only`, to run nothing else) and
+commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
 (`unix/conformance/CONFORMANCE.md` has the procedure). A conformance subtest
 that dies on one image now and then is caught by dispatching with
 `conformance_repeat=<n>`, which runs it that many times on every image and
@@ -592,6 +660,16 @@ run the Intel paths without the hardware.
 The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`, against
 a local default of four), because parallel device creation aborts on a runner.
 A flake there is not fixed by re-enabling parallelism.
+
+A leg a GPU hang cut short (the runner's exit code 3, under "Reading a test
+run") has no verdict, and a hosted machine whose GPU hung stays hung, so the
+e2e and conformance steps mark such a leg with an error annotation titled
+`GPU hang`. When a run fails and every job that did not succeed carries that
+annotation, `.github/workflows/rerun-gpu-hangs.yml` re-runs the failed jobs
+once, which puts them on fresh machines; it leaves a pull request's run alone
+once a newer push has replaced it. A second hang, or a hang beside any other
+failure, is for a person to read, and the failed jobs are re-run by hand
+with `gh run rerun <run-id> --failed`.
 
 ## What sends a pull request back
 
@@ -654,7 +732,12 @@ LOG_DIR=$PWD/.codex/evidence/bench-release/<version>`, which archives the runs
 and the report there. A regression it reports is fixed before the tag or named
 in the notes.
 
-Land that commit, wait for its run on `main` to go green, then push the tag. The
+Land that commit and wait for its run on `main` to go green. The latest Intel
+run on `main` has to be green too: that is the commit's own push run, which
+carries the Intel legs, unless a nightly or an `intel_only` dispatch ran
+after it. Pull requests do not run the Intel image, so that run is the only
+Intel verdict the release has, and a run whose Intel legs show nothing but
+GPU hangs is re-run until it gives one. Then push the tag. The
 release job refuses a tag whose version disagrees with either workspace, and
 refuses one whose commit has no green run on `main`; a tag pushed while that run
 is still going is waited on rather than rejected. It builds the bundle itself,

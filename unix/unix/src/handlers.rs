@@ -256,7 +256,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
             |path| Some(std::path::PathBuf::from(path)),
         )
     };
-    if let Some(caps) = metal::create_command_queue(gate) {
+    if let Some(caps) = metal::create_command_queue(gate, params.present_debug) {
         params.device_handle = caps.device_handle;
         params.record_handle = caps.record_handle;
         params.unified_memory = u32::from(caps.unified_memory);
@@ -308,6 +308,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
             if params.display_sync_enabled != 0 { "on" } else { "off" },
             params.max_fps
         );
+        crate::hud_state::report_attached();
         STATUS_SUCCESS
     } else {
         params.view_handle = MetalHandle::NULL;
@@ -429,6 +430,29 @@ pub fn task_faults() -> mtld3d_core::perf::TaskFaults {
             0
         },
     }
+}
+
+/// The process's physical footprint in bytes, 0 when the kernel refuses the query.
+///
+/// `ri_phys_footprint` of `proc_pid_rusage`, the task ledger figure that
+/// `TASK_VM_INFO`'s `phys_footprint` also reports and the Metal HUD shows
+/// as app memory: resident and compressed private memory plus the driver and
+/// GPU allocations charged to the process.
+pub fn process_footprint() -> u64 {
+    // SAFETY: rusage_info_v2 is plain data initialized before the kernel fills it.
+    let mut info: libc::rusage_info_v2 = unsafe { core::mem::zeroed() };
+    let Ok(pid) = libc::c_int::try_from(std::process::id()) else {
+        return 0;
+    };
+    // SAFETY: info is a live writable rusage_info_v2 and RUSAGE_INFO_V2 names its layout.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc == 0 { info.ri_phys_footprint } else { 0 }
 }
 
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {

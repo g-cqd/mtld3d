@@ -58,7 +58,7 @@ use std::{
 
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
-    mtl::{PixelFormat, VertexFormat, VertexStepFunction},
+    mtl::{PixelFormat, VERTEX_ATTRIBUTE_SLOTS, VertexFormat, VertexStepFunction},
 };
 use mtld3d_types::MAX_STREAMS;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -326,9 +326,29 @@ mod source;
 /// `78` turns `pos_fixup` into the `PosFixup` struct and adds the
 /// `D3DRS_DEPTHBIAS` offset to the position epilogue, changing the MSL of
 /// every vertex shader.
-/// `79` adds fixed-function `COLORARG0` and `ALPHAARG0` to the pixel key and
+///
+/// `79` links `vs_3_0` outputs to `ps_3_0` inputs by semantic and dcl write
+/// mask: semantics outside the fixed-function set get `Varyings` members of
+/// their own, and the programmable PS variant and its recipe gain
+/// `VariantKey::linked_input_mask`, which moves every PS key hash. It also
+/// fetches a `D3DCOLOR` `BLENDINDICES` element of a fixed-function draw as
+/// unnormalized bytes, changing the vertex descriptor of those pipeline
+/// recipes.
+///
+/// `80` passes a pre-transformed declaration's elements through to a
+/// `ps_3_0` by semantic: `FfVsKey::passthrough` joins the fixed-function
+/// key in the bytes freed by folding its TCI modes and coordinate sets into
+/// one `tci` byte per stage, the pre-transformed FF VS reads those elements
+/// from attributes 15 and up and declares the extra members they feed, and
+/// its pipeline recipes carry those attributes.
+///
+/// `81` adds `VsSamplerKinds::lod_table`, which moves every programmable VS
+/// key hash: a vertex `texldl` on a slot with a texture LOD, a LOD bias or a
+/// finest level reads its row of the vertex LOD table.
+///
+/// `82` adds fixed-function `COLORARG0` and `ALPHAARG0` to the pixel key and
 /// emits the D3D9 ternary texture operations from those fields.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 79;
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 82;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
@@ -338,8 +358,9 @@ pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emit
 /// Separate from [`SHADER_CACHE_SCHEMA_VERSION`] so a translation change can
 /// invalidate shader and pipeline identities without pretending the binary
 /// framing changed.
-/// Version 20 extends the serialized pixel-specialization recipe.
-pub const CACHE_FORMAT_VERSION: u32 = 20;
+/// Version 20 extends the serialized pixel-specialization recipe; version 21
+/// the vertex one, by the `lod_table` byte.
+pub const CACHE_FORMAT_VERSION: u32 = 21;
 
 /// File magic.
 ///
@@ -699,7 +720,7 @@ impl PipelineRecipe {
             };
         }
         let attr_count = usize::from(reader.u8()?);
-        if attr_count > MAX_STREAMS as usize {
+        if attr_count > VERTEX_ATTRIBUTE_SLOTS as usize {
             return None;
         }
         let mut vertex_attrs = Vec::with_capacity(attr_count);
@@ -760,7 +781,7 @@ impl PipelineRecipe {
                 .iter()
                 .all(|layout| layout.stride != 0 || *layout == StreamLayout::UNUSED)
             && self.vertex_attrs.iter().all(|attr| {
-                attr.attr_index < MAX_STREAMS
+                attr.attr_index < VERTEX_ATTRIBUTE_SLOTS
                     && attr.buffer_index < MAX_STREAMS
                     && attr.format != VertexFormat::Invalid
                     && self.snapshot.stream_layouts[attr.buffer_index as usize].is_used()

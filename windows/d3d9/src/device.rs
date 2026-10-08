@@ -8,12 +8,12 @@ use log::{debug, error, info, trace, warn};
 pub use mtld3d_core::encoder_data::{
     BeginVisibilityOp, BindColorOp, BindDepthOp, BindDepthOpFlags, CarryDepthOp, ClearColorOp,
     ClearColorRectsOp, ClearDepthStencilOp, ClearDepthStencilRectsOp, ColorFillOp, DepthBinding,
-    DestroyTextureOp, EndVisibilityOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp,
-    NoteColorReadOp, PendingVbibRetention, ReadColorHandleOp, ReadDeviceBufferOp,
-    ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp, ResolveDepthTextureOp,
-    ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding, SetDumpDrawOp,
-    SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
-    StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UpdateColorRegionOp,
+    DestroyBufferOp, DestroyTextureOp, EndVisibilityOp, GenerateMipmapsOp,
+    GenerateMipmapsOrderedOp, NoteColorReadOp, PendingVbibRetention, ReadColorHandleOp,
+    ReadDeviceBufferOp, ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp,
+    ResolveDepthTextureOp, ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding,
+    SetDumpDrawOp, SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp,
+    StretchKind, StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UpdateColorRegionOp,
     UploadColorOp, UploadResampledOp, UploadTextureAndMipsOp, UploadTextureOp,
     UploadTextureOpFlags,
 };
@@ -28,8 +28,9 @@ use mtld3d_core::{
         self, FfVsLayout, InputSemantic, d3d_to_metal_primitive, fvf_to_elements,
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
     },
+    departed_textures::DepartedTextures,
     dirty_rect::DirtyRect,
-    dxso::{VsSamplerKinds, operand_token_count},
+    dxso::{MAX_LINKED_INPUTS, VsSamplerKinds, operand_token_count},
     encoder_draw::{
         ApiSnapshotCache, SnapshotAttributes, SnapshotDelta,
         draw_record::{BoundVertices, IndexBuffer, IndexedDraw, NonindexedDraw, StreamRecord},
@@ -50,6 +51,7 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
+    sampler_state::TEXTURE_LOD_SLOT,
     shader_constants::{int_bool_rows, window_in_range},
     snapshot::SnapshotSection,
     streams::validate_stream_freq,
@@ -73,7 +75,7 @@ use mtld3d_types::{
     D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT,
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
     D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
@@ -88,16 +90,15 @@ use mtld3d_types::{
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND,
-    D3DRTYPE_CUBETEXTURE, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
-    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
-    SAMPLER_STATE_COUNT, render_state_defaults,
+    D3DRTYPE_CUBETEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE,
+    D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid,
+    IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOTIMPL, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_FAIL, E_NOTIMPL, LOG_TARGET,
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
@@ -425,9 +426,10 @@ pub struct DeviceInner {
     /// Leaked at creation rather than owned here: a child `Release` can drive
     /// the device to zero and free this struct while the guard the child's
     /// thunk took is still live, and that guard releases through the lock on
-    /// its way out. One small allocation per flagged device creation. `None`
-    /// is the whole of "not multithreaded": every thunk then takes the no-op
-    /// guard.
+    /// its way out, and a texture keeps entering it after the device is gone
+    /// ([`Self::api_lock_ptr`]). One small allocation per flagged device
+    /// creation. `None` is the whole of "not multithreaded": every thunk then
+    /// takes the no-op guard.
     api_lock: Option<&'static ApiLock>,
     /// Normalised present parameters the implicit swapchain reports.
     ///
@@ -570,12 +572,12 @@ pub struct DeviceInner {
     rs_warn_fired: [u64; RENDER_STATE_COUNT.div_ceil(64)],
     ff_state: FfState,
     vs_draw: mtld3d_core::vs_draw::VsDrawState,
-    /// Scissor rect set by `SetScissorRect`.
+    /// `SetScissorRect`'s rect as the game wrote it, which `GetScissorRect` hands back.
     ///
-    /// The encoder thread reads this each draw and emits a Metal
-    /// `setScissorRect` command gated on `D3DRS_SCISSORTESTENABLE`.
-    /// `(0, 0, 0, 0)` means "unset — use viewport".
-    scissor_rect: [u32; 4],
+    /// The render-state snapshot narrows it to the region it lets through,
+    /// which the encoder emits as `setScissorRect` while
+    /// `D3DRS_SCISSORTESTENABLE` is on.
+    scissor_rect: D3DRECT,
     /// Viewport set by `SetViewport`.
     ///
     /// Served back by `GetViewport`. Width/height also flow to the encoder so
@@ -713,6 +715,22 @@ pub struct DeviceInner {
     /// create, release and Evict run one at a time, on the API thread or
     /// serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`.
     live_textures: Mutex<rustc_hash::FxHashMap<TextureId, *mut TextureInner>>,
+    /// Textures that moved to another device and still have storage on this one's encoder.
+    ///
+    /// The move runs under the adopting device's `ApiLock`, which does not
+    /// cover this device's `current_frame`, so it files the id here instead of
+    /// recording the destroy itself; `stamp_and_swap` drains the list into
+    /// the frame it hands over, under this device's own lock. A leaf mutex
+    /// like `live_textures`.
+    departed_textures: DepartedTextures,
+    /// Metal textures of standalone targets released after the device failed.
+    ///
+    /// A device whose failure is latched sends no frame again, so a retire
+    /// operation recorded then would never reach the encoder that destroys
+    /// the texture. The handles wait here instead, sRGB twins ahead of the
+    /// texture each holds a retain on, and the final `Release` destroys them
+    /// once the encoder's shutdown has waited for the GPU.
+    retired_while_failed: Vec<u64>,
     /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
@@ -738,7 +756,7 @@ pub struct DeviceInner {
     snapshot_dirty: SnapshotDirty,
     /// Owned keys retained only for subsequent API-side dirty-state builders and dumps.
     snapshot_cache: ApiSnapshotCache,
-    /// The F12 draw-state dump, see `frame_dump`.
+    /// The Ctrl+Shift+P draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
@@ -757,6 +775,13 @@ pub struct DeviceInner {
     /// and folded into a programmable `VsSource` so a shader reading an
     /// unprovided input compiles a distinct, zero-filled variant.
     cached_vs_provided_mask: u16,
+    /// Stream 0's consumed extent from the most recent `VDECL` rebuild.
+    ///
+    /// Sizes a `Draw*PrimitiveUP` vertex copy: when it is past the draw's
+    /// stride, the last vertex's crossing attribute reads past the vertices
+    /// the application supplied, which the copy zero-fills. Same lifecycle as
+    /// `cached_ff_vs_layout`; the UP draws read it after their snapshot.
+    cached_stream0_extent: u32,
 }
 
 /// Per-RS-index dirty mask.
@@ -843,7 +868,7 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
 bitflags::bitflags! {
     /// Per-draw snapshot dirty mask.
     ///
-    /// One bit per cached piece in `FrameEncoder::current_snapshot`. See
+    /// One bit per cached piece of the native `DrawReader` snapshot. See
     /// `SnapshotCache` doc on `DeviceInner::snapshot_dirty` for lifecycle.
     /// Each bit is its [`SnapshotSection`]'s, so the perf summary's
     /// per-section rebuild counters read the mask directly.
@@ -988,11 +1013,11 @@ impl DeviceInner {
         }
     }
 
-    pub const fn scissor_rect(&self) -> [u32; 4] {
+    pub const fn scissor_rect(&self) -> D3DRECT {
         self.scissor_rect
     }
 
-    pub const fn set_scissor_rect(&mut self, r: [u32; 4]) {
+    pub const fn set_scissor_rect(&mut self, r: D3DRECT) {
         self.scissor_rect = r;
     }
 
@@ -1002,10 +1027,10 @@ impl DeviceInner {
 
     pub fn set_viewport(&mut self, v: D3DVIEWPORT9) {
         self.viewport = v;
-        // D3D9 viewport z-range fixup: the far plane forwarded to the encoder
-        // is clamped to at least `min_z + 0.001` so a degenerate (`min_z ==
-        // max_z`) or inverted (`max_z < min_z`) range collapses to a tiny
-        // forward range instead of mapping every fragment to a single depth.
+        // D3D9 itself collapses a degenerate (`min_z == max_z`) or inverted
+        // (`max_z < min_z`) range to `min_z .. min_z + 0.001`, so the far
+        // plane forwarded to the encoder is clamped to at least
+        // `min_z + 0.001`; an inverted range is not honoured on purpose.
         // `self.viewport` keeps the raw values so GetViewport round-trips
         // unchanged. Ordinary `[min_z, max_z]` ranges (`max_z >= min_z + 0.001`)
         // are left untouched.
@@ -1109,6 +1134,18 @@ impl DeviceInner {
 
     pub const fn vertex_decl(&self) -> *mut Direct3DVertexDeclaration9 {
         self.vertex_decl.raw()
+    }
+
+    /// The elements the bound declaration passes to the pixel stage of a pre-transformed draw.
+    ///
+    /// Empty with no declaration bound, the state in which the FVF is 0.
+    fn bound_decl_passthrough(&self) -> [u8; MAX_LINKED_INPUTS] {
+        let decl = self.vertex_decl();
+        if decl.is_null() {
+            return [0; MAX_LINKED_INPUTS];
+        }
+        // SAFETY: non-null; the bound-slot refcount keeps the declaration live.
+        unsafe { &*decl }.inner().passthrough()
     }
 
     /// Bind `new` as the current vertex declaration. Pass null to clear.
@@ -1262,6 +1299,21 @@ impl DeviceInner {
         self.vertex_textures[slot].raw()
     }
 
+    /// Whether this device samples `texture` unfiltered whatever its stage's filters say.
+    ///
+    /// Only the single-precision float formats qualify, and only on a device
+    /// without 32-bit float filtering, which answers `D3DUSAGE_QUERY_FILTER`
+    /// with no for them. The format test runs first, so the device's answer is
+    /// read only for those three formats.
+    fn samples_unfiltered(&self, texture: &crate::texture::Direct3DTexture9) -> bool {
+        !mtld3d_core::format::supports_usage_query(
+            texture.d3d_format(),
+            D3DUSAGE_QUERY_FILTER,
+            false,
+            true,
+        ) && !crate::direct3d9::float32_filtering_supported(self.config().deny_float32_filtering)
+    }
+
     /// Store one vertex-slot sampler state and mirror the row to the encoder.
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
@@ -1269,8 +1321,23 @@ impl DeviceInner {
     }
 
     /// Mirror vertex sampler `slot`'s whole state row to the encoder.
+    ///
+    /// The row carries the filters the bound texture can take: a texture this
+    /// device cannot filter is point-sampled, so the row is pushed again when
+    /// a bind starts or ends that. It also carries the bound texture's
+    /// `SetLOD`, the level a vertex `texldl` counts from, so a bind that
+    /// changes it and a `SetLOD` on the bound texture push it again too.
     fn push_vertex_sampler_row(&mut self, slot: usize) {
-        let state = self.vertex_sampler_states[slot];
+        let mut state = self.vertex_sampler_states[slot];
+        // The spare slot 0 may hold a game's write of state 0; the copy
+        // carries the texture LOD there instead.
+        state[TEXTURE_LOD_SLOT] = self.vertex_texture_lod(slot);
+        if self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture))
+        {
+            mtld3d_core::sampler_state::sample_unfiltered(&mut state);
+        }
         self.push_control(crate::device::SetVertexSamplerOp {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             state,
@@ -1279,14 +1346,19 @@ impl DeviceInner {
 
     /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
     ///
-    /// Swaps the bound-slot refcount, flushes the texture's dirty mips,
-    /// and mirrors the id to the encoder. Later CPU writes dirty the draw
+    /// Swaps the bound-slot refcount, moves a texture another device last
+    /// used over to this one, flushes the texture's dirty mips, and mirrors
+    /// the id to the encoder. Later CPU writes dirty the draw
     /// snapshot, which flushes the same slots before the next draw.
     pub fn set_vertex_texture_slot(
         &mut self,
         slot: usize,
         tex: *mut crate::texture::Direct3DTexture9,
     ) {
+        let was_unfiltered = self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture));
+        let was_lod = self.vertex_texture_lod(slot);
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
         self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
@@ -1312,6 +1384,9 @@ impl DeviceInner {
         } else {
             // SAFETY: non-null per the branch; live per D3D9 lifetime rules.
             let bound = unsafe { &mut *tex };
+            // A texture another device last used is moved over first, so its
+            // levels upload here and its id names storage on this encoder.
+            crate::texture::rehydrate_for_device(bound, self);
             // Vertex texture fetch samples like a stage bind, so it ends a
             // system-memory texture's CPU-only phase the same way.
             promote_cpu_only_texture(self, bound);
@@ -1323,6 +1398,30 @@ impl DeviceInner {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             id,
         });
+        let unfiltered = self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture));
+        if was_unfiltered || unfiltered || was_lod != self.vertex_texture_lod(slot) {
+            self.push_vertex_sampler_row(slot);
+        }
+    }
+
+    /// The `SetLOD` of the texture bound at vertex slot `slot`, 0 for an empty slot.
+    fn vertex_texture_lod(&self, slot: usize) -> u32 {
+        self.vertex_textures[slot]
+            .as_ref()
+            .map_or(0, |texture| texture.inner().lod())
+    }
+
+    /// Push the vertex sampler row of every vertex slot `tex` is bound to.
+    ///
+    /// For a `SetLOD` on `tex`: the rows carry the bound texture's LOD.
+    pub fn refresh_vertex_texture_lod(&mut self, tex: *const crate::texture::Direct3DTexture9) {
+        for slot in 0..self.vertex_textures.len() {
+            if core::ptr::eq(self.vertex_textures[slot].raw(), tex) {
+                self.push_vertex_sampler_row(slot);
+            }
+        }
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -1510,6 +1609,25 @@ impl DeviceInner {
             });
     }
 
+    /// Retire a released VB/IB: its CPU backing when it has one, its device buffer otherwise.
+    ///
+    /// A buffer that still holds its backing goes through the retention
+    /// pipeline, which pairs the backing with the encoder's cache entry. A
+    /// `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer gave its backing up after
+    /// its upload, so nothing would reach that entry; the destroy op takes its
+    /// device buffer out instead, ordered after every draw that bound it.
+    pub fn retire_released_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        backing: Option<PageBox>,
+        last_submit_seq: u64,
+    ) {
+        match backing {
+            Some(page_box) => self.queue_vbib_retention(buffer_id, page_box, last_submit_seq),
+            None => self.push_control(crate::device::DestroyBufferOp { buffer_id }),
+        }
+    }
+
     /// Push an inline, op-stream-ordered `Staged` VB/IB dirty-range upload.
     ///
     /// `page_box` is a transient snapshot of the dirtied bytes taken on the
@@ -1605,6 +1723,11 @@ impl DeviceInner {
     /// the `submit_seq` it carries. Shared between `Present` and
     /// `flush_current_frame_blocking`.
     fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> (FrameData, u64) {
+        // Textures that moved to another device leave this encoder's cache
+        // behind every op the outgoing frame recorded.
+        for tex_id in self.departed_textures.take() {
+            self.push_control(DestroyTextureOp { tex_id });
+        }
         let mut frame = core::mem::replace(&mut self.current_frame, new_frame);
         // A `PresentationInterval` a Reset changed rides the first frame that
         // leaves the device after it, which is this one: the encoder applies it
@@ -1622,10 +1745,10 @@ impl DeviceInner {
         if let Some(change) = self.pending_gamma.take() {
             frame.set_apply_gamma(Some(change));
         }
-        // An F12 run ends with the frame the closing `Present` submits. A
-        // mid-frame flush sends the marked frame out early, so its stop mark
-        // moves onto the continuation; the start mark stays with the first
-        // piece, and the encoder keeps capturing until it sees the stop.
+        // A Ctrl+Shift+P run ends with the frame the closing `Present`
+        // submits. A mid-frame flush sends the marked frame out early, so its
+        // stop mark moves onto the continuation; the start mark stays with the
+        // first piece, and the encoder keeps capturing until it sees the stop.
         if no_present {
             let carried = frame.take_carried_capture_marks(true);
             self.current_frame.mark_gpu_capture(carried);
@@ -1634,6 +1757,17 @@ impl DeviceInner {
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
         self.perf.drain_into_payload(frame.perf_mut(), !no_present);
+        // The summary runs in `mtld3d.so`, whose `PageBox` counters and pool
+        // are not this binary's, so this runtime's traffic rides the payload.
+        #[cfg(perf_tracking)]
+        {
+            let hz = self.encoder.source_clock_hz();
+            self.perf_mut().drain_pagebox_traffic(
+                frame.perf_mut(),
+                &crate::page_box_pool::PAGEBOX_POOL,
+                hz,
+            );
+        }
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
@@ -1653,11 +1787,11 @@ impl DeviceInner {
             failed_submit_seq_ptr: Arc::as_ptr(&self.failed_submit_seq) as u64,
         });
         frame.set_retained_bytes_ptr(Arc::as_ptr(&self.vbib_retained_bytes) as u64);
-        // Every cached snapshot pointer in the encoder's CurrentSnapshot
-        // aliases into the outgoing frame's `ScratchArena`, which is
-        // about to drop after the encoder drains it. Force the API
-        // thread to re-emit every Op::Set* on the first draw of the
-        // new frame.
+        // The next frame's packet decodes into a fresh, empty
+        // `DrawReader`, and the tokens the outgoing frame's snapshot
+        // held borrow that frame's command storage, released once the
+        // encoder drains it. Force the API thread to re-emit every
+        // snapshot section on the first draw of the new frame.
         self.snapshot_dirty = SnapshotDirty::all();
         self.reassert_saved_bindings();
         (frame, this_seq)
@@ -1732,6 +1866,20 @@ impl DeviceInner {
         }
     }
 
+    /// Drop what the open frame recorded on a device that can no longer send a frame.
+    ///
+    /// A failed device keeps recording, uploads included, and nothing would
+    /// ever take the frame off it, so each `Present` starts it again from the
+    /// saved bindings instead of letting it grow for as long as the
+    /// application runs. Nothing in it can reach the GPU: the encoder refuses
+    /// every frame of a failed device.
+    #[cold]
+    fn discard_unsendable_frame(&mut self) {
+        let fresh = self.fresh_frame();
+        drop(core::mem::replace(&mut self.current_frame, fresh));
+        self.reassert_saved_bindings();
+    }
+
     /// Submit the current frame's accumulated ops synchronously.
     ///
     /// Then continue with a fresh empty frame. Used by `LockRect` on the
@@ -1753,11 +1901,12 @@ impl DeviceInner {
     /// payload the submit thread holds while it waits for the previous
     /// present to commit, which is a wait on the display. Setting the policy
     /// here, before the flush is sent, wakes that submit into a copy so the
-    /// encoder, and then the flush, go on at once; the encoder's flush arm
-    /// puts the policy back once its own submission has committed. The one
-    /// thunk this side issues off the device lifecycle, and only on a path
-    /// that is already a synchronous read-back.
-    fn hurry_presentation(&self) -> Result<(), i32> {
+    /// encoder, and then the flush, go on at once. The encoder puts the policy
+    /// back when the request that follows ends: the flush arm once its own
+    /// submission has committed, the visibility intake once its drain is done.
+    /// The one thunk this side issues off the device lifecycle, and only on a
+    /// path that is already a synchronous read-back.
+    pub fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
             return Ok(());
         }
@@ -1879,9 +2028,11 @@ impl DeviceInner {
     /// Recycle-pool hit, else enforce the cap, else allocate. The cap is
     /// the only mechanism bounding retained bytes: allocation itself is
     /// infallible (see `PageBox::new_uninit`), because on the 32-bit game
-    /// process the allocator never fails cleanly — the process thrashes or
+    /// process the allocator never fails cleanly: the process thrashes or
     /// dies long before `alloc` returns null, so reacting to a null was
-    /// always too late to be the fix.
+    /// always too late to be the fix. The one exception is the system-memory
+    /// copy a resource gets at creation, which a create answers with
+    /// `E_OUTOFMEMORY` as D3D9 does; a rename is never a creation.
     pub fn alloc_pagebox_capped(&mut self, logical_len: usize) -> Result<PageBox, i32> {
         self.encoder.status()?;
         // Recycle-pool fast path: a hit is a warm, still-committed box of
@@ -1934,6 +2085,7 @@ impl DeviceInner {
 
     fn present_image(&mut self, texture: Option<MetalHandle<MTLTextureKind>>) -> i32 {
         if let Err(hr) = self.encoder.status() {
+            self.discard_unsendable_frame();
             return hr;
         }
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
@@ -1961,12 +2113,14 @@ impl DeviceInner {
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
         // `CycleSetTimer` writes into that frame's `present_block_cycles`
-        // when it drops at end of scope.
-        let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
+        // when it drops.
+        let stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         if let Err(hr) = self.encoder.send_frame(frame) {
             return hr;
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
+        drop(stall);
+        // Outside the stall, so the address-space walk is not charged to it.
         self.mem_watch_present();
         mtld3d_types::D3D_OK
     }
@@ -2171,6 +2325,57 @@ impl DeviceInner {
     /// freed, so the registry never holds a dangling pointer, and from
     /// `texture::rehydrate_for_device` for the device a texture migrates off,
     /// which is the only other way an entry stops belonging here.
+    /// File a texture that moved to another device for this device's encoder to drop.
+    ///
+    /// Called under the adopting device's lock; see
+    /// [`mtld3d_core::departed_textures`].
+    pub fn note_departed_texture(&self, id: TextureId) {
+        self.departed_textures.note(id);
+    }
+
+    /// Retire a standalone colour target's Metal textures.
+    ///
+    /// The encoder destroys them once the GPU is past every pass that names
+    /// them. A device whose failure is latched sends no frame again, so the
+    /// final `Release` destroys them instead (see `retired_while_failed`).
+    pub fn retire_color_target(&mut self, retired: crate::encoder::RetiredColorTarget) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireColorOp { retired });
+            return;
+        }
+        self.keep_retired_while_failed(&[
+            retired.srgb,
+            retired.base,
+            retired.msaa_srgb,
+            retired.msaa,
+        ]);
+    }
+
+    /// Retire a standalone depth-stencil target's Metal texture, as [`Self::retire_color_target`].
+    pub fn retire_depth_target(&mut self, depth: MetalHandle<MTLTextureKind>) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireDepthOp { depth });
+            return;
+        }
+        self.keep_retired_while_failed(&[depth]);
+    }
+
+    /// File the non-null `handles` for the final `Release` to destroy.
+    #[cold]
+    fn keep_retired_while_failed(&mut self, handles: &[MetalHandle<MTLTextureKind>]) {
+        self.retired_while_failed.extend(
+            handles
+                .iter()
+                .filter(|handle| !handle.is_null())
+                .map(|handle| handle.raw()),
+        );
+    }
+
+    /// Keep the storage of a texture that moved back before its departure was drained.
+    pub fn cancel_departed_texture(&self, id: TextureId) {
+        self.departed_textures.cancel(id);
+    }
+
     pub fn deregister_texture(&self, ti: *mut TextureInner) {
         // SAFETY: deregistration runs before the live inner Box is freed or
         // transferred to another device; its texture id never changes.
@@ -2310,9 +2515,10 @@ impl DeviceInner {
     ///
     /// The encoder waits (via `WaitForGpuRetire` thunk → Metal
     /// `waitUntilCompleted`) only when `coherent_seq < target_seq`;
-    /// otherwise it just runs intake locally. `target_seq == 0` (END operation
-    /// not yet processed: game called `Issue(END)` but not Present) skips the
-    /// round-trip entirely so the FLUSH poll loop can return `S_FALSE` fast.
+    /// otherwise it just runs intake locally. The encoder takes the request
+    /// after every frame handed to it before, so the frame `target_seq` names
+    /// has been encoded and committed by the time it waits. `target_seq == 0`,
+    /// a query never ended, skips the round-trip.
     pub fn encoder_intake_visibility_for(&self, target_seq: u64) -> Result<(), i32> {
         self.encoder.status()?;
         if target_seq == 0 {
@@ -2594,6 +2800,13 @@ impl DeviceInner {
     /// flow into the next frame via `fresh_frame`, but the viewport push
     /// here references the new dimensions.
     pub fn reset_to_defaults(&mut self) {
+        // An autogen texture bound as a render target regenerates its mip
+        // chain when it stops being one, as `SetRenderTarget` does on the way
+        // off it; queued ahead of the teardown that may release it.
+        let autogen = core::mem::replace(&mut self.cur_autogen_rt_ids, [None; RENDER_TARGET_SLOTS]);
+        for old_id in autogen.into_iter().flatten() {
+            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
+        }
         self.bound_rt.teardown();
         // Reset reverts the colour target to the implicit backbuffer and the
         // depth/stencil to the implicit auto-depth default, and unbinds render
@@ -2607,7 +2820,6 @@ impl DeviceInner {
                 });
             }
         }
-        self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
         self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
         self.bound_buffers.teardown();
@@ -2637,12 +2849,18 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
         self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
+        // Every user clip plane returns to its zero default; the per-draw
+        // uniform that carries them rebuilds with the rest below.
+        self.clip_planes = [[0.0; 4]; CLIP_PLANE_SLOTS];
         #[cfg(perf_tracking)]
         self.perf.state_mut().advance_reset_epoch();
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
-        self.scissor_rect = [0, 0, self.backbuffer_width, self.backbuffer_height];
+        self.scissor_rect = mtld3d_core::render_state::full_target_scissor(
+            self.backbuffer_width,
+            self.backbuffer_height,
+        );
 
         // Viewport reseed mirrors `set_viewport` — push the op so the
         // encoder's pass-state picks up the default before the first
@@ -2759,11 +2977,12 @@ impl DeviceInner {
     /// the retired textures; the caller decides which bindings the fresh
     /// frame gets back.
     pub fn reseed_current_frame(&mut self) {
-        // The replaced frame is dropped rather than submitted, so an F12 run
-        // in progress hands its marks to the fresh one: without that the
-        // encoder never sees the run's stop and the capture ends only with
-        // the process. Every reseed follows a flush, which already sent the
-        // start out with the piece it submitted, so this is the stop.
+        // The replaced frame is dropped rather than submitted, so a
+        // Ctrl+Shift+P run in progress hands its marks to the fresh one:
+        // without that the encoder never sees the run's stop and the capture
+        // ends only with the process. Every reseed follows a flush, which
+        // already sent the start out with the piece it submitted, so this is
+        // the stop.
         let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
         self.current_frame.mark_gpu_capture(carried);
@@ -2940,7 +3159,8 @@ impl DeviceInner {
                 min_z: 0.0,
                 max_z: 1.0,
             });
-            self.scissor_rect = [0, 0, new_width, new_height];
+            self.scissor_rect =
+                mtld3d_core::render_state::full_target_scissor(new_width, new_height);
         }
     }
 
@@ -3188,7 +3408,10 @@ impl Direct3DDevice9 {
             vs_draw: mtld3d_core::vs_draw::VsDrawState::new(),
             // D3D9 default scissor rect covers the full backbuffer; like the
             // viewport, SetRenderTarget and Reset re-cover the new target.
-            scissor_rect: [0, 0, info.backbuffer_width, info.backbuffer_height],
+            scissor_rect: mtld3d_core::render_state::full_target_scissor(
+                info.backbuffer_width,
+                info.backbuffer_height,
+            ),
             viewport,
             clip_planes: [[0.0; 4]; CLIP_PLANE_SLOTS],
             cursor: CursorState::new(
@@ -3218,6 +3441,8 @@ impl Direct3DDevice9 {
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
+            departed_textures: DepartedTextures::default(),
+            retired_while_failed: Vec::new(),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
@@ -3225,6 +3450,7 @@ impl Direct3DDevice9 {
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
+            cached_stream0_extent: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_DEVICE9_VTBL,
@@ -3282,6 +3508,17 @@ impl DeviceInner {
     /// Stamp the owning wrapper pointer once the COM object is boxed in `CreateDevice`.
     pub fn set_device_wrapper(&mut self, wrapper: *mut c_void) {
         self.device_wrapper = wrapper as u64;
+    }
+
+    /// The device's API lock as the pointer a texture keeps; null without the multithreaded flag.
+    ///
+    /// The lock is leaked at creation, so the pointer stays valid after this
+    /// device is gone; a `D3DPOOL_MANAGED` texture that outlives the device
+    /// keeps entering it.
+    pub fn api_lock_ptr(&self) -> *mut ApiLock {
+        self.api_lock.map_or(core::ptr::null_mut(), |lock| {
+            core::ptr::from_ref(lock).cast_mut()
+        })
     }
 
     /// The implicit backbuffer `MTLTexture`.
@@ -3585,8 +3822,11 @@ impl DeviceInner {
 /// wait for the lock counts as API time, which is what the app pays. The
 /// shell is leaked at teardown and its inner is not, so a refcount of zero
 /// means there is no inner to read: a `Release` past zero, like a null
-/// `this`, gets the no-op guard. The unflagged fast path is a null test, a
-/// refcount load, one pointer chase and a discriminant test.
+/// `this`, gets the no-op guard. A texture reaches the lock through the
+/// pointer it carries instead ([`crate::com_ref::ComChild::enter_api_lock`]),
+/// because a managed one can be called while the device is in its final
+/// `Release` or gone. The unflagged fast path is a null test, a refcount
+/// load, one pointer chase and a discriminant test.
 #[inline]
 pub fn device_api_lock(this: *mut c_void) -> ApiGuard {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -3678,7 +3918,12 @@ extern "system" fn device_add_ref(this: *mut c_void) -> u32 {
 
 extern "system" fn device_release(this: *mut c_void) -> u32 {
     let _api = device_api_lock(this);
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // A stray Release of a device an earlier final Release tore down is the
+    // no-op the refcount guard below makes it, and is not timed: the timer
+    // reads the device's counters, which went with it.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let live = unsafe { InPtr::<Direct3DDevice9>::opt(this) }.is_some_and(|obj| obj.refcount != 0);
+    let _timer = live.then(|| device_timer(this, DeviceSubCategory::Misc));
     // SAFETY: D3D9 Release — same contract as AddRef above; null `this` is UB
     // per spec.
     // SAFETY: IDirect3DDevice9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3DDevice9.
@@ -3756,9 +4001,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // it sees any other window change.
         device_inner.leave_fullscreen();
 
-        // Restore the game's original window proc *before* freeing DeviceInner;
-        // the subclass's global back-pointer becomes dangling once we drop.
-        device_inner.cursor().uninstall_subclass();
+        // Leave the window's subclass *before* freeing DeviceInner; the
+        // registry's back-pointer becomes dangling once we drop. The game's
+        // procedure comes back with the last device on the window.
+        let device_ptr = std::ptr::from_mut::<DeviceInner>(&mut device_inner);
+        device_inner.cursor().uninstall_subclass(device_ptr);
         // The HCURSORs the device built die with it, now that no message can
         // realize one of them again.
         device_inner.cursor_mut().destroy_handles();
@@ -3814,11 +4061,35 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // MTLBuffer wrapping a `PageBox` the game ever Locked has been
         // released.
         if device_inner.shutdown().is_err() {
-            // An unacknowledged shutdown may still read device-owned sinks and GPU resources.
+            // An unacknowledged shutdown may still read device-owned sinks and GPU resources,
+            // so the device memory and its command queue stay as they are. The parent's
+            // reference is the application's object, which nothing native holds (the
+            // encoder decodes its own copy of the configuration), so it is given back.
+            error!(target: LOG_TARGET,
+                "device release: the encoder did not acknowledge shutdown; the device and its \
+                 command queue are left allocated");
             std::mem::forget(device_inner);
+            release_parent(parent);
             return rc;
         }
 
+        // Targets released after the device failed never reached the encoder,
+        // and the shutdown above has waited for every pass that named them.
+        let retired_while_failed = core::mem::take(&mut device_inner.retired_while_failed);
+        if !retired_while_failed.is_empty() {
+            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                pad0: 0,
+                handles_ptr: retired_while_failed.as_ptr() as u64,
+                count: u32::try_from(retired_while_failed.len())
+                    .expect("a device's released targets fit u32"),
+                pad1: 0,
+            };
+            unix_call(&mut destroy);
+            info!(target: LOG_TARGET,
+                "device release: destroyed {} Metal textures of targets released after the \
+                 device failed", retired_while_failed.len());
+        }
         if !implicit_handles.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
@@ -3844,17 +4115,25 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // top of `device_release` rather than a use-after-free. The leak is
         // bounded by device-create count (one per device, ~24 bytes).
         obj.refcount = 0;
-        if !parent.is_null() {
-            // SAFETY: `parent` is non-null (checked above) and was
-            // AddRef'd during `Direct3D9::CreateDevice`; the parent's
-            // refcount has kept it alive until this Release.
-            let parent_obj = unsafe { &*(parent as *const ParentIUnknown) };
-            // SAFETY: `parent_obj.vtbl` is the `'static` parent vtable.
-            let vtbl = unsafe { &*parent_obj.vtbl };
-            (vtbl.release)(parent);
-        }
+        release_parent(parent);
     }
     rc
+}
+
+/// Give back the reference a device holds on the `IDirect3D9` that created it.
+///
+/// Null for a device whose parent was never recorded.
+fn release_parent(parent: *mut c_void) {
+    if parent.is_null() {
+        return;
+    }
+    // SAFETY: `parent` is non-null (checked above) and was AddRef'd during
+    // `Direct3D9::CreateDevice`; the parent's refcount has kept it alive until
+    // this Release.
+    let parent_obj = unsafe { &*(parent as *const ParentIUnknown) };
+    // SAFETY: `parent_obj.vtbl` is the `'static` parent vtable.
+    let vtbl = unsafe { &*parent_obj.vtbl };
+    (vtbl.release)(parent);
 }
 
 /// The owning `Direct3DDevice9`* wrapper for a child's `device_inner` pointer.
@@ -4131,6 +4410,13 @@ extern "system" fn device_create_additional_swap_chain(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // Nowhere to hand the chain to: refused before it is made, since a chain
+    // nobody holds would keep its device reference for good.
+    if swap_chain.is_null() {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain(ppSwapChain = NULL) → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     null_out(swap_chain);
     if swap_chain.is_null() {
         return D3DERR_INVALIDCALL;
@@ -4273,38 +4559,37 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return D3DERR_INVALIDCALL;
     }
+    // A Reset with well-formed parameters ends an open `BeginStateBlock`
+    // recording whether or not it goes on to succeed, before it looks for
+    // outstanding references: the recording dies with the state it was
+    // recording against. Every rejection from here on goes through
+    // `reject_reset`, which restores the state defaults as well.
+    dev.recording_state_block = None;
     // A fullscreen request must still be well-formed even though its size is
     // not used: the D3D9 "zero means the client area" rule is windowed-only,
     // so zero dimensions here are a malformed request. Checked before the
-    // window moves, so a rejected Reset leaves the device exactly as it was.
+    // window moves, so a rejected Reset leaves the window as it was.
     if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
         warn!(
             target: LOG_TARGET,
             "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
-    // A Reset with well-formed parameters ends an open `BeginStateBlock`
-    // recording whether or not it goes on to succeed, before it looks for
-    // outstanding references: the recording dies with the state it was
-    // recording against.
-    dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
     // the Reset recreates, and D3D9 makes the app release them first. A state
     // block that holds such a resource keeps it outstanding too, since the
-    // resource lives as long as the block; the device's bindings do not count
-    // (they are reset below on success).
+    // resource lives as long as the block; the device's bindings do not count,
+    // so they need not be released before the count is read.
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(
             target: LOG_TARGET,
             "reject Reset — {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still referenced",
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     if pp.windowed != 0 && pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
@@ -4325,9 +4610,27 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset: MultiSampleType={} Quality={} on back-buffer format {} is not available",
             pp.multi_sample_type, pp.multi_sample_quality, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     };
+    // The auto depth-stencil format answers to the same depth and multisample
+    // rules as at `CreateDevice`, also before the window or the mode moves.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !mtld3d_core::multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            crate::direct3d9::device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset: AutoDepthStencilFormat {} at MultiSampleType {} is no depth-stencil \
+             the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return reject_reset(dev);
+    }
     let target_window = if pp.device_window == 0 {
         dev.window()
     } else {
@@ -4340,8 +4643,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}, fmt={}) - no usable windowed client area",
             pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     warn_present_params_fields_once(&pp);
@@ -4364,9 +4666,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         pp.multi_sample_quality,
         new_sample_count,
     );
+    // A back buffer an earlier `Reset` failed to create takes the recreate
+    // path at any size: the dimensions that `Reset` adopted are not a back
+    // buffer that exists.
     let resized = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
-        || multi_sample_changed;
+        || multi_sample_changed
+        || dev.backbuffer_handle.is_null();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -4388,8 +4694,6 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
             return hr;
         }
-        // The fresh attach's layer carries no gamma table either.
-        dev.reapply_gamma();
     }
 
     // debug, not info — fires per-frame during a window drag.
@@ -4403,8 +4707,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
     } else {
         // Skip flush + destroy + recreate + setDrawableSize entirely. The game
@@ -4418,8 +4721,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
         // Deliver every op queued since the last Present before the reseed
         // below replaces `current_frame`. The queue holds work whose
@@ -4461,6 +4763,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     //    would hand them to the reseed to throw away, so this keeps the
     //    order `apply_auto_resize` already uses.
     dev.reseed_current_frame();
+    // The fresh attach's layer carries no gamma table. The ramp is queued only
+    // now that `current_frame` names that layer: the frames the flushes above
+    // sent still named the layer the retarget detached, and a ramp riding one
+    // of them would be dropped for want of an attachment.
+    if retargeted {
+        dev.reapply_gamma();
+    }
 
     // 8. Reset device state to D3D9 defaults. Cursor + silent-write
     //    warn latches survive (per-spec / process-lifetime telemetry).
@@ -4479,6 +4788,43 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
 
     D3D_OK
+}
+
+/// Fail a well-formed `Reset` with the device state at its defaults.
+///
+/// D3D9 resets the device state before it checks what can make a `Reset`
+/// fail, so a rejected one still releases every binding and returns every
+/// state to its default, leaving what a successful `Reset` leaves: render
+/// target 0 on the back buffer, the depth stencil on the implicit surface,
+/// no recording and no open scene. The frame in flight is delivered first,
+/// as a same-size `Reset` does, and [`fail_reset`] replaces it, so the
+/// attachments it records follow the defaults as well; without that, a draw
+/// after the rejection would be built for the back buffer while its pass
+/// still carried the targets the application had bound.
+fn reject_reset(dev: &mut DeviceInner) -> i32 {
+    if let Err(hr) = dev.flush_current_frame_blocking() {
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return hr;
+    }
+    fail_reset(dev, D3DERR_INVALIDCALL)
+}
+
+/// End a failed `Reset` on a fresh frame with the state defaults, answering `hr`.
+///
+/// The frame in flight was already delivered by the caller, unless the
+/// encoder had already failed, which this then leaves latched. Past the point
+/// where `Reset` destroyed the implicit back buffer or depth texture, the
+/// frame that delivery left behind and the saved render-target and depth
+/// bindings still name the destroyed textures, so the frame is dropped
+/// unsent rather than delivered and the defaults clear the saved bindings.
+/// The fresh frame names whatever the failed recreate left, NULL where it
+/// made nothing. The device reports `D3DERR_DEVICENOTRESET` until a `Reset`
+/// succeeds.
+fn fail_reset(dev: &mut DeviceInner, hr: i32) -> i32 {
+    dev.flags.insert(DeviceFlags::NOT_RESET);
+    dev.reseed_current_frame();
+    dev.reset_to_defaults();
+    hr
 }
 
 /// Resolve geometry after the window transition, undoing a rejected fullscreen exit.
@@ -4684,6 +5030,7 @@ fn reset_recreate_resources(
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
+        dev.depth_stencil_format = 0;
         return Err(D3DERR_INVALIDCALL);
     }
     dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
@@ -4704,7 +5051,10 @@ fn reset_recreate_resources(
                 "Reset: depth_stencil_format {} has no Metal mapping — device unusable",
                 dev.depth_stencil_format
             );
+            // No implicit depth surface exists now, and the format says so,
+            // as `reconcile_implicit_depth` leaves it on the same failure.
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         };
         // Render space, matching the colour attachment exactly — Metal
@@ -4721,6 +5071,7 @@ fn reset_recreate_resources(
         if status != 0 || ds_params.texture_handle.is_null() {
             error!(target: LOG_TARGET, "Reset: CreateDepthTexture failed (0x{status:08X}) — device unusable");
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         }
         dev.set_depth_stencil_handle(ds_params.texture_handle);
@@ -5100,6 +5451,20 @@ fn resolve_create_levels(entry_point: &str, requested: u32, natural: u32) -> u32
     resolve_mip_levels(requested, natural)
 }
 
+/// Refuse a create whose system-memory copy the process cannot allocate.
+///
+/// The staging a resource gets at creation is the one allocation that may
+/// fail; D3D9 answers such a create `E_OUTOFMEMORY` and hands back no object.
+/// What was allocated before the failure has already been dropped by the
+/// caller.
+fn refuse_unallocatable_staging(entry_point: &str, out: *mut *mut c_void) -> i32 {
+    warn!(target: LOG_TARGET,
+        "reject {entry_point}: the resource's system-memory copy cannot be allocated → \
+         E_OUTOFMEMORY");
+    null_out(out);
+    mtld3d_types::E_OUTOFMEMORY
+}
+
 /// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
 ///
 /// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
@@ -5172,6 +5537,23 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     if (usage_ds && !is_depth_fmt) || (usage_rt && is_depth_fmt) {
         null_out(texture);
         return D3DERR_INVALIDCALL;
+    }
+
+    // Past the extent the device reports, a texture Metal backs is refused:
+    // Metal itself aborts the process on a descriptor past its own limit. A
+    // system-memory or scratch texture has no Metal texture until it is bound
+    // for sampling, and creates at any extent.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::texture_extent_fits(width, height) {
+        let entry_point = if offscreen_plain {
+            "CreateOffscreenPlainSurface"
+        } else {
+            "CreateTexture"
+        };
+        mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(offscreen_plain),
+            "reject {entry_point}({width}x{height}, pool={pool}) → NOTAVAILABLE (past the {} \
+             texel extent the device reports)", caps::MAX_TEXTURE_DIM);
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
     }
 
     // Offscreen plain surfaces must be lockable. A GPU-only depth texture
@@ -5347,6 +5729,9 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
 
+    // The staging is the one allocation of a create that may fail: a level the
+    // process has no room for refuses the create with `E_OUTOFMEMORY`.
+    let mut out_of_memory = false;
     let (pool_hits, pool_misses) = {
         let mut staging_take = take_staging();
         if let Some(layout) = &planar_layout {
@@ -5354,18 +5739,25 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
             // height: the chroma planes follow the luma rows in the same box, and
             // the lock pitch strides all of them. The per-level arrays keep the
             // logical extent, which is what `GetDesc` and rect validation read.
-            staging.push(staging_take.take(layout.total_bytes()));
+            match staging_take.try_take(layout.total_bytes()) {
+                Some(page) => staging.push(page),
+                None => out_of_memory = true,
+            }
             mip_widths.push(width);
             mip_heights.push(height);
             mip_bytes_per_row.push(layout.pitch());
             // Every offset a planar lock, upload or decode forms is derived from
             // the layout, so the allocation has to be exactly the layout's size.
-            debug_assert_eq!(staging[0].logical_len(), layout.total_bytes());
+            debug_assert!(out_of_memory || staging[0].logical_len() == layout.total_bytes());
             debug_assert_eq!(actual_levels, 1);
         } else {
             for level in 0..actual_levels {
                 let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
-                staging.push(staging_take.take(size as usize));
+                let Some(page) = staging_take.try_take(size as usize) else {
+                    out_of_memory = true;
+                    break;
+                };
+                staging.push(page);
                 mip_widths.push(mw);
                 mip_heights.push(mh);
                 mip_bytes_per_row.push(bpr);
@@ -5373,6 +5765,9 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         }
         staging_take.finish()
     };
+    if out_of_memory {
+        return refuse_unallocatable_staging("CreateTexture", texture);
+    }
 
     obj.inner()
         .perf_mut()
@@ -5536,8 +5931,9 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         texture,
     } = *info;
 
-    // Lockable and legacy depth mappings do not imply a plain-texture
-    // capability: their CPU lock contracts are not implemented here.
+    // The lockable depth formats create as a depth-stencil texture, with no
+    // `LockRect` of its levels, and not as a plain one: a plain depth texture
+    // is a sampling resource the format queries would have to offer.
     if usage & D3DUSAGE_DEPTHSTENCIL == 0 && !is_depth_stencil_format(format) {
         mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(format),
             "reject CreateTexture plain depth format={format} → INVALIDCALL (unsupported format)");
@@ -5655,12 +6051,19 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     } else {
         obj.inner().scale_for_created_target(width, height, true)
     };
+    // The staging is the one allocation of a create that may fail.
     let staging = if dynamic {
-        mip_bytes_per_row
+        let staging: Option<Vec<PageBox>> = mip_bytes_per_row
             .iter()
             .zip(&mip_heights)
-            .map(|(&pitch, &rows)| PageBox::new_zeroed(pitch as usize * rows as usize))
-            .collect()
+            .map(|(&pitch, &rows)| {
+                PageBox::try_new_zeroed((pitch as usize).saturating_mul(rows as usize))
+            })
+            .collect();
+        let Some(staging) = staging else {
+            return refuse_unallocatable_staging("CreateTexture", texture);
+        };
+        staging
     } else {
         Vec::new()
     };
@@ -5790,6 +6193,15 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    // A volume more than one slice deep is a 3D Metal texture, held to
+    // `MaxVolumeExtent` on every axis; Metal aborts the process past its limit.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::volume_extent_fits(width, height, depth) {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateVolumeTexture({width}x{height}x{depth}, pool={pool}) → NOTAVAILABLE \
+             (past the extent the device reports)");
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
+    }
     // A per-level 3D mip chain. Each level's box is the block-aware 2D slice
     // size (`compute_mip_size`, correct for DXT/ATI as well as plain formats)
     // times the level's depth; `LockBox` hands the game a pointer into the
@@ -5815,13 +6227,20 @@ extern "system" fn device_create_volume_texture(
             let (mw, mh, slice_size, bpr) = compute_mip_size(width, height, level, &fmt);
             let md = (depth >> level).max(1);
             let box_bytes = (slice_size as usize).saturating_mul(md as usize);
-            staging.push(staging_take.take(box_bytes));
+            // The staging is the one allocation of a create that may fail.
+            let Some(page) = staging_take.try_take(box_bytes) else {
+                break;
+            };
+            staging.push(page);
             mip_widths.push(mw);
             mip_heights.push(mh);
             mip_bytes_per_row.push(bpr);
         }
         staging_take.finish()
     };
+    if staging.len() != actual_levels as usize {
+        return refuse_unallocatable_staging("CreateVolumeTexture", texture);
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -5972,6 +6391,16 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    // Same extent rule as `CreateTexture`: a face past the reported extent is
+    // refused in the pools Metal backs, before six faces of staging are made.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::texture_extent_fits(edge_length, edge_length)
+    {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateCubeTexture(edge={edge_length}, pool={pool}) → NOTAVAILABLE (past the \
+             {} texel extent the device reports)", caps::MAX_TEXTURE_DIM);
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
+    }
     // Zero stays zero: it marks a compressed layout, and a face upload counts
     // block rows and block offsets only while the marker survives creation.
     let bpp = fmt.bytes_per_pixel();
@@ -6002,14 +6431,21 @@ extern "system" fn device_create_cube_texture(
     }
     let (pool_hits, pool_misses) = {
         let mut staging_take = take_staging();
-        for _face in 0..CUBE_FACE_COUNT {
+        // The staging is the one allocation of a create that may fail.
+        'faces: for _face in 0..CUBE_FACE_COUNT {
             for level in 0..actual_levels {
                 let (_, _, size, _) = compute_mip_size(edge_length, edge_length, level, &fmt);
-                staging.push(staging_take.take(size as usize));
+                let Some(page) = staging_take.try_take(size as usize) else {
+                    break 'faces;
+                };
+                staging.push(page);
             }
         }
         staging_take.finish()
     };
+    if staging.len() != actual_levels as usize * CUBE_FACE_COUNT as usize {
+        return refuse_unallocatable_staging("CreateCubeTexture", texture);
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -6105,13 +6541,15 @@ extern "system" fn device_create_vertex_buffer(
         "CreateVertexBuffer(len={length}, usage={usage:#x}, fvf={fvf:#x}, pool={pool})"
     );
     warn_unused_usage_and_pool_once("VertexBuffer", usage, pool);
-    let buffer = Direct3DVertexBuffer9::new(&VertexBufferCreateInfo {
+    let Some(buffer) = Direct3DVertexBuffer9::new(&VertexBufferCreateInfo {
         device_inner: std::ptr::from_mut::<DeviceInner>(dev),
         length,
         usage,
         fvf,
         pool,
-    });
+    }) else {
+        return refuse_unallocatable_staging("CreateVertexBuffer", vb);
+    };
     // Queue the eager `MTLBuffer` wrap so subsequent draw operations hit
     // the buffer cache instead of cache-missing inside
     // `ensure_vbib_mtl_buffer` on first bind.
@@ -6186,13 +6624,15 @@ extern "system" fn device_create_index_buffer(
         "CreateIndexBuffer(len={length}, usage={usage:#x}, format={format}, pool={pool})"
     );
     warn_unused_usage_and_pool_once("IndexBuffer", usage, pool);
-    let buffer = Direct3DIndexBuffer9::new(&IndexBufferCreateInfo {
+    let Some(buffer) = Direct3DIndexBuffer9::new(&IndexBufferCreateInfo {
         device_inner: std::ptr::from_mut::<DeviceInner>(dev),
         length,
         usage,
         format,
         pool,
-    });
+    }) else {
+        return refuse_unallocatable_staging("CreateIndexBuffer", ib);
+    };
     // Queue the eager `MTLBuffer` wrap; same drain semantics as VB.
     let inner = buffer.inner();
     dev.push_buffer_warmup(VbibWarmupEntry {
@@ -6494,6 +6934,19 @@ extern "system" fn device_create_render_target(
         let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
         (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
+    // Zero-initialise the staging (defence-in-depth): a `LockRect` before any
+    // render, or any path that skips the read-back fill, reads defined bytes
+    // rather than allocator garbage. It is the one allocation of the create that
+    // may fail, and it is made before the colour texture so a refusal leaves
+    // nothing to tear down.
+    let staging = if staging_bytes == 0 {
+        None
+    } else {
+        let Some(staging) = PageBox::try_new_zeroed(staging_bytes) else {
+            return refuse_unallocatable_staging("CreateRenderTarget", surface);
+        };
+        Some(staging)
+    };
     let Some(surf_ptr) = create_color_target_surface(
         obj.inner().device_handle,
         obj.inner_ptr(),
@@ -6513,14 +6966,11 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
-    if staging_bytes != 0 {
-        // Zero-initialise the staging (defence-in-depth): a `LockRect` before
-        // any render, or any path that skips the read-back fill, reads defined
-        // bytes rather than allocator garbage.
+    if let Some(staging) = staging {
         // SAFETY: `surf_ptr` is the freshly created, live standalone RT
         // surface (refcount 1); no other reference exists yet, so the
         // exclusive borrow to attach the staging is sound.
-        unsafe { &mut *surf_ptr }.set_lockable_staging(PageBox::new_zeroed(staging_bytes));
+        unsafe { &mut *surf_ptr }.set_lockable_staging(staging);
     }
     // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
@@ -6700,11 +7150,11 @@ fn copy_systemmem_to_default(
     // allocation is distinct from the dst inner (src_parent != dst_parent).
     let src_inner = unsafe { &*core::ptr::from_ref(src_tex.inner()) };
     let hr = copy(dst_tex.inner_mut(), src_inner);
-    if hr != D3D_OK {
-        return hr;
-    }
+    // A copy that failed partway has still written the levels before the one
+    // that failed, and those owe their upload like any other: the re-walk is
+    // what flushes them at the next draw.
     schedule_staging_upload_at_next_bind(dst_tex);
-    D3D_OK
+    hr
 }
 
 extern "system" fn device_update_surface(
@@ -7155,6 +7605,9 @@ extern "system" fn device_update_texture(
                     let sw = src.mip_width(src_level);
                     let sh = src.mip_height(src_level);
                     let Some(c) = dr.clamp(sw, sh) else { continue };
+                    if !c.reaches(dst.mip_width(level), dst.mip_height(level)) {
+                        continue;
+                    }
                     let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                         dst.update_cube_sub_region_from(
                             (face, level),
@@ -7230,6 +7683,9 @@ extern "system" fn device_update_texture(
             let sw = src.mip_width(src_level);
             let sh = src.mip_height(src_level);
             let Some(c) = dr.clamp(sw, sh) else { continue };
+            if !c.reaches(dst.mip_width(level), dst.mip_height(level)) {
+                continue;
+            }
             let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                 // Whole mip.
                 dst.update_sub_region_from(level, src, src_level, None, (0, 0))
@@ -7851,9 +8307,24 @@ extern "system" fn device_stretch_rect(
             .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
     };
     if !dst_eligible || !src_eligible {
+        // One line per process, naming the first pair rejected here; the
+        // arguments are formatted only when it fires.
+        // SAFETY: `src` is the live IDirect3DSurface9 the game passed to this call.
+        let src_surface = unsafe { InPtr::<Direct3DSurface9>::opt(src) };
+        // SAFETY: `dst` is the live IDirect3DSurface9 the game passed to this call.
+        let dst_surface = unsafe { InPtr::<Direct3DSurface9>::opt(dst) };
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "reject StretchRect: ineligible src/dst surface class → INVALIDCALL"
+            "reject StretchRect: ineligible src/dst surface class (src={} usage=0x{:x} {} 0x{:x}, \
+             dst={} usage=0x{:x} {} 0x{:x}) → INVALIDCALL",
+            src_info.class_name(),
+            src_surface.map_or(0, |surf| surf.d3d_usage()),
+            mtld3d_core::format::format_name(src_info.format),
+            src_info.format,
+            dst_info.class_name(),
+            dst_surface.map_or(0, |surf| surf.d3d_usage()),
+            mtld3d_core::format::format_name(dst_info.format),
+            dst_info.format
         );
         return D3DERR_INVALIDCALL;
     }
@@ -7928,11 +8399,15 @@ extern "system" fn device_stretch_rect(
     // Past every gate that can reject the call, so the endpoints' pending
     // uploads are work this call will use.
     flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
-    // A cross-Metal-format same-size copy also needs the render-quad path (the
-    // 1:1 blit can't convert). `check_stretch_rect_formats` guaranteed a
-    // cross-format destination is a render target or an offscreen-plain surface
-    // (cross-format RT/texture/offscreen → RT, plus the offscreen→offscreen
-    // case handled on the CPU just below).
+    // A same-size copy that converts also needs the render-quad path (the 1:1
+    // blit can't convert): a cross-Metal-format pair, or a source without
+    // alpha into a destination with alpha sharing its storage, whose alpha
+    // the quad forces to one while it samples (`BlitDecode::OpaqueAlpha` for
+    // an X source; a widened source already stores alpha one).
+    // `check_stretch_rect_formats` guaranteed a cross-format destination is a
+    // render target or an offscreen-plain surface (cross-format
+    // RT/texture/offscreen → RT, plus the offscreen→offscreen case handled on
+    // the CPU just below).
     // Device-aware mapping: it must agree with the Metal formats the textures
     // were actually created with (e.g. a packed 16-bit pair that is
     // BGRA8-backed on this device is NOT cross-format).
@@ -7943,13 +8418,14 @@ extern "system" fn device_stretch_rect(
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
-    // the 1:1 blit can't convert. Do it on the CPU — decode each source pixel
+    // the 1:1 blit can't convert. Do it on the CPU: decode each source pixel
     // and re-encode into the destination texture's staging, then upload that
     // staging so a later sample (or same-format StretchRect out of it) and a
     // later LockRect both see the converted pixels. Do NOT push the render-quad
-    // op — it would bind a non-render-target
-    // texture as a colour attachment. `WoW` never hits offscreen→offscreen
-    // cross-format, so this path is conformance-only.
+    // op, which would bind a non-render-target texture as a colour attachment.
+    // This serves the offscreen pairs of two storages, the YUV decodes, and a
+    // source without alpha into a destination with alpha, whose padding the
+    // converter reads as alpha one.
     if cross_format
         && !scaling
         && dst_info
@@ -8159,18 +8635,25 @@ fn flush_dirty_mips_for_gpu_write(
 ///
 /// Compares the *Metal* pixel formats, not the D3D codes: distinct D3D
 /// formats can share a single Metal format (e.g. A8R8G8B8 + X8R8G8B8 are both
-/// `Bgra8Unorm`, only the alpha-channel meaning differs, which doesn't matter
-/// for a byte-level blit). `WoW` composites a X8R8G8B8 source onto an
-/// A8R8G8B8 destination at login, so rejecting an alpha-only difference would
-/// wrongly fail a valid blit. A shared storage does not make every pair a
-/// byte copy, though: a packed YUV endpoint lays its bytes out in an order no
-/// other format shares (`reinterprets_packed_yuv`), so such a pair converts
-/// or is refused like a pair of two storages.
+/// `Bgra8Unorm`, and on a device without the packed 16-bit formats A1R5G5B5
+/// and A4R4G4B4 are too). A shared storage does not make every pair a byte
+/// copy, though. A source without alpha into a destination with alpha would
+/// hand the source's padding to the destination as alpha where D3D9 writes
+/// alpha one (`exposes_padding_as_alpha`, judged on the mappings this device
+/// created), so that pair converts; the other direction stays a byte copy,
+/// since every reader of a destination without alpha ignores the alpha it
+/// carries. A packed YUV endpoint lays its bytes out in an order no other
+/// format shares (`reinterprets_packed_yuv`), so such a pair converts or is
+/// refused like a pair of two storages.
 fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packed16: bool) -> bool {
-    let metal = |format: u32| {
-        crate::direct3d9::map_for_device(format, expand_packed16).map(|m| m.metal_pixel_format())
-    };
-    metal(src.format) == metal(dst.format)
+    let src_map = crate::direct3d9::map_for_device(src.format, expand_packed16);
+    let dst_map = crate::direct3d9::map_for_device(dst.format, expand_packed16);
+    let exposes_padding = matches!(
+        (&src_map, &dst_map),
+        (Some(s), Some(d)) if mtld3d_core::stretch_rect::exposes_padding_as_alpha(s, d)
+    );
+    src_map.map(|m| m.metal_pixel_format()) == dst_map.map(|m| m.metal_pixel_format())
+        && !exposes_padding
         && !mtld3d_core::stretch_rect::reinterprets_packed_yuv(src.format, dst.format)
 }
 
@@ -8723,14 +9206,12 @@ extern "system" fn device_create_offscreen_plain_surface(
     } else {
         (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
-    let surf = Direct3DSurface9::new_system_memory(
-        obj.inner_ptr(),
-        width,
-        height,
-        format,
-        pool,
-        PageBox::new_uninit(bytes),
-    );
+    // The surface's bytes are the one allocation of the create that may fail.
+    let Some(backing) = PageBox::try_new_uninit(bytes) else {
+        return refuse_unallocatable_staging("CreateOffscreenPlainSurface", surface);
+    };
+    let surf =
+        Direct3DSurface9::new_system_memory(obj.inner_ptr(), width, height, format, pool, backing);
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live system-memory surface at
     // refcount 1.
@@ -8969,7 +9450,10 @@ extern "system" fn device_set_render_target(
     });
     // D3D9 likewise resets the scissor rect to the new RT's full dimensions,
     // overriding any rect set before the switch.
-    dev.set_scissor_rect([0, 0, desc.width, desc.height]);
+    dev.set_scissor_rect(mtld3d_core::render_state::full_target_scissor(
+        desc.width,
+        desc.height,
+    ));
     // RT swap: depth/stencil resolution may change; new RT might also
     // already be bound as a texture on some stage (sampling-from-RT). RS
     // carries the reset scissor; VS_CONST is internalized into `set_viewport`.
@@ -9416,19 +9900,11 @@ extern "system" fn device_clear(
     }
 
     // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
-    // region is additionally clipped to the (non-degenerate) device scissor
-    // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
-    // `scissor_rect()` is stored as [x, y, width, height]; convert to the
-    // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
-    let s = dev.scissor_rect(); // [x, y, width, height]
-    let scissor_on =
-        dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
-    let scissor = (
-        s[0].cast_signed(),
-        s[1].cast_signed(),
-        s[0].saturating_add(s[2]).cast_signed(),
-        s[1].saturating_add(s[3]).cast_signed(),
-    );
+    // region is additionally clipped to the device scissor rect, and an empty
+    // scissor clears nothing. Resolved on the API thread; the encoder then
+    // clips ∩ viewport.
+    let scissor_on = dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0;
+    let scissor = mtld3d_core::render_state::scissor_region(dev.scissor_rect());
 
     // D3D9 Clear's pRects/Count semantics, shared by every plane:
     //  - pRects == NULL  → clear the whole target (Count ignored). With the
@@ -9438,7 +9914,14 @@ extern "system" fn device_clear(
     // `None` is the whole target; `Some` is an explicit list, already clipped
     // to the scissor and possibly empty.
     let regions: Option<Vec<(i32, i32, i32, i32)>> = if rects.is_null() {
-        scissor_on.then(|| vec![scissor])
+        scissor_on.then(|| {
+            let (x1, y1, x2, y2) = scissor;
+            if x2 > x1 && y2 > y1 {
+                vec![scissor]
+            } else {
+                Vec::new()
+            }
+        })
     } else {
         let mut list = if count > 0 {
             clear_target_rects(count, rects)
@@ -9751,7 +10234,7 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     let dev = obj.inner();
     let on = enable != 0;
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::LightEnable { index, enable: on });
+        rec.record_light_enable(index, on);
         return D3D_OK;
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
@@ -10582,39 +11065,34 @@ extern "system" fn device_get_current_texture_palette(
 }
 
 extern "system" fn device_set_scissor_rect(this: *mut c_void, rect: *const c_void) -> i32 {
-    use mtld3d_types::D3DRECT;
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::ViewScissor);
     // SAFETY: vtable in-param; `rect` is *const D3DRECT per ABI.
     let Some(r) = (unsafe { ValueIn::<D3DRECT>::read_opt(rect) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let rect_x = r.x1.max(0).cast_unsigned();
-    let rect_y = r.y1.max(0).cast_unsigned();
-    let rect_w = (r.x2 - r.x1).max(0).cast_unsigned();
-    let rect_h = (r.y2 - r.y1).max(0).cast_unsigned();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::ScissorRect([rect_x, rect_y, rect_w, rect_h]));
+        rec.record(StateOp::ScissorRect(r));
         return D3D_OK;
     }
     if dev.frame_dump.active {
         dev.frame_dump_event(&format!(
-            "SetScissorRect [{rect_x},{rect_y},{rect_w},{rect_h}]"
+            "SetScissorRect ({},{})-({},{})",
+            r.x1, r.y1, r.x2, r.y2
         ));
     }
-    dev.set_scissor_rect([rect_x, rect_y, rect_w, rect_h]);
+    dev.set_scissor_rect(r);
     // scissor_rect is the only piece of RenderStateSnapshot affected.
     dev.mark_snapshot_dirty(SnapshotDirty::RS);
     D3D_OK
 }
 
 extern "system" fn device_get_scissor_rect(this: *mut c_void, rect: *mut c_void) -> i32 {
-    use mtld3d_types::D3DRECT;
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::ViewScissor);
     if rect.is_null() {
@@ -10625,17 +11103,12 @@ extern "system" fn device_get_scissor_rect(this: *mut c_void, rect: *mut c_void)
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    let [x, y, w, h] = dev.scissor_rect();
+    let scissor = dev.scissor_rect();
     // SAFETY: `rect` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `RECT` (alias for `D3DRECT`) owned by the
     // caller.
     unsafe {
-        *rect.cast::<D3DRECT>() = D3DRECT {
-            x1: x.cast_signed(),
-            y1: y.cast_signed(),
-            x2: (x + w).cast_signed(),
-            y2: (y + h).cast_signed(),
-        };
+        *rect.cast::<D3DRECT>() = scissor;
     }
     D3D_OK
 }
@@ -11317,6 +11790,50 @@ unsafe fn copy_up_vertices(
     unsafe { arena_alloc_bytes(dev.current_frame.scratch_mut(), source) }
 }
 
+/// Copy a UP vertex stream whose last crossing attribute ends past its vertices.
+///
+/// The `count * stride` bytes D3D9 promises behind `vertex_data` are copied
+/// and zero-filled up to that attribute's end, `(count - 1) * stride +
+/// extent`, which is what the attribute then reads. Returns the copy and its
+/// size, or `None` when the size does not fit `u32`, which no vertex count a
+/// draw can carry reaches. Only a draw whose stream-0 extent is past its
+/// stride calls this; every other UP draw copies with [`copy_up_vertices`].
+///
+/// # Safety
+///
+/// `vertex_data` must be readable for `count * stride` bytes for the
+/// duration of the call, which the D3D9 ABI makes the caller's contract.
+#[cold]
+#[inline(never)]
+unsafe fn copy_up_crossing_vertices(
+    dev: &mut DeviceInner,
+    vertex_data: *const c_void,
+    count: u32,
+    stride: u32,
+) -> Option<(ScratchSlice, u32)> {
+    let extent = dev.cached_stream0_extent;
+    let Some(size) = mtld3d_core::streams::inline_vertex_span(count, stride, extent) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "Draw*PrimitiveUP: {count} vertices of stride {stride} with a crossing attribute \
+             ending at {extent} need more than 4 GiB → INVALIDCALL"
+        );
+        return None;
+    };
+    let supplied = count as usize * stride as usize;
+    // SAFETY: the caller guarantees `count * stride` readable bytes at `vertex_data`.
+    let source = unsafe { core::slice::from_raw_parts(vertex_data.cast::<u8>(), supplied) };
+    // SAFETY: current_frame retains immutable scratch through native submit replay.
+    let copy = unsafe {
+        mtld3d_core::draw_data::arena_alloc_zero_padded(
+            dev.current_frame.scratch_mut(),
+            source,
+            size as usize,
+        )
+    };
+    Some((copy, size))
+}
+
 extern "system" fn device_draw_primitive_up(
     this: *mut c_void,
     primitive_type: u32,
@@ -11349,10 +11866,6 @@ extern "system" fn device_draw_primitive_up(
         if vertex_data.is_null() {
             return D3DERR_INVALIDCALL;
         }
-        let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
-        // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
-        // vertices of `vertex_stride` bytes are readable from `vertex_data`.
-        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, fan_bytes) };
         // The encoder's shared 16-bit pattern is relative to the fan's first
         // vertex, which the inline stream starts at, so it covers every fan a
         // 16-bit index can address; anything longer gets a generated list.
@@ -11371,6 +11884,27 @@ extern "system" fn device_draw_primitive_up(
         let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
         emit_snapshot_deltas(&obj);
         drop(snap);
+        // After the snapshot, which resolves the declaration the copy is sized by.
+        let (vertex_copy, fan_size) = if dev.cached_stream0_extent <= vertex_stride {
+            let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
+            // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
+            // vertices of `vertex_stride` bytes are readable from `vertex_data`.
+            let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, fan_bytes) };
+            (
+                vertex_copy,
+                u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+            )
+        } else {
+            let fan_vertices = primitive_count.saturating_add(2);
+            // SAFETY: per the D3D9 ABI the caller guarantees the fan's vertices
+            // of `vertex_stride` bytes are readable; the copy reads no more.
+            let copy =
+                unsafe { copy_up_crossing_vertices(dev, vertex_data, fan_vertices, vertex_stride) };
+            let Some(copy) = copy else {
+                return D3DERR_INVALIDCALL;
+            };
+            copy
+        };
         let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
@@ -11378,7 +11912,7 @@ extern "system" fn device_draw_primitive_up(
             metal_prim,
             vertex_source: VertexSource::Up {
                 bytes: vertex_copy,
-                size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+                size: fan_size,
                 stride: vertex_stride,
             },
             index_source,
@@ -11402,19 +11936,33 @@ extern "system" fn device_draw_primitive_up(
     let cycles = obj.inner().perf_cycles();
     let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
 
-    let data_size = (vtx_count * vertex_stride) as usize;
-    // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
-    // contract.
-    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, data_size) };
-
     emit_snapshot_deltas(&obj);
+    // After the snapshot, which resolves the declaration the copy is sized by.
+    let (vertex_copy, data_size) = if dev.cached_stream0_extent <= vertex_stride {
+        let data_size = (vtx_count * vertex_stride) as usize;
+        // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
+        // contract.
+        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, data_size) };
+        (
+            vertex_copy,
+            u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+        )
+    } else {
+        // SAFETY: per the D3D9 ABI `vertex_data` covers `vtx_count` vertices of
+        // `vertex_stride` bytes; the copy reads no more.
+        let copy = unsafe { copy_up_crossing_vertices(dev, vertex_data, vtx_count, vertex_stride) };
+        let Some(copy) = copy else {
+            return D3DERR_INVALIDCALL;
+        };
+        copy
+    };
     drop(snap);
     let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
-            size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+            size: data_size,
             stride: vertex_stride,
         },
         index_source: IndexSource::None {
@@ -11517,6 +12065,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // SAFETY: the bound-slot refcount keeps this separate texture
             // allocation live; the device API lock serialises its access.
             let bound = unsafe { &mut *tex };
+            // Bound here, then used on another device: back it comes, as a
+            // fragment stage's texture does in the stage walk.
+            crate::texture::rehydrate_for_device(bound, dev);
             crate::texture::flush_dirty_mips(bound.inner_mut(), dev);
             bound.inner_mut().note_gpu_use();
         }
@@ -11557,15 +12108,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let decl_ptr = dev.vertex_decl();
         let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
             let (elements, _fvf_stride) = fvf_to_elements(fvf);
-            // With no declaration bound `fvf` is 0, since the FVF is the bound
-            // declaration's, so the layout reads an omitted COLORVERTEX source
-            // as 0, as a declaration does.
-            let layout = convert::ff_vs_layout_from_elements(&elements, fvf == 0);
+            let layout = convert::ff_vs_layout_from_elements(&elements);
             // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
             // D3D9 runs the FF pre-transformed path regardless, even when a
             // VS is still bound — so the attrs must resolve for the FF VS too.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(&elements)
+                resolve_attrs_for_ff(&elements, &[0; MAX_LINKED_INPUTS])
             } else {
                 // SAFETY: non-null check passed; refcount holds it live.
                 let vs_obj = unsafe { &*bound_vertex_shader };
@@ -11576,10 +12124,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // SAFETY: non-null check passed; refcount holds it live.
             let decl = unsafe { &*decl_ptr };
             let elements = decl.inner().elements();
-            let layout = convert::ff_vs_layout_from_elements(elements, fvf == 0);
+            let layout = convert::ff_vs_layout_from_elements(elements);
             // See the FVF arm: POSITIONT bypasses a bound VS.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(elements)
+                resolve_attrs_for_ff(elements, &decl.inner().passthrough())
             } else {
                 // SAFETY: see above.
                 let vs_obj = unsafe { &*bound_vertex_shader };
@@ -11588,6 +12136,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             (resolved, decl.inner().hash(), layout)
         };
         dev.cached_ff_vs_layout = ff_vs_layout;
+        dev.cached_stream0_extent = resolved.extents[0];
         // Which VS input registers the declaration backs — folded into a
         // programmable VsSource so a shader reading an unprovided input gets a
         // distinct zero-filled variant. For the FF
@@ -11670,14 +12219,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             rs[D3DRS_SCISSORTESTENABLE as usize] != 0,
         );
 
-        let sr = dev.scissor_rect();
-        // D3D9 caps scissor coords at MaxTextureWidth/Height (16384) — fits u16.
-        let scissor_rect = [
-            u16::try_from(sr[0]).expect("D3D9 scissor x ≤ 16384"),
-            u16::try_from(sr[1]).expect("D3D9 scissor y ≤ 16384"),
-            u16::try_from(sr[2]).expect("D3D9 scissor w ≤ 16384"),
-            u16::try_from(sr[3]).expect("D3D9 scissor h ≤ 16384"),
-        ];
+        // `SetScissorRect` stores any RECT; the snapshot carries the region
+        // it lets through, saturated to `u16`.
+        let scissor_rect = mtld3d_core::render_state::scissor_snapshot_rect(dev.scissor_rect());
 
         // `D3DRS_MULTISAMPLEMASK` only means anything against a maskable
         // multisampled target, and which target is bound is API-thread
@@ -11790,9 +12334,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             section_cycles.and_then(|c| c.draw_snapshot_section(SnapshotSection::VsSource)),
         );
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
-            let key = dev
-                .ff_state()
-                .build_vs_key(rs, dev.cached_ff_vs_layout, bound_mask);
+            let key = dev.ff_state().build_vs_key(
+                rs,
+                dev.cached_ff_vs_layout,
+                bound_mask,
+                dev.bound_decl_passthrough(),
+            );
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -11818,6 +12365,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
                     clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
                     sampler_kinds: dev.vertex_texture_kinds(),
+                    reserved: [0; 7],
 
                     flags: (if vs_obj.uses_rel_const() {
                         mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE
@@ -11879,6 +12427,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         mtld3d_core::draw_data::ShaderSourceFlags::BUMP_ENV
                     } else {
                         mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.uses_rel_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.reads_linked_inputs() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::LINKED_INPUTS
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
                     }),
 
                     reserved: [0; 4],
@@ -11927,9 +12483,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let key_ref = vs_value.as_ref().or(dev.snapshot_cache.vs.as_ref());
         let key = match key_ref {
             Some(VsSource::FixedFunction(value)) => value.key.clone(),
-            _ => dev
-                .ff_state()
-                .build_vs_key(rs, dev.cached_ff_vs_layout, bound_mask),
+            _ => dev.ff_state().build_vs_key(
+                rs,
+                dev.cached_ff_vs_layout,
+                bound_mask,
+                dev.bound_decl_passthrough(),
+            ),
         };
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
@@ -12003,7 +12562,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     let rows = dev.ff_state.palette_section_rows(&key);
                     if rows != 0 {
                         dev.current_frame.record_ff_vs_destination(
-                            mtld3d_core::ff_state::FF_VS_PALETTE_BASE_ROW,
+                            mtld3d_core::dxso::FF_VS_PALETTE_BASE_ROW,
                             rows,
                             |destination| dev.ff_state.fill_palette_section(&key, destination),
                         );
@@ -12325,6 +12884,9 @@ fn snapshot_stage_bindings(
             bound_texture_mask |= 1u8 << stage;
         }
         let mut sampler_state = dev.stage_bindings().sampler_states(stage);
+        if dev.samples_unfiltered(tex) {
+            mtld3d_core::sampler_state::sample_unfiltered(&mut sampler_state);
+        }
         // Lazy texture upload: flush any per-mip `dirty` flags before
         // capturing TextureInfo. Operations pushed by `schedule_upload`
         // precede the Draw operation on the encoder thread, so the
@@ -12335,24 +12897,10 @@ fn snapshot_stage_bindings(
         crate::texture::rehydrate_for_device(tex, dev);
         crate::texture::flush_dirty_mips(tex.inner_mut(), dev);
         tex.inner_mut().note_gpu_use();
-        // A texture's SetLOD raises the effective most-detailed mip. LOD == 0
-        // (the common case) is a no-op in both branches.
-        let lod = tex.inner().lod();
-        if sampler_state[D3DSAMP_MIPFILTER as usize] == D3DTEXF_NONE {
-            // mip-OFF: the effective level is the texture LOD alone (MAXMIPLEVEL
-            // does not apply). Metal samples level 0 for a non-mipmapped sampler
-            // and ignores lodMinClamp, so promote to POINT with MAXMIPLEVEL = LOD
-            // — the clamp then pins sampling to the LOD level.
-            if lod > 0 {
-                sampler_state[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
-                sampler_state[D3DSAMP_MAXMIPLEVEL as usize] = lod;
-            }
-        } else {
-            // mip-ON: the sampler clamps to max(MAXMIPLEVEL, LOD); fold the LOD
-            // into MAXMIPLEVEL so the cached sampler's lodMinClamp honours it.
-            let max_mip = sampler_state[D3DSAMP_MAXMIPLEVEL as usize];
-            sampler_state[D3DSAMP_MAXMIPLEVEL as usize] = max_mip.max(lod);
-        }
+        // A texture's SetLOD is its most detailed level. The sampler
+        // translation and the explicit-LOD rows read it from the copy's spare
+        // slot; LOD 0 (the common case) leaves both as the state alone.
+        sampler_state[TEXTURE_LOD_SLOT] = tex.inner().lod();
         packed[out_idx].write(StageBinding {
             texture_id: tex.texture_id(),
             sampler_state,
@@ -12437,9 +12985,6 @@ extern "system" fn device_draw_indexed_primitive_up(
     // uploaded but unreferenced.
     let vtx_upload = min_vertex_index as usize + num_vertices as usize;
     let vtx_bytes = vtx_upload * vertex_stride as usize;
-    // SAFETY: per the D3D9 ABI `vertex_data` covers at least
-    // `(min_vertex_index + num_vertices) * vertex_stride` bytes.
-    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, vtx_bytes) };
 
     // Build the index stream. Triangle fan has no Metal primitive, so the
     // inline indices are gathered into a triangle list (fan vertices
@@ -12484,12 +13029,31 @@ extern "system" fn device_draw_indexed_primitive_up(
     let snap = AtomicCycleAddTimer::start(cycles.draw_snapshot());
     emit_snapshot_deltas(&obj);
     drop(snap);
+    // After the snapshot, which resolves the declaration the copy is sized by.
+    let (vertex_copy, vtx_size) = if dev.cached_stream0_extent <= vertex_stride {
+        // SAFETY: per the D3D9 ABI `vertex_data` covers at least
+        // `(min_vertex_index + num_vertices) * vertex_stride` bytes.
+        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, vtx_bytes) };
+        (
+            vertex_copy,
+            u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+        )
+    } else {
+        let count = min_vertex_index.saturating_add(num_vertices);
+        // SAFETY: per the D3D9 ABI `vertex_data` covers `min_vertex_index +
+        // num_vertices` vertices of `vertex_stride` bytes; the copy reads no more.
+        let copy = unsafe { copy_up_crossing_vertices(dev, vertex_data, count, vertex_stride) };
+        let Some(copy) = copy else {
+            return D3DERR_INVALIDCALL;
+        };
+        copy
+    };
     let _push = AtomicCycleAddTimer::start(cycles.draw_push_op());
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
-            size: u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+            size: vtx_size,
             stride: vertex_stride,
         },
         index_source,
@@ -13793,6 +14357,18 @@ extern "system" fn device_create_pixel_shader(
         created
             .usage
             .contains(mtld3d_shared::shader_create::ShaderUsage::BOOL_CONST),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_REL_CONST,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::RELATIVE_CONST),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::READS_LINKED_INPUTS,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::LINKED_INPUTS),
     );
     if let Err(result) = created.adopt(obj.inner()) {
         return result;

@@ -5,7 +5,7 @@
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicI32, AtomicU32, AtomicU64},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
 };
 
 pub use mtld3d_core::encoder_data::{
@@ -92,9 +92,20 @@ pub struct EncoderThread {
     completions: CompletionPool,
     /// Submitted packets, their handed-over leases and recovered recording storage.
     retirement: Mutex<PacketRetirement>,
+    /// `debug.failNextSubmit`, armed until the first submission it refuses.
+    fail_next_submit: AtomicBool,
 }
 
 impl EncoderThread {
+    /// This device's calibrated TSC frequency, `None` until its background worker published it.
+    ///
+    /// For API-thread perf code that needs a time in cycles without paying
+    /// the calibration sleep itself.
+    #[cfg(perf_tracking)]
+    pub fn source_clock_hz(&self) -> Option<u64> {
+        self.source_clock.hz()
+    }
+
     pub fn spawn(
         device: MetalHandle<MTLDeviceKind>,
         record_handle: DeviceRecordHandle,
@@ -157,6 +168,7 @@ impl EncoderThread {
             native_failure,
             completions: CompletionPool::new(),
             retirement: Mutex::default(),
+            fail_next_submit: AtomicBool::new(config.fail_next_submit),
         })
     }
 
@@ -194,6 +206,16 @@ impl EncoderThread {
     /// Latch `status` as the device failure unless one is latched; `cause` names the step.
     pub fn record_failure(&self, status: i32, cause: &str) -> i32 {
         mtld3d_core::encoder_failure::record_failure(&self.failure, status, cause)
+    }
+
+    /// Padded bytes of the texture staging only this device's upload leases still keep.
+    ///
+    /// Walks every retained page lease under the retirement lock, so it is
+    /// for the address-space watch's samples, not for a frame.
+    pub fn upload_lease_bytes(&self) -> u64 {
+        let mut tally = mtld3d_core::guest_pages::LeaseOnlyPages::default();
+        self.lock_retirement().tally_page_leases(&mut tally);
+        tally.bytes()
     }
 
     fn lock_retirement(&self) -> MutexGuard<'_, PacketRetirement> {
@@ -279,6 +301,9 @@ impl EncoderThread {
             self.retain_failed(packet);
             return Err(failure);
         }
+        if self.fail_next_submit.load(Ordering::Relaxed) {
+            return Err(self.refuse_for_test(packet));
+        }
         let mut params = SubmitEncoderFrameParams {
             runtime: self.runtime,
             metadata_ptr: packet.metadata_bytes().as_ptr() as u64,
@@ -314,6 +339,22 @@ impl EncoderThread {
         // the next frame's pass.
         self.retain_submitted(packet, mode != EncoderSubmitMode::Queue);
         self.status()
+    }
+
+    /// Refuse `packet` the way a native rejection would, for `debug.failNextSubmit`.
+    ///
+    /// Out of line and cold: the key is a test seam, armed only in the
+    /// suite, and the submission path pays one relaxed load for it.
+    #[cold]
+    #[inline(never)]
+    fn refuse_for_test(&self, packet: FramePacket) -> i32 {
+        self.fail_next_submit.store(false, Ordering::Relaxed);
+        log::error!(target: LOG_TARGET, "encoder: debug.failNextSubmit refused the frame submission");
+        self.retain_failed(packet);
+        self.record_failure(
+            D3DERR_DEVICELOST,
+            "debug.failNextSubmit refused the submission",
+        )
     }
 
     pub fn send_frame(&self, frame: FrameData) -> Result<(), i32> {
@@ -360,7 +401,7 @@ impl EncoderThread {
             return Ok(());
         }
         #[cfg(perf_tracking)]
-        self.source_clock.join();
+        self.source_clock.wait();
         let mut params = DestroyEncoderParams {
             runtime: self.runtime,
         };

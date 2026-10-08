@@ -152,8 +152,25 @@ unless its entry says otherwise.
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
   each warned once; the whole back buffer is presented across the device
   window.
+- SM3 linkage limits. A `ps_3_0` links at most `MAX_LINKED_INPUTS` (eight)
+  input semantics outside the fixed-function varyings (NORMAL, TANGENT,
+  COLOR2 and the like); a ninth and later read zero, warned once. A
+  pretransformed (XYZRHW, POSITIONT) draw feeds a `ps_3_0` the declaration's
+  elements by semantic, at most eight of them besides the position, colours,
+  texture coordinates and point size, the rest reading zero, warned once.
+  Two of its inputs keep the fixed-function value instead, both unverified
+  against Windows: TEXCOORDn is the set stage n's `D3DTSS_TEXCOORDINDEX`
+  routes, which is the declaration's TEXCOORDn unless the index was changed,
+  and FOG reads the specular alpha while fog is enabled with both fog modes
+  NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- The fixed-function texture operations `D3DTOP_PREMODULATE`,
+  `D3DTOP_MULTIPLYADD` and `D3DTOP_LERP`: absent from `TextureOpCaps`, and a
+  stage that names one is warned once and runs as `D3DTOP_SELECTARG1`.
+  `D3DTSS_COLORARG0` and `D3DTSS_ALPHAARG0`, which only the last two read,
+  are stored and reported back, and warned once when written away from
+  their default.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
   `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
   `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
@@ -193,6 +210,13 @@ unless its entry says otherwise.
   it: both World of Warcraft targets create a plain device, and nothing else
   in the tested set asks for 9Ex. Issue #789 is the record of the decision
   and of what an implementation would cover.
+- SM3 relative addressing of anything but the float constants: an input
+  read through the loop counter (`v[aL]` in `ps_3_0` and `vs_3_0`) and a
+  `vs_3_0` output written through it (`o[aL]`). A shader that writes
+  `o[aL]` fails `CreateVertexShader` with `D3DERR_INVALIDCALL`; one that
+  reads `v[aL]` is created, but its translation fails with a logged error
+  and its draws are left out, so this one does not fail cleanly. No known
+  title needs either.
 - A draw that samples the colour render target it is drawing into (a
   feedback loop) has no hazard handling, and nothing detects the bind, so
   this one does not fail cleanly. Metal leaves the result undefined, and an
@@ -219,12 +243,17 @@ unless its entry says otherwise.
   could not grow latches `E_OUTOFMEMORY` instead. Every later call that
   reports device state, `TestCooperativeLevel` and `Reset` included,
   returns the latched code until the device is released, and the log names
-  the step that failed first. There is no recovery short of creating a new
-  device.
+  the step that failed first. A failed device drops its open frame at each
+  `Present`, and its final `Release` destroys the render targets and depth
+  surfaces released after the failure. There is no recovery short of
+  creating a new device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,
   palettized textures. Accepted or rejected per spec, non-functional.
+- The depth formats `D15S1` and `D24X4S4`, whose one- and four-bit stencil no
+  Metal format has: answered `D3DERR_NOTAVAILABLE` and refused by every
+  create, as the reference implementations do.
 
 ## Kept divergences
 
@@ -265,7 +294,35 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - The window procedure carrying cursor realization and the windowed
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
+- A rejected `Reset` leaves render target 0 on the back buffer and the
+  depth stencil on the implicit surface, as a successful one does, where
+  the reference implementations leave both unbound; what D3D9 itself
+  leaves there is not observable. No knob.
+- A texture whose Metal allocation is refused at an extent within the
+  reported limits still creates: its Metal texture is made on the encoder
+  thread after `CreateTexture`, `CreateCubeTexture` or `CreateVolumeTexture`
+  has returned `D3D_OK`, so the refusal is logged and the texture samples as
+  opaque black, where D3D9 answers the create with an out-of-memory error.
+  No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- A `D3DSAMP_BORDERCOLOR` other than transparent black, opaque black or
+  opaque white reads as opaque black under `D3DTADDRESS_BORDER`; D3D9
+  returns the colour the game set. No knob.
+- `ATI1` creates as a 2D texture in every pool and as an offscreen plain
+  surface in every pool a plain surface takes, while every format query
+  answers `D3DERR_NOTAVAILABLE` for it, and its lock reports the BC4 block
+  pitch rather than the pitch D3D9 reports for the format. No knob.
+- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and as
+  a depth-stencil texture, on a 32-bit float depth, while every depth query
+  answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth surface
+  fails, warned once. They are single-sampled; a multisampled swap chain
+  refuses them, as `CheckDeviceMultiSampleType` does. A standalone
+  depth-stencil surface in either format is refused, as before. No knob.
+- `CreateDevice` and `Reset` accept any back-buffer format and present a
+  BGRA8 back buffer for every one but A8R8G8B8 and X8R8G8B8, which
+  `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside
+  its back-buffer set and keeps a 16-bit one. `CheckDeviceType` offers that
+  set only. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes
@@ -286,3 +343,10 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and appears once the build lands; D3D9 draws every call in its frame.
   Building inline stalls the frame for the length of a Metal compile.
   `shader.asyncCompile`, on by default.
+- The fixed-function specular add clamps its sum to [0, 1] before fog
+  blends it, where both reference implementations fog the unclamped sum. No
+  knob.
+- `GetRenderTargetData` from an X render target into a system-memory
+  surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
+  A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,
+  where D3D9 reads it as one. No knob.

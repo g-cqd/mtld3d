@@ -3,24 +3,25 @@
 //! The round-trip renders to a texture, then samples it.
 
 use mtld3d_tests::{
-    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, TexturedVertex,
-    Vertex, VolumeVertex,
+    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, SwapChain,
+    Texture, TexturedVertex, Vertex, VolumeVertex,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_DISCARD,
-    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    IID_IDIRECT3DSWAPCHAIN9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -782,6 +783,293 @@ fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) 
         .collect()
 }
 
+/// `StretchRect` from an X render target into its A counterpart writes alpha one.
+///
+/// The X byte is padding that D3D9 reads as alpha one, so a copy into the A
+/// format writes alpha one whatever the padding holds; the fill here leaves
+/// its zero alpha in it. Checked 1:1 into a render target with the point and
+/// the linear filter, scaled into part of one (the rest keeping its own
+/// fill), and 1:1 into a render-target texture level, in both 8-bit channel
+/// orders. Each word is read in its own
+/// format's order, so red is `0xFFFF0000` in A8R8G8B8 and `0xFF0000FF` in
+/// A8B8G8R8.
+#[test]
+fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    for (x_format, a_format, opaque_red) in [
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8, RED),
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8, 0xFF00_00FF),
+    ] {
+        let src = h.create_render_target(SIZE.0, SIZE.1, x_format);
+        assert_eq!(
+            h.color_fill_hr(&src, 0x00FF_0000),
+            D3D_OK,
+            "fill {x_format:#x}"
+        );
+
+        let one_to_one = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &one_to_one, SIZE, a_format)
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let linear = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &linear, D3DTEXF_LINEAR),
+            D3D_OK,
+            "1:1 linear {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &linear, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 linear {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let scaled = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.color_fill_hr(&scaled, GREEN),
+            D3D_OK,
+            "seed {a_format:#x}"
+        );
+        assert_eq!(
+            h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+            D3D_OK,
+            "scaled {x_format:#x} -> {a_format:#x}"
+        );
+        let words = read_back(&h, &scaled, SIZE, a_format);
+        for y in 0..SIZE.1 as usize {
+            for x in 0..SIZE.0 as usize {
+                let expected = if x < 8 && y < 8 { opaque_red } else { GREEN };
+                assert_eq!(
+                    words[y * SIZE.0 as usize + x],
+                    expected,
+                    "scaled {x_format:#x} -> {a_format:#x}, pixel ({x}, {y})"
+                );
+            }
+        }
+
+        let texture = h.create_texture(
+            SIZE.0,
+            SIZE.1,
+            1,
+            D3DUSAGE_RENDERTARGET,
+            a_format,
+            D3DPOOL_DEFAULT,
+        );
+        let level = texture.surface_level(0);
+        assert_eq!(
+            h.stretch_rect(&src, &level, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x} texture level"
+        );
+        for (i, &word) in read_back(&h, &level, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x} texture level, pixel {i}"
+            );
+        }
+    }
+}
+
+/// `StretchRect` from the X8R8G8B8 back buffer into an A8R8G8B8 texture writes alpha one.
+///
+/// A frame copies its back buffer into a render-target texture of the same
+/// size and samples it afterwards. The back buffer's padding holds the fill's
+/// zero alpha, and the copy still reads alpha one. A render target of the
+/// back buffer's size scales with it under `render.scale`, so the copy stays
+/// 1:1 there too.
+#[test]
+fn stretch_rect_from_the_x8r8g8b8_back_buffer_into_an_a8r8g8b8_texture_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (640, 480);
+    let h = Harness::new();
+    let back_buffer = h.render_target(0);
+    assert_eq!(h.color_fill_hr(&back_buffer, 0x00FF_0000), D3D_OK, "fill");
+    let texture = h.create_texture(
+        SIZE.0,
+        SIZE.1,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&back_buffer, &level, D3DTEXF_NONE),
+        D3D_OK,
+        "back buffer -> A8R8G8B8 texture level"
+    );
+    let words = read_back(&h, &level, SIZE, D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (320, 240), (639, 479)] {
+        assert_eq!(words[y * SIZE.0 as usize + x], RED, "pixel ({x}, {y})");
+    }
+}
+
+/// `StretchRect` from an X8R8G8B8 render target into an A16B16G16R16F one writes alpha one.
+///
+/// The two storages differ, so the copy converts through the render quad, and
+/// the X byte's zero still reads as alpha one in the half-float destination.
+#[test]
+fn stretch_rect_from_an_x8r8g8b8_render_target_into_a16b16g16r16f_writes_opaque_alpha() {
+    let h = Harness::new();
+    let src = h.create_render_target(16, 16, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x00FF_0000), D3D_OK, "fill");
+    let dst = h.create_render_target(16, 16, D3DFMT_A16B16G16R16F);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A16B16G16R16F"
+    );
+    let sysmem = h.create_offscreen_plain_surface(16, 16, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&dst, &sysmem),
+        D3D_OK,
+        "read-back"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+    let halves = locked.as_u16(pitch * 16);
+    for (x, y) in [(0usize, 0usize), (8, 8), (15, 15)] {
+        let texel = y * pitch + x * 4;
+        let lanes = [0, 1, 2, 3].map(|lane| f16_to_f32(halves[texel + lane]).to_bits());
+        assert_eq!(
+            lanes,
+            [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits),
+            "texel ({x}, {y}) as R, G, B, A"
+        );
+    }
+}
+
+/// `StretchRect` from an X offscreen plain into one with alpha writes alpha one.
+///
+/// An offscreen-plain destination cannot be rendered into, so the pair is
+/// converted on the CPU, and the conversion reads the padding as alpha one:
+/// X8R8G8B8 into A8R8G8B8, X1R5G5B5 into A1R5G5B5, and X8R8G8B8 into
+/// A1R5G5B5 and A4R4G4B4, each source locked with its padding clear.
+#[test]
+fn stretch_rect_from_an_x_offscreen_plain_into_one_with_alpha_writes_opaque_alpha() {
+    const SIDE: usize = 4;
+    // Red with the top bit, the X1R5G5B5 padding, clear, and the same red opaque.
+    const X1_RED: u16 = 0x7C00;
+    const A1_OPAQUE_RED: u16 = 0xFC00;
+    const A4_OPAQUE_RED: u16 = 0xFF00;
+    let h = Harness::new();
+
+    let x8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let a8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    x8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[0x00FF_0000; SIDE * SIDE]);
+    a8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[GREEN; SIDE * SIDE]);
+    assert_eq!(
+        h.stretch_rect(&x8, &a8, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A8R8G8B8"
+    );
+    {
+        let locked = a8.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let words = locked.as_u32(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &words[y * pitch..y * pitch + SIDE],
+                &[RED; SIDE],
+                "A8R8G8B8 row {y}"
+            );
+        }
+    }
+
+    // Each source is red with its padding clear. X8R8G8B8 shares its storage
+    // with A1R5G5B5 and A4R4G4B4 on a device that widens the packed 16-bit
+    // formats (`make test INTEL=1`), where a byte copy would hand the padding
+    // over; on a device with them the pair is two storages either way.
+    let fill = |format: u32| -> Vec<u8> {
+        if format == D3DFMT_X1R5G5B5 {
+            core::iter::repeat_n(X1_RED.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        } else {
+            core::iter::repeat_n(0x00FF_0000u32.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        }
+    };
+    for (src_format, dst_format, opaque_red) in [
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4, A4_OPAQUE_RED),
+    ] {
+        let src = h.create_offscreen_plain_surface(4, 4, src_format, D3DPOOL_DEFAULT);
+        let dst = h.create_offscreen_plain_surface(4, 4, dst_format, D3DPOOL_DEFAULT);
+        let src_bytes = fill(src_format);
+        src.lock_rect(0)
+            .write_u8_rect(src_bytes.len() / SIDE, SIDE, &src_bytes);
+        dst.lock_rect(0)
+            .write_u8_rect(SIDE * 2, SIDE, &[0; SIDE * SIDE * 2]);
+        assert_eq!(
+            h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+            D3D_OK,
+            "{src_format:#x} -> {dst_format:#x}"
+        );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+        let texels = locked.as_u16(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &texels[y * pitch..y * pitch + SIDE],
+                &[opaque_red; SIDE],
+                "{src_format:#x} -> {dst_format:#x} row {y}"
+            );
+        }
+    }
+}
+
+/// `StretchRect` from an A render target into its X counterpart keeps the colour.
+///
+/// The X destination ignores alpha, so the copy only has to carry the colour
+/// channels, which it does 1:1 and scaled.
+#[test]
+fn stretch_rect_from_an_a_render_target_into_its_x_counterpart_keeps_the_colour() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    let src = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x80FF_0000), D3D_OK, "fill A8R8G8B8");
+    let one_to_one = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1"
+    );
+    for (i, &word) in read_back(&h, &one_to_one, SIZE, D3DFMT_X8R8G8B8)
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(word & 0x00FF_FFFF, 0x00FF_0000, "1:1 pixel {i}");
+    }
+    let scaled = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+        D3D_OK,
+        "scaled"
+    );
+    assert_eq!(
+        read_back(&h, &scaled, SIZE, D3DFMT_X8R8G8B8)[0] & 0x00FF_FFFF,
+        0x00FF_0000,
+        "scaled pixel (0, 0)"
+    );
+}
+
 /// `StretchRect` refuses a rect that leaves its surface instead of clamping it.
 ///
 /// A source rect past the source's edge, a negative one, and a destination
@@ -1050,6 +1338,150 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
         "the depth written by the occluder (0.25) samples back as dark gray, got {center:?}"
     );
     assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
+/// A RESZ resolve into an INTZ texture reaches the next draw that samples it while bound.
+///
+/// Sampling the bound depth attachment reads a copy the encoder keeps until
+/// a depth write moves its epoch. A RESZ resolve into the texture is such a
+/// write even though no draw or clear touches it: sampled again while bound,
+/// the texture must read the 0.75 the resolve brought in, not the 0.25 the
+/// first copy held.
+#[test]
+fn intz_depth_sampled_while_bound_sees_a_resz_resolve_into_it() {
+    let h = Harness::new();
+    let depth_texture = || {
+        h.create_texture(
+            640,
+            480,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let sampled = depth_texture();
+    let source = depth_texture();
+    let sampled_surf = sampled.surface_level(0);
+    let source_surf = source.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+
+    // The resolve's source holds 0.75, written before the first sample takes its copy.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.75, 0), 0);
+
+    // The sampled texture gets 0.25 from a draw, then is sampled while bound.
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    let sample_center = || {
+        assert_eq!(h.set_texture(0, &sampled), 0, "bind INTZ as a sampler");
+        h.select_texture_stage(0);
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+            (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+        }
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+        let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: vv,
+        };
+        let quad = [
+            v(-0.5, 0.5, 0.0, 0.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(0.5, -0.5, 1.0, 1.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+        ];
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample-depth draw with the attachment still bound"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+        center
+    };
+    let first = sample_center();
+    assert!(
+        (48..=90).contains(&first.r),
+        "the first sample reads the drawn 0.25 as dark gray, got {first:?}"
+    );
+
+    // The resolve copies the bound source into the texture at stage 0, with
+    // no draw or clear on either; then the texture is the attachment again.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.set_texture(0, &sampled), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "RESZ into the sampled texture"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the resolve destination");
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth again"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    let second = sample_center();
+    assert!(
+        (170..=210).contains(&second.r),
+        "the second sample reads the resolved 0.75 as light gray, got {second:?}"
+    );
 }
 
 #[test]
@@ -3134,11 +3566,74 @@ fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
         "ColorFill green"
     );
 
-    // Sample level 4 (4x4) of the 64x64 chain. MAXMIPLEVEL is the most
-    // detailed level the sampler may use, so the draw cannot read the filled
-    // level 0 instead.
+    sample_mip_level_4(&h, &rt);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries the fill colour, got {center:?}"
+    );
+}
+
+/// A rejected `Reset` regenerates the chain of an autogen render target it unbinds.
+///
+/// The `Reset` returns render target 0 to the back buffer, and an autogen
+/// texture leaving render target 0 rebuilds its lower levels from level 0,
+/// as `SetRenderTarget` does. The chain is seeded red, level 0 is cleared
+/// green while bound, and the texture, a held `D3DPOOL_DEFAULT` resource,
+/// rejects the `Reset`; the small level then reads green, red while stale.
+#[test]
+fn rejected_reset_regenerates_a_bound_autogen_render_target() {
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    {
+        let backbuffer = h.render_target(0);
+        assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+        assert_eq!(h.clear_target(RED), 0, "clear RT red");
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            0,
+            "unbinding regenerates the chain red"
+        );
+    }
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT again");
+    assert_eq!(h.clear_target(GREEN), 0, "clear level 0 green");
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "the held texture rejects the Reset"
+    );
+    let rt0 = h.render_target(0);
+    assert_ne!(rt0.as_ptr(), rt_surface.as_ptr(), "RT0 left the texture");
+    drop(rt0);
+
+    sample_mip_level_4(&h, &rt);
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries level 0's green, got {center:?}"
+    );
+    drop(rt_surface);
+    drop(rt);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset once the texture is gone");
+}
+
+/// Draw the 4x4 level of the 64x64 `rt` over the middle of a black render target 0.
+///
+/// MAXMIPLEVEL is the most detailed level the sampler may use, so the draw
+/// cannot read a more detailed level instead. Leaves the scene ended.
+fn sample_mip_level_4(h: &Harness, rt: &Texture<'_>) {
     assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
-    assert_eq!(h.set_texture(0, &rt), 0, "bind the filled texture");
+    assert_eq!(h.set_texture(0, rt), 0, "bind the filled texture");
     for (state, value) in [
         (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
         (D3DTSS_COLORARG1, D3DTA_TEXTURE),
@@ -3219,13 +3714,6 @@ fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
         "sample the regenerated mip"
     );
     assert_eq!(h.end_scene(), 0);
-    assert_eq!(h.present(), 0);
-
-    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
-    assert!(
-        center.g > 200 && center.r < 40 && center.b < 40,
-        "the small mip carries the fill colour, got {center:?}"
-    );
 }
 
 #[test]
@@ -7209,4 +7697,137 @@ fn uncleared_draw_into_a_render_target_texture_keeps_last_frames_pixels() {
         inside.g > 200 && inside.r < 40 && inside.b < 40,
         "inside the triangle the target shows the green draw, got {inside:?}"
     );
+}
+
+/// The first back buffer of `chain`, as a reference that is not tied to the swap chain's.
+///
+/// D3D9 keeps a swap chain alive for as long as its back buffer is referenced,
+/// so a test may release the swap chain first; the harness wrapper's lifetime
+/// would forbid exactly that.
+fn detached_back_buffer<'h>(chain: &SwapChain<'h>) -> Surface<'h> {
+    let borrowed = chain.back_buffer();
+    let raw = borrowed.as_ptr();
+    core::mem::forget(borrowed);
+    Surface::from_raw(raw)
+}
+
+/// An additional swap chain's back buffer stays usable after the swap chain's last release.
+///
+/// The back buffer pins its swap chain while the application holds it, so
+/// releasing the swap chain first leaves both alive, the back buffer still
+/// describing itself and naming its swap chain as its container. The back
+/// buffer is a `D3DPOOL_DEFAULT` resource the application holds, so `Reset`
+/// refuses until it goes; its release then returns the device reference its
+/// first reference took, and the device count ends where it started.
+#[test]
+fn an_additional_swap_chain_back_buffer_outlives_the_swap_chain_release() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let before = h.device_refcount();
+    let chain = h.additional_swapchain();
+    let back_buffer = detached_back_buffer(&chain);
+    drop(chain);
+
+    let (hr, desc) = back_buffer.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the held back buffer");
+    assert_eq!((desc.width, desc.height), (width, height));
+    let (hr, container, _) = back_buffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(hr, D3D_OK, "the back buffer still names its swap chain");
+    assert!(!container.is_null());
+    assert_eq!(
+        h.reset(width, height),
+        D3DERR_INVALIDCALL,
+        "Reset refuses while the application holds the back buffer"
+    );
+
+    drop(back_buffer);
+    assert_eq!(
+        h.device_refcount(),
+        before,
+        "the back buffer's release returns the device reference it took"
+    );
+    assert_eq!(
+        h.reset(width, height),
+        D3D_OK,
+        "Reset succeeds once the back buffer is gone"
+    );
+}
+
+/// What a test does with the device once a bound back buffer's swap chain is released.
+#[derive(Debug)]
+enum AfterRelease {
+    /// `GetRenderTarget(0)` hands the bound back buffer back.
+    GetRenderTarget,
+    /// `SetRenderTarget(0, implicit)` drops the device's binding.
+    SetRenderTarget,
+    /// `Reset` drops the binding as it restores render target 0.
+    Reset,
+}
+
+/// A bound additional swap chain back buffer survives the application releasing it and its chain.
+///
+/// The device's binding is a reference of its own, so the swap chain and its
+/// back buffer survive the application's last releases of the two, and
+/// `GetRenderTarget` hands the back buffer back alive. Replacing the binding,
+/// directly or through `Reset`, releases the swap chain with its back buffer,
+/// and the device count is back where it started: every device reference and
+/// `Reset` blocker the back buffer took was returned.
+#[test]
+fn a_bound_additional_swap_chain_back_buffer_survives_the_application_releases() {
+    for after in [
+        AfterRelease::GetRenderTarget,
+        AfterRelease::SetRenderTarget,
+        AfterRelease::Reset,
+    ] {
+        let h = Harness::new();
+        let (width, height) = h.dims();
+        let before = h.device_refcount();
+        {
+            let chain = h.additional_swapchain();
+            let back_buffer = chain.back_buffer();
+            assert_eq!(
+                h.set_render_target(0, &back_buffer),
+                D3D_OK,
+                "{after:?}: bind the back buffer"
+            );
+        }
+        match after {
+            AfterRelease::GetRenderTarget => {
+                let bound = h.render_target(0);
+                let (hr, desc) = bound.desc();
+                assert_eq!(hr, D3D_OK, "{after:?}: GetDesc on the bound back buffer");
+                assert_eq!((desc.width, desc.height), (width, height));
+                let (hr, container, _) = bound.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+                assert_eq!(
+                    hr, D3D_OK,
+                    "{after:?}: the bound back buffer names its swap chain"
+                );
+                assert!(!container.is_null());
+                drop(bound);
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::SetRenderTarget => {
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::Reset => {
+                assert_eq!(
+                    h.reset(width, height),
+                    D3D_OK,
+                    "{after:?}: the device's own binding does not block Reset"
+                );
+            }
+        }
+        assert_eq!(
+            h.device_refcount(),
+            before,
+            "{after:?}: the device count is back where it started"
+        );
+        assert_eq!(
+            h.reset(width, height),
+            D3D_OK,
+            "{after:?}: a later Reset succeeds"
+        );
+    }
 }

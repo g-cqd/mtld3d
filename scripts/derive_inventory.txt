@@ -36,6 +36,7 @@ unix/shared/src/mtl.rs LoadAction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MinMagFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MipFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs PresentDebugFlags Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs PresentWaitPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -103,7 +104,6 @@ windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
 windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/display_mode.rs ModeRequest Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/draw_data.rs AttrSnapshot Clone,Copy
-windows/core/src/draw_data.rs CurrentSnapshotPtr Clone,Copy
 windows/core/src/draw_data.rs DepthScissorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/draw_data.rs DepthStencilFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/draw_data.rs RenderStatePtr Clone,Copy
@@ -142,6 +142,8 @@ windows/core/src/dxso/ir.rs SrcOperand Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/ir.rs Swizzle Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/ir.rs TextureType Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/ir.rs WriteMask Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/dxso/link.rs Element Clone,Copy
+windows/core/src/dxso/link.rs Semantic Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/opcode.rs Opcode Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/encoder_data.rs DepthBinding Clone
 windows/core/src/encoder_data.rs FrameDataFlags Clone,Copy,Debug,Default,PartialEq,Eq
@@ -167,6 +169,7 @@ windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs CurrentAttachmentFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/passes.rs DepthClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs DepthLoad Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/passes.rs PassColorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/passes.rs PassDepthFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/passes.rs StencilClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs StencilLoad Clone,Copy,Debug,PartialEq,Eq
@@ -240,6 +243,8 @@ windows/tests/src/vertex.rs SpecularVertex Clone,Copy
 windows/tests/src/vertex.rs TexturedVertex Clone,Copy
 windows/tests/src/vertex.rs Vertex Clone,Copy
 windows/tests/src/win32.rs Rect Clone,Copy,PartialEq,Eq,Debug
+windows/tests/tests/e2e/bench_crossing.rs NarrowVertex Clone,Copy
+windows/tests/tests/e2e/bench_crossing.rs WideVertex Clone,Copy
 windows/tests/tests/e2e/draw.rs PaddedVertex Clone,Copy
 windows/tests/tests/e2e/points.rs PsizeVertex Clone,Copy
 windows/tests/tests/e2e/streams.rs PackedVertex Clone,Copy

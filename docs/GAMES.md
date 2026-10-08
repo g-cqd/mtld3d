@@ -14,6 +14,15 @@ the reason for each one.
 | Grand Theft Auto IV | Plays, `gta-iv` profile |
 | Call of Duty: Modern Warfare 2 | Plays, 64-bit |
 | Far Cry 2 | Plays, `farcry2` profile (reports an NVIDIA adapter so its alpha to coverage works) |
+| Assassin's Creed II | Plays, with EaglePatch |
+| Age of Empires II: HD Edition | Plays |
+| Kane & Lynch: Dead Men | Plays |
+| LEGO Indiana Jones 2: The Adventure Continues | Plays |
+| League of Legends 4.20 | Plays |
+| Need for Speed: Underground 2 | Plays, with the Widescreen Fix, ExtraOptions and XtendedInput |
+| Need for Speed: Most Wanted (2005) | Plays, with the Widescreen Fix and ExtraOptions |
+| Need for Speed: Carbon | Plays, with the Widescreen Fix |
+| Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
@@ -27,6 +36,7 @@ the [tracker](https://github.com/athei/mtld3d/issues); reports are welcome.
 Name the game, its version and whether it is 32-bit or 64-bit, the mtld3d
 release and the Wine or CrossOver version, and attach the log from
 `mtld3d-logs` next to the game's executable. A report of wrong rendering is
-easiest to act on with an F12 capture taken at the moment it shows
-([`ARCHITECTURE.md`](ARCHITECTURE.md#f12-three-frame-dump-and-gpu-capture)
+easiest to act on with a Ctrl+Shift+P capture taken at the moment it
+shows
+([`ARCHITECTURE.md`](ARCHITECTURE.md#ctrlshiftp-three-frame-dump-and-gpu-capture)
 says how).

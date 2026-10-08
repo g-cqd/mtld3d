@@ -106,7 +106,9 @@ impl PoolInner {
     ///
     /// The caller has checked that the pool is enabled.
     fn pop(&mut self, kind: LaneKind, logical_len: usize, gauge: &AtomicUsize) -> Option<PageBox> {
-        let class = PageBox::padded_len(logical_len) / PAGE_SIZE - 1;
+        // The page count less one, which is what the padded length names
+        // without forming it: a length too long to round up is oversize too.
+        let class = logical_len.max(1).div_ceil(PAGE_SIZE) - 1;
         let lane = &mut self.lanes[kind as usize];
         if class >= MAX_POOL_CLASSES {
             #[cfg(perf_tracking)]
@@ -157,7 +159,20 @@ impl StagingTake<'_> {
     ///
     /// Either way the contents are uninitialized, the contract of
     /// [`PageBox::new_uninit`].
+    ///
+    /// # Panics
+    ///
+    /// When no box is parked and the allocation fails, as
+    /// [`PageBox::new_uninit`] does.
     pub fn take(&mut self, logical_len: usize) -> PageBox {
+        self.try_take(logical_len).expect("PageBox alloc failed")
+    }
+
+    /// [`Self::take`] that answers `None` when no box is parked and the allocation fails.
+    ///
+    /// For the staging a texture gets at creation, the one place a staging
+    /// allocation may fail (see [`PageBox::try_new_uninit`]).
+    pub fn try_take(&mut self, logical_len: usize) -> Option<PageBox> {
         let Some(inner) = self.guard.as_mut() else {
             #[cfg(perf_tracking)]
             self.pool.record_acquire(
@@ -165,14 +180,14 @@ impl StagingTake<'_> {
                 diagnostics::Acquire::Disabled,
                 logical_len,
             );
-            return PageBox::new_uninit(logical_len);
+            return PageBox::try_new_uninit(logical_len);
         };
         if let Some(pb) = inner.pop(LaneKind::Staging, logical_len, &self.pool.pooled_bytes) {
             self.hits = self.hits.saturating_add(1);
-            return pb;
+            return Some(pb);
         }
         self.misses = self.misses.saturating_add(1);
-        PageBox::new_uninit(logical_len)
+        PageBox::try_new_uninit(logical_len)
     }
 
     /// Release the pool and report `(hits, misses)` for the device's counters.
@@ -180,6 +195,17 @@ impl StagingTake<'_> {
     pub fn finish(self) -> (u32, u32) {
         (self.hits, self.misses)
     }
+}
+
+/// Snapshot of one pool's VB/IB parks for the perf summary (see [`PageBoxPool::buffer_traffic`]).
+#[cfg(perf_tracking)]
+pub struct PoolTraffic {
+    /// Boxes the VB/IB lane has parked since the pool was made.
+    pub recycled: u64,
+    /// Padded bytes behind `recycled`.
+    pub recycled_bytes: u64,
+    /// Padded bytes parked across both lanes now.
+    pub parked_bytes: u64,
 }
 
 /// Bounded recycle pool for retired [`PageBox`]es.
@@ -368,18 +394,43 @@ impl PageBoxPool {
             .bytes
     }
 
-    /// Report process-pool totals on the renderer's existing performance cadence.
+    /// Report pool totals on the renderer's existing performance cadence.
     ///
     /// Counters include every device sharing this pool and never reset at frame boundaries.
     /// The snapshot uses the pool mutex, so each outcome partition is internally consistent.
+    /// `runtime` names the binary that owns the pool, closing the line, since each runtime
+    /// logs its own pool's.
     ///
     /// # Panics
     ///
     /// Panics if the pool mutex was poisoned.
     #[cfg(perf_tracking)]
-    pub fn log_diagnostics(&self) {
+    pub fn log_diagnostics(&self, runtime: &str) {
         let text = self.diagnostics_summary();
-        log::info!(target: "mtld3d::perf", "{text}");
+        log::info!(target: "mtld3d::perf", "{text} runtime={runtime}");
+    }
+
+    /// The VB/IB lane's parks so far and the bytes both lanes hold now, for the perf summary.
+    ///
+    /// The parks are cumulative; a reader deltas two of these. The texture
+    /// staging lane's parks are left out, as the summary's pool row counts
+    /// only the buffer lane's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool mutex was poisoned.
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn buffer_traffic(&self) -> PoolTraffic {
+        let (recycled, recycled_bytes) =
+            self.inner.lock().expect("PageBoxPool mutex poisoned").lanes[LaneKind::Buffer as usize]
+                .diagnostics
+                .parked();
+        PoolTraffic {
+            recycled,
+            recycled_bytes,
+            parked_bytes: self.pooled_bytes() as u64,
+        }
     }
 
     /// Padded bytes currently parked across both lanes (lock-free Relaxed read).
@@ -413,13 +464,13 @@ impl PageBoxPool {
         let cap_bytes = self.cap_bytes();
         if cap_bytes == 0 {
             #[cfg(perf_tracking)]
-            self.record_recycle(kind, diagnostics::Recycle::Disabled);
+            self.record_recycle(kind, diagnostics::Recycle::Disabled, pb.len());
             return Some(pb);
         }
         let class = pb.len() / PAGE_SIZE - 1;
         if class >= MAX_POOL_CLASSES {
             #[cfg(perf_tracking)]
-            self.record_recycle(kind, diagnostics::Recycle::Oversize);
+            self.record_recycle(kind, diagnostics::Recycle::Oversize, pb.len());
             return Some(pb);
         }
         let lane_cap = match kind {
@@ -432,12 +483,12 @@ impl PageBoxPool {
         let lane = &mut inner.lanes[kind as usize];
         if total + len > cap_bytes || lane.bytes + len > lane_cap {
             #[cfg(perf_tracking)]
-            lane.diagnostics.recycle(diagnostics::Recycle::Full);
+            lane.diagnostics.recycle(diagnostics::Recycle::Full, len);
             drop(inner);
             return Some(pb);
         }
         #[cfg(perf_tracking)]
-        lane.diagnostics.recycle(diagnostics::Recycle::Parked);
+        lane.diagnostics.recycle(diagnostics::Recycle::Parked, len);
         lane.bytes += len;
         self.pooled_bytes.store(total + len, Ordering::Relaxed);
         lane.classes[class].push(pb);
@@ -464,10 +515,10 @@ impl PageBoxPool {
     }
 
     #[cfg(perf_tracking)]
-    fn record_recycle(&self, kind: LaneKind, outcome: diagnostics::Recycle) {
+    fn record_recycle(&self, kind: LaneKind, outcome: diagnostics::Recycle, padded_len: usize) {
         self.inner.lock().expect("PageBoxPool mutex poisoned").lanes[kind as usize]
             .diagnostics
-            .recycle(outcome);
+            .recycle(outcome, padded_len);
     }
 }
 

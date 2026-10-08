@@ -207,11 +207,40 @@ pub const SAMPLE_FLOOR: Duration = Duration::from_micros(5);
 /// median of a few ticks from turning every third-tick call into one.
 pub const SPIKE_FLOOR: Duration = Duration::from_micros(50);
 
+/// The least time a single frame takes to count as a spike, whatever the median.
+///
+/// The frame benchmarks present without waiting for the display, so a frame
+/// that leaves its shader compiles to another thread has a median of tens of
+/// microseconds, and twice that is a preempted thread or a timer, not a
+/// stall anyone sees. A pipeline compile on the API thread takes
+/// milliseconds (one new shader a frame put the frame median at 11 ms on
+/// the v0.11.0 layer), so 1 ms still counts every frame that waited for
+/// one, and it is 6 % of a 60 Hz frame.
+pub const FRAME_SPIKE_FLOOR: Duration = Duration::from_millis(1);
+
 /// The fewest samples whose p99 a comparison reads as a time rather than as context.
 pub const MIN_P99_SAMPLES: usize = 50;
 
 /// Edge of every pattern texture, in texels.
 const TEXTURE_EDGE: u32 = 64;
+
+/// The `perf-kv` keys of the retention queues' bytes, which [`perf_rule`] records as `info`.
+///
+/// Each holds the entries of every frame still in flight at the window's
+/// worst frame, so it moves in whole frames of intake with the GPU's
+/// timing ([`Metrics::perf`] says what that leaves unjudged). Named one by
+/// one, so a footprint gauge added later with the same suffix stays
+/// `bytes`.
+const RETAINED_BYTES_KEYS: [&str; 2] = ["vbib_retained_bytes", "tex_staging_retained_bytes"];
+
+/// The `perf-kv` keys of process-wide memory, which [`perf_rule`] records as `info`.
+///
+/// The process footprint and the Metal device's allocated size count
+/// everything the process holds, the benchmark binary, Wine and the Metal
+/// driver's own allocations among it, and both carry what earlier
+/// benchmarks of the round left behind, so they move with the machine and
+/// the round's order rather than with the build.
+const PROCESS_BYTES_KEYS: [&str; 2] = ["process_footprint_bytes", "metal_allocated_bytes"];
 
 /// The shader model of a programmable material.
 pub enum Model {
@@ -354,9 +383,22 @@ impl FrameClock {
         FrameStats::of(&self.work)
     }
 
-    /// How many timed frames took longer than `limit`.
-    pub fn over(&self, limit: Duration) -> usize {
-        self.times.iter().filter(|&&time| time > limit).count()
+    /// Timed frames slower than twice the median and than [`FRAME_SPIKE_FLOOR`], and that limit.
+    ///
+    /// # Panics
+    /// Panics if no frame was timed.
+    pub fn spikes(&self) -> (usize, Duration) {
+        Self::spikes_of(&self.times)
+    }
+
+    /// The frames of `times` over twice their median and [`FRAME_SPIKE_FLOOR`], and that limit.
+    ///
+    /// # Panics
+    /// Panics if `times` is empty.
+    pub fn spikes_of(times: &[Duration]) -> (usize, Duration) {
+        let limit = (FrameStats::of(times).p50 * 2).max(FRAME_SPIKE_FLOOR);
+        let count = times.iter().filter(|&&time| time > limit).count();
+        (count, limit)
     }
 }
 
@@ -1228,6 +1270,78 @@ pub struct PassShape {
     pub ff_ps: u32,
     /// Textures the pass's draws sample, summed over the draws.
     pub textures: u32,
+    /// The pass's state mix, for a benchmark that reports one.
+    pub state: Option<PassState>,
+}
+
+/// The state mix of one render pass: shares, draw-to-draw switches and distinct shaders.
+///
+/// Each share counts draws: those with blending on, with alpha test on,
+/// with depth writes off (whether depth is on or not), culling nothing, and
+/// writing no colour to render target 0. A switch counts the draws after
+/// the pass's first whose value differs from the draw before: the vertex
+/// and the pixel shader (fixed function counting as one value), the stage-0
+/// texture (none counting as one), the blend state (enable, both factors,
+/// the operation and the separate-alpha states), the alpha test (enable,
+/// function and reference) and the cull mode. The distinct counts are the
+/// programmable vertex and pixel shaders and the textures bound on any stage.
+pub struct PassState {
+    /// Draws with blending on.
+    pub blend: u32,
+    /// Draws with the alpha test on.
+    pub atest: u32,
+    /// Draws with depth writes off.
+    pub zwrite_off: u32,
+    /// Draws with `D3DCULL_NONE`.
+    pub cull_none: u32,
+    /// Draws whose render target 0 colour write mask is 0.
+    pub cmask0: u32,
+    /// Draws whose vertex shader differs from the draw before.
+    pub vs_sw: u32,
+    /// Draws whose pixel shader differs from the draw before.
+    pub ps_sw: u32,
+    /// Draws whose stage-0 texture differs from the draw before.
+    pub tex_sw: u32,
+    /// Draws whose blend state differs from the draw before.
+    pub blend_sw: u32,
+    /// Draws whose alpha test differs from the draw before.
+    pub atest_sw: u32,
+    /// Draws whose cull mode differs from the draw before.
+    pub cull_sw: u32,
+    /// Distinct programmable vertex shaders.
+    pub vs_n: u32,
+    /// Distinct programmable pixel shaders.
+    pub ps_n: u32,
+    /// Distinct textures bound on any stage.
+    pub tex_n: u32,
+}
+
+impl PassState {
+    /// Append the 14 keys of the mix to `out`, each after a space.
+    ///
+    /// The keys and their order are part of the `shape` record's format
+    /// ([`Metrics`]), which the benchmark reports print too.
+    pub fn write_keys(&self, out: &mut String) {
+        let _ = write!(
+            out,
+            " blend={} atest={} zwrite_off={} cull_none={} cmask0={} vs_sw={} ps_sw={} \
+             tex_sw={} blend_sw={} atest_sw={} cull_sw={} vs_n={} ps_n={} tex_n={}",
+            self.blend,
+            self.atest,
+            self.zwrite_off,
+            self.cull_none,
+            self.cmask0,
+            self.vs_sw,
+            self.ps_sw,
+            self.tex_sw,
+            self.blend_sw,
+            self.atest_sw,
+            self.cull_sw,
+            self.vs_n,
+            self.ps_n,
+            self.tex_n,
+        );
+    }
 }
 
 /// A benchmark's numbers in the machine-read form of `bench-<name>.metrics`.
@@ -1260,7 +1374,10 @@ pub struct PassShape {
 ///   layer's `perf-kv` lines ([`Self::perf`] has the rules); a file without
 ///   them says why in a `# no perf-kv line` comment.
 /// - `shape <bench> pass <i> <W>x<H> draws=<n> ff_vs=<n> ff_ps=<n>
-///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark.
+///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark,
+///   followed by the [`PassState`] keys `blend= atest= zwrite_off=
+///   cull_none= cmask0= vs_sw= ps_sw= tex_sw= blend_sw= atest_sw= cull_sw=
+///   vs_n= ps_n= tex_n=`, each a count, when the benchmark reports them.
 ///
 /// A program comparing a base build with a candidate reads these, so the
 /// format is a contract: a record changes by adding a key or a metric, never
@@ -1497,7 +1614,7 @@ impl Metrics {
     pub fn shapes(&mut self, passes: &[PassShape]) {
         for (at, pass) in passes.iter().enumerate() {
             assert!(pass.draws > 0, "pass {at} of a scene has draws");
-            let _ = writeln!(
+            let _ = write!(
                 self.shapes,
                 "shape {bench} pass {at} {width}x{height} draws={draws} ff_vs={ff_vs} \
                  ff_ps={ff_ps} tex_per_draw={per_draw:.2}",
@@ -1509,6 +1626,10 @@ impl Metrics {
                 ff_ps = pass.ff_ps,
                 per_draw = f64::from(pass.textures) / f64::from(pass.draws),
             );
+            if let Some(state) = &pass.state {
+                state.write_keys(&mut self.shapes);
+            }
+            self.shapes.push('\n');
         }
     }
 
@@ -1531,10 +1652,28 @@ impl Metrics {
     ///   weighted by the event's count where the line carries it
     ///   (`comp_async_latency_avg_ms` by `comp_async_installs_total`) and by
     ///   frames otherwise.
-    /// - `_bytes`, a peak size: `perf.<key>` in bytes, `bytes`, the largest.
+    /// - `_bytes`, a peak size: `perf.<key>` in bytes, the largest; `bytes`,
+    ///   but `info` for the two retention queues' bytes
+    ///   ([`RETAINED_BYTES_KEYS`]), which hold the entries of every frame
+    ///   still in flight at the window's worst frame, so one more frame in
+    ///   flight moves them by a whole frame's intake. A change that keeps a
+    ///   queue's entries up to a frame or so longer than the frames in
+    ///   flight reaches no judged row: it reads the same as the GPU running
+    ///   three frames behind instead of four. What stays judged is what
+    ///   enters a queue: for VB/IB, the bytes renamed per frame
+    ///   (`vbib_rename_bytes_total`, `noisy`) and the retention cap's counts
+    ///   (`vbib_ret_cap_*_total`, `noisy`, which on a zero base need more
+    ///   than two a frame); for textures, the uploads per frame
+    ///   (`tex_uploads_total`, `exact` over [`FrameWork::Fixed`] frames),
+    ///   with no cap on that queue. The process footprint and the Metal
+    ///   device's allocated size ([`PROCESS_BYTES_KEYS`]) are `info` too:
+    ///   they count the whole process, Wine and the driver included, and
+    ///   what earlier benchmarks of the round left in it.
     /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
     ///   for a cache size (`cache_*_count`) when the frames are
-    ///   [`FrameWork::Fixed`], `noisy` otherwise.
+    ///   [`FrameWork::Fixed`], `info` for a retention queue's peak depth
+    ///   (`*_retention_peak_count`), which moves with the frames in flight
+    ///   as its bytes do, `noisy` otherwise.
     /// - `_total`, a window's count: `perf.<key less _total>_pf`, the
     ///   windows' totals over their frames to three places, in bytes for a
     ///   `_bytes_total` and in counts otherwise. A count the API calls fix
@@ -1546,7 +1685,7 @@ impl Metrics {
     ///   because a window lasts two seconds, not a number of frames, so its
     ///   totals grow with the frame rate.
     ///
-    /// A key a window leaves out (`docs/ARCHITECTURE.md` names the three that
+    /// A key a window leaves out (`docs/ARCHITECTURE.md` names the ones that
     /// can be) is recorded only when every window read carries it, so each
     /// value covers the same windows; a comparison reports a key some rounds
     /// of a leg carry and others do not as incomplete, not judged.
@@ -1990,11 +2129,19 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
         return rule(own(), Fold::FrameMean(set), PerfUnit::Ms, 4, Class::Time);
     }
     if key.ends_with("_bytes") {
-        return rule(own(), Fold::Max, PerfUnit::Bytes, 0, Class::Bytes);
+        let class = if RETAINED_BYTES_KEYS.contains(&key) || PROCESS_BYTES_KEYS.contains(&key) {
+            Class::Info
+        } else {
+            Class::Bytes
+        };
+        return rule(own(), Fold::Max, PerfUnit::Bytes, 0, class);
     }
     if key.ends_with("_count") {
+        // A retention peak counts the entries of every frame still in flight.
         let class = if fixed && key.starts_with("cache_") {
             Class::Exact
+        } else if key.ends_with("_retention_peak_count") {
+            Class::Info
         } else {
             Class::Noisy
         };
@@ -2018,15 +2165,17 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
 ///
 /// Draws, passes, commands, the calls of every API, device, bind, surface
 /// and keys-gating row and the keys gate's skips, texture uploads and
-/// dirty rects, user-pointer draws, generated fans and staging uploads: a
-/// frame that repeats the calls of the one before repeats these. Anything
-/// else counts events that depend on how the CPU and the GPU overlap.
+/// dirty rects, user-pointer draws, generated fans, draws off the stack
+/// pin and staging uploads: a frame that repeats the calls of the one
+/// before repeats these. Anything else counts events that depend on how
+/// the CPU and the GPU overlap.
 fn structural(base: &str) -> bool {
-    const WHOLE: [&str; 5] = [
+    const WHOLE: [&str; 6] = [
         "draws",
         "passes",
         "commands",
         "fan_generated",
+        "draw_unpinned",
         "vbib_staging_uploads",
     ];
     const PREFIX: [&str; 4] = ["tex_uploads", "tex_dirtyrect", "up_", "keys_"];

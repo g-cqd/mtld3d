@@ -2,10 +2,12 @@ use core::ffi::c_void;
 
 use log::trace;
 use mtld3d_core::{
+    api_lock::ApiGuard,
+    held_pages::{HeldPages, PageHolder},
     page_box::PageBox,
     perf::SurfaceSubCategory,
     render_scale::RenderScale,
-    stretch_rect::{StretchRegion, parse_rect},
+    stretch_rect::StretchRegion,
     surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
 };
 use mtld3d_shared::{
@@ -24,9 +26,6 @@ use super::{
     encoder::ResampledUpload, null_out, private_data::PrivateDataStore, texture::Direct3DTexture9,
     unix_call::unix_call,
 };
-
-mod backbuffer_snapshot;
-use backbuffer_snapshot::BackbufferSnapshot;
 
 static DIRECT3D_SURFACE9_VTBL: IDirect3DSurface9Vtbl = IDirect3DSurface9Vtbl {
     query_interface: surface_query_interface,
@@ -116,10 +115,13 @@ pub enum ImplicitKind {
 ///   every `LockRect`, and turns an `UnlockRect` of an unmapped sub-resource
 ///   into a no-op success (the D3D9 behavior the conformance test asserts).
 /// * `held_dc` — the GDI objects of that outstanding `GetDC`.
+/// * `holder`: the `(cube face, mip level)` whose `GetDC` returned them, the
+///   one subresource whose `ReleaseDC` may give them back.
 pub struct DcLockState {
     map_count: u32,
     dc_in_use: bool,
     held_dc: GdiDc,
+    holder: (u32, u32),
 }
 
 impl Default for DcLockState {
@@ -128,6 +130,7 @@ impl Default for DcLockState {
             map_count: 0,
             dc_in_use: false,
             held_dc: GdiDc::NULL,
+            holder: (u32::MAX, 0),
         }
     }
 }
@@ -356,6 +359,10 @@ impl Direct3DSurface9 {
     /// [`ImplicitKind`]). `container` is the implicit swapchain wrapper
     /// `GetContainer` returns.
     pub fn new_implicit_backbuffer(device_inner: *mut DeviceInner, container: u64) -> Self {
+        Self::backbuffer(device_inner, container, SurfaceFlags::empty())
+    }
+
+    fn backbuffer(device_inner: *mut DeviceInner, container: u64, flags: SurfaceFlags) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
             parent_texture: core::ptr::null_mut(),
@@ -377,7 +384,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
-            flags: SurfaceFlags::empty(),
+            flags,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -620,7 +627,7 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            system_memory: Some(backing),
+            system_memory: Some(HeldPages::new(backing, PageHolder::Surface)),
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -652,7 +659,8 @@ impl Direct3DSurface9 {
         // freshly created by `new_color_target` (refcount 1); access is
         // exclusive: D3D9 objects are single-threaded, or serialised by the
         // device `ApiLock` under `D3DCREATE_MULTITHREADED`.
-        unsafe { &mut *self.inner }.system_memory = Some(backing);
+        unsafe { &mut *self.inner }.system_memory =
+            Some(HeldPages::new(backing, PageHolder::Surface));
     }
 
     fn inner(&self) -> &SurfaceInner {
@@ -849,6 +857,20 @@ impl Direct3DSurface9 {
     /// pool for an offscreen-plain one.
     pub fn standalone_pool(&self) -> u32 {
         self.inner().standalone_pool
+    }
+
+    /// `D3DUSAGE_*` flags `GetDesc` reports for this surface.
+    ///
+    /// A texture-level surface reports its parent texture's usage, a
+    /// standalone surface the usage it was created with.
+    pub fn d3d_usage(&self) -> u32 {
+        let parent = self.parent_texture();
+        if parent.is_null() {
+            return self.inner().standalone_usage;
+        }
+        // SAFETY: `parent` is non-null (checked above) and a surface keeps a
+        // reference on its parent texture for its whole lifetime.
+        unsafe { &*parent }.d3d_usage()
     }
 
     /// D3D9 format of this surface when bound as a depth attachment (D3DFMT_*).
@@ -1178,19 +1200,19 @@ struct SurfaceInner {
     /// [`SurfaceMultiSample::NONE`] for every texture-backed or system-memory
     /// surface; an implicit surface resolves its own live from the device.
     multi_sample: SurfaceMultiSample,
-    /// Page-aligned backbuffer snapshot exposed by `LockRect` or `GetDC`.
+    /// Page-aligned PE-addressable readback buffer held between `LockRect` and `UnlockRect`.
     ///
-    /// The matching `UnlockRect` or `ReleaseDC` uploads writable contents and
-    /// releases the page. The lock state prevents either API from replacing
-    /// storage still exposed by the other.
-    readback: Option<BackbufferSnapshot>,
+    /// Allocated on the `LockRect` readback path (backbuffer), dropped on
+    /// `UnlockRect`. Persists across the Lock so the game can read the returned
+    /// pointer.
+    readback: Option<HeldPages>,
     /// Backing store for a `D3DPOOL_SYSTEMMEM` offscreen plain surface.
     ///
     /// From `CreateOffscreenPlainSurface`. Allocated full-size at creation;
     /// `GetRenderTargetData`/`GetFrontBufferData` blit a render target's pixels
     /// into it, and `LockRect` hands back a pointer into it. `None` for every
     /// GPU-backed surface kind.
-    system_memory: Option<PageBox>,
+    system_memory: Option<HeldPages>,
     /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
     ///
     /// Any stored `IUnknown` is released when this `SurfaceInner` drops.
@@ -1216,9 +1238,10 @@ struct SurfaceInner {
     /// `D3DLOCK_*` flags captured by the most recent successful `LockRect`.
     ///
     /// Consumed by `UnlockRect`. Only meaningful for a lockable standalone
-    /// render target or backbuffer: a `D3DLOCK_READONLY` lock skips the staging→GPU
-    /// upload on unlock (the staging was filled by a read-back, never written,
-    /// so re-uploading it would clobber the rendered pixels). `0` otherwise.
+    /// render target and for the back buffer: a `D3DLOCK_READONLY` lock must
+    /// skip the write-back to the GPU on unlock (its pages were filled by a
+    /// read-back, never written, so pushing them back would clobber the
+    /// rendered pixels). `0` otherwise.
     lock_flags: u32,
     /// Non-null for a container-cached texture shell, where it equals `parent_texture`.
     ///
@@ -1283,25 +1306,6 @@ impl SurfaceInner {
     /// `GetDC` anywhere on the resource blocks it; so does this surface already
     /// being mapped (same-face double-lock).
     fn try_begin_lock(&mut self) -> Result<(), i32> {
-        // A cube face and its parent cube map one subresource through two
-        // objects, so a face lock has to see the cube's per-subresource lock
-        // state: a level already locked through the cube's own `LockRect` makes
-        // locking the face INVALIDCALL. Checked before this surface records
-        // anything, so a rejected lock leaves the per-face flag and the shared
-        // map count untouched.
-        if self.cube_face != u32::MAX && !self.state_owner_texture.is_null() {
-            // SAFETY: `state_owner_texture` is the owning cube texture, set at
-            // construction and outliving the face; access is exclusive: D3D9
-            // objects are single-threaded, or serialised by the device
-            // `ApiLock` under `D3DCREATE_MULTITHREADED`.
-            let cube = unsafe { &*self.state_owner_texture };
-            if cube
-                .inner()
-                .cube_is_locked(self.cube_face, self.mip_level as usize)
-            {
-                return Err(D3DERR_INVALIDCALL);
-            }
-        }
         let shared = self.dc_lock_ptr();
         // SAFETY: `shared` is the live resource-wide state (own field or the
         // owning cube texture's); access is exclusive (D3D9 objects are
@@ -1707,7 +1711,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireColorOp { retired });
+        unsafe { &mut *inner.device_inner }.retire_color_target(retired);
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1730,7 +1734,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireDepthOp { depth });
+        unsafe { &mut *inner.device_inner }.retire_depth_target(depth);
     }
     // A texture shell has nothing of the texture to give back here. The
     // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by
@@ -1963,6 +1967,19 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
         // Standalone surface: it pins the device for its public lifetime, so
         // its own pointer cannot go stale under it.
         inner.device_wrapper()
+    }
+    fn enter_api_lock(&self) -> ApiGuard {
+        let inner = self.inner();
+        // A surface that belongs to a texture is covered by the lock the
+        // texture carries, which outlives the texture's device; see
+        // `owning_device` for why the container is the one to ask.
+        if !inner.parent_texture.is_null() {
+            // SAFETY: as in `owning_device`, the parent texture is live for as
+            // long as a public reference to this surface is.
+            let parent = unsafe { &*inner.parent_texture };
+            return parent.enter_api_lock();
+        }
+        crate::device::device_api_lock(inner.device_wrapper())
     }
     fn finalizes_on_zero(&self) -> bool {
         // Implicit surfaces are never freed by `Release` — they are destroyed
@@ -2263,6 +2280,15 @@ extern "system" fn surface_lock_rect(
                 .flags
                 .contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
         {
+            if tex.is_depth_format() {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a depth texture (a lockable \
+                     depth format included: no CPU copy of depth is kept) → INVALIDCALL");
+            } else {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a non-dynamic D3DPOOL_DEFAULT \
+                     texture → INVALIDCALL");
+            }
             return D3DERR_INVALIDCALL;
         }
         mtld3d_shared::crumb!(
@@ -2273,23 +2299,18 @@ extern "system" fn surface_lock_rect(
         // a live `Direct3DTexture9` whose refcount keeps it alive while
         // this surface is live.
         if obj.inner().cube_face != u32::MAX {
-            // SAFETY: `obj.inner` is this live face surface's inner allocation.
-            let inner = unsafe { &mut *obj.inner };
-            if let Err(hr) = inner.try_begin_lock() {
-                return hr;
-            }
-            let hr = crate::texture::cube_lock_rect(
+            // A face and its cube map one subresource, so the cube's per-face
+            // lock is the face surface's lock too: either object's `UnlockRect`
+            // ends a lock either one took. The cube refuses a second lock and
+            // a lock under an outstanding DC.
+            return crate::texture::cube_lock_rect(
                 parent_tex.cast::<c_void>(),
-                inner.cube_face,
-                inner.mip_level,
+                obj.inner().cube_face,
+                obj.inner().mip_level,
                 locked_rect,
                 rect,
                 flags,
             );
-            if hr != D3D_OK {
-                let _ = inner.try_end_lock();
-            }
-            return hr;
         }
         // SAFETY: `parent_tex` is non-null and held live by the surface.
         let tex_vtbl = unsafe { (*parent_tex).vtbl() };
@@ -2322,11 +2343,7 @@ extern "system" fn surface_lock_rect(
         return match route {
             ColorSurfaceLock::Staging => lockable_rt_lock_rect(&obj, locked_rect, rect, flags),
             ColorSurfaceLock::BackBufferReadback => {
-                // SAFETY: the ABI supplies a readable RECT or null for the whole surface.
-                let rect = unsafe { ValueIn::<D3DRECT>::read_opt(rect) };
-                // SAFETY: the ABI supplies a writable output, checked non-null above.
-                let out = unsafe { &mut *locked_rect };
-                backbuffer_lock_readback(&obj, out, rect, flags)
+                backbuffer_lock_readback(&obj, locked_rect, rect, flags)
             }
             ColorSurfaceLock::Reject => {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -2340,7 +2357,8 @@ extern "system" fn surface_lock_rect(
         return systemmem_lock_rect(&obj, locked_rect, rect);
     }
     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-        "stub IDirect3DSurface9::LockRect on standalone non-color surface → INVALIDCALL"
+        "IDirect3DSurface9::LockRect on a depth-stencil surface (a lockable depth format \
+         included: no CPU copy of depth is kept) → INVALIDCALL"
     );
     D3DERR_INVALIDCALL
 }
@@ -2355,17 +2373,21 @@ extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
     let parent_tex = obj.inner().parent_texture;
     if !parent_tex.is_null() {
         if obj.inner().cube_face != u32::MAX {
-            // SAFETY: `obj.inner` is this live face surface's inner allocation.
-            let inner = unsafe { &mut *obj.inner };
-            let surface_hr = inner.try_end_lock();
-            if surface_hr != D3D_OK {
-                return surface_hr;
+            let (face, level) = (obj.inner().cube_face, obj.inner().mip_level);
+            // SAFETY: `parent_tex` is non-null (checked above) and points to the
+            // live cube texture whose refcount keeps it alive while this face
+            // surface is live.
+            let cube = unsafe { (*parent_tex).inner() };
+            // Unmapping an unmapped face is INVALIDCALL, except while a `GetDC`
+            // is outstanding on the cube, when it is a no-op success.
+            if !cube.cube_is_locked(face, level as usize) {
+                return if cube.dc_in_use() {
+                    D3D_OK
+                } else {
+                    D3DERR_INVALIDCALL
+                };
             }
-            return crate::texture::cube_unlock_rect(
-                parent_tex.cast::<c_void>(),
-                inner.cube_face,
-                inner.mip_level,
-            );
+            return crate::texture::cube_unlock_rect(parent_tex.cast::<c_void>(), face, level);
         }
         // An offscreen-plain D3DPOOL_DEFAULT surface (it owns its backing texture)
         // rejects an unlock-without-lock / double-unlock with INVALIDCALL, unlike
@@ -2409,7 +2431,8 @@ extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
         // A lockable standalone render target also carries a renderable colour
         // handle: push the just-written staging up to that GPU texture before
         // closing the lock so `StretchRect`/sampling observe the new pixels.
-        // (A staging-less colour surface takes the snapshot path below.) A `D3DLOCK_READONLY` lock
+        // (A staging-less colour surface never reaches here — its `UnlockRect`
+        // falls through to the read-back drop below.) A `D3DLOCK_READONLY` lock
         // never wrote the staging (it only read the read-back), so uploading it
         // would clobber the rendered pixels with a stale copy — skip the upload.
         let read_only = inner.lock_flags & D3DLOCK_READONLY != 0;
@@ -2425,159 +2448,268 @@ extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
         // the (shared cube) resource is a no-op success — see `try_end_lock`.
         return inner.try_end_lock();
     }
-    // GetDC owns the same snapshot slot without a LockRect mapping. Its
-    // no-op UnlockRect must leave the page alive until ReleaseDC tears down
-    // the DIB; only a mapped backbuffer may upload and release this page.
-    if !inner.flags.contains(SurfaceFlags::MAPPED) {
-        return inner.try_end_lock();
+    // Standalone colour surface (the back-buffer read-back path). A successful
+    // `LockRect` recorded the lock and stashed its page in `readback`, so
+    // ending that lock drops the page (the performance-critical portrait
+    // Lock→read→Unlock cycle). Without a lock `try_end_lock` answers: a no-op
+    // S_OK while a `GetDC` holds the same page, which must survive until
+    // `ReleaseDC` writes it back, and INVALIDCALL otherwise (a double unlock,
+    // or a non-lockable render target whose `LockRect` was refused).
+    // A writable lock of a lockable back buffer mapped a read-back of the
+    // whole surface, and what the application wrote exists only there until
+    // it is pushed into the back buffer the way `ReleaseDC` pushes GDI's
+    // drawing.
+    let was_mapped = inner.flags.contains(SurfaceFlags::MAPPED);
+    let wrote = was_mapped && core::mem::take(&mut inner.lock_flags) & D3DLOCK_READONLY == 0;
+    let hr = inner.try_end_lock();
+    if wrote && inner.is_lockable_backbuffer() {
+        backbuffer_page_upload(inner);
     }
-    if inner.readback.is_none() {
-        let _ = inner.try_end_lock();
-        return D3DERR_INVALIDCALL;
+    if was_mapped {
+        inner.readback = None;
     }
-    if inner.lock_flags & D3DLOCK_READONLY == 0 {
-        backbuffer_snapshot_upload(inner);
-    }
-    inner.readback = None;
-    inner.try_end_lock()
+    hr
 }
 
-/// Map a synchronous backbuffer snapshot until `UnlockRect`.
+/// Synchronous backbuffer readback.
 ///
-/// Read-only locks copy only the requested region. Writable locks keep the
-/// full snapshot so uploading a changed subrectangle preserves its neighbours.
+/// Flush the in-progress frame to Metal so the most recent draws land in the
+/// backbuffer texture, then blit the requested sub-rect into a page-aligned
+/// PE-heap buffer that stays alive until `UnlockRect`. `WoW` uses this for
+/// character portraits (a small sub-rect blit back to a game-side texture).
 fn backbuffer_lock_readback(
     obj: &Direct3DSurface9,
-    out: &mut D3DLOCKED_RECT,
-    rect: Option<D3DRECT>,
+    locked_rect: *mut D3DLOCKED_RECT,
+    rect: *const c_void,
     flags: u32,
 ) -> i32 {
-    // SAFETY: `obj.inner` is this live wrapper's allocation; the device API
-    // lock or D3D9's single-threaded contract makes this borrow exclusive.
-    let inner = unsafe { &mut *obj.inner };
-    let read_only = flags & D3DLOCK_READONLY != 0;
-    if !read_only && !inner.is_lockable_backbuffer() {
+    let inner_ptr = obj.inner;
+    // SAFETY: `inner_ptr` is the live `SurfaceInner` allocation for this
+    // wrapper; access is exclusive (D3D9 objects are single-threaded, or
+    // serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so
+    // the exclusive borrow is sound for the duration of this fn.
+    let inner = unsafe { &mut *inner_ptr };
+
+    // A backbuffer created with D3DPRESENTFLAG_LOCKABLE_BACKBUFFER accepts a
+    // LockRect with any flags (e.g. D3DLOCK_DISCARD); a non-lockable backbuffer
+    // rejects a non-READONLY lock. The portrait read-back path (WoW) always
+    // locks D3DLOCK_READONLY, so it is unaffected either way.
+    let lockable = inner.is_lockable_backbuffer();
+    if flags & D3DLOCK_READONLY == 0 && !lockable {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "backbuffer writable LockRect on a non-lockable backbuffer → INVALIDCALL"
+            "backbuffer LockRect without D3DLOCK_READONLY (flags={flags:#x}) on a non-lockable backbuffer → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
     }
-    let (width, height) = (inner.live_width(), inner.live_height());
-    let region = match parse_rect(rect.map(|r| (r.x1, r.y1, r.x2, r.y2)), width, height) {
-        Ok(region) => region,
-        Err(reason) => {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: reason.key(),
-                "back-buffer LockRect: {} → INVALIDCALL",
-                reason.as_str()
-            );
-            return D3DERR_INVALIDCALL;
-        }
-    };
-    let format = inner.live_format();
-    let Some(mapping) = mtld3d_core::format::map_d3d_format(format) else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "colour-surface LockRect: no format mapping for {format:#x} → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    };
-    let bpp = mapping.bytes_per_pixel();
-    if bpp == 0 || region.w == 0 || region.h == 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer LockRect: format {format:#x} has no read-back layout or the locked \
-             area is empty → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
-    // Publishing the map before reading back rejects a second lock without
-    // replacing the page still exposed to the first caller. The back buffer
-    // takes the surface lock state like every other lockable surface, so a
-    // `GetDC` on it that is still outstanding refuses the lock as well.
+    // The read-back page is what the lock maps, and a `GetDC` wraps the same
+    // slot, so the back buffer takes the surface lock state like every other
+    // lockable surface: a second lock or a lock under an outstanding DC is
+    // refused before anything replaces the page the first one handed out.
     if let Err(hr) = inner.try_begin_lock() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "backbuffer LockRect while the back buffer is already locked or a GetDC on it is outstanding → INVALIDCALL"
         );
         return hr;
     }
-    let snapshot_region = if read_only {
-        region
+    // A writable lock maps the whole surface: what the application writes
+    // goes back into the back buffer at `UnlockRect`, which takes the whole
+    // page the way `ReleaseDC` takes a DC's. A read-only one reads only the
+    // rect it names, the portrait path's cost.
+    let hr = if flags & D3DLOCK_READONLY == 0 {
+        backbuffer_map_for_write(inner, locked_rect, rect)
     } else {
-        StretchRegion {
-            x: 0,
-            y: 0,
-            w: width,
-            h: height,
-        }
+        backbuffer_read_into_lock(inner, locked_rect, rect)
     };
-    let Some((mut page, pitch)) = readback_backbuffer_region(inner, snapshot_region) else {
+    if hr == D3D_OK {
+        inner.lock_flags = flags;
+    } else {
         let _ = inner.try_end_lock();
-        return D3DERR_INVALIDCALL;
-    };
-    let offset = if read_only {
-        Some(0)
-    } else {
-        (region.y as usize)
-            .checked_mul(pitch as usize)
-            .and_then(|row| {
-                (region.x as usize)
-                    .checked_mul(bpp as usize)
-                    .and_then(|column| row.checked_add(column))
-            })
-    };
-    let Some(pixels) = offset.and_then(|offset| page.as_mut_slice().get_mut(offset..)) else {
+    }
+    hr
+}
+
+/// Map `rect` of a lockable back buffer for writing, through a read-back of the whole surface.
+///
+/// The page is the one `GetDC` reads into, at the surface's host-visible
+/// pitch, which is the pitch the lock reports, and `bits` points at the rect's
+/// first texel inside it. The caller has recorded the lock; on a failure it is
+/// the caller that takes the record back.
+fn backbuffer_map_for_write(
+    inner: &mut SurfaceInner,
+    locked_rect: *mut D3DLOCKED_RECT,
+    rect: *const c_void,
+) -> i32 {
+    let (x, y, w, h) = parse_surface_rect(rect, inner.live_width(), inner.live_height());
+    if w == 0 || h == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer LockRect: the locked origin lies outside the read-back page → INVALIDCALL");
-        let _ = inner.try_end_lock();
+            "back-buffer LockRect: the locked area is empty → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    let Some((_, _, bytes_per_row)) = readback_full_backbuffer(inner) else {
         return D3DERR_INVALIDCALL;
     };
-    out.pitch = pitch.cast_signed();
-    out.bits = pixels.as_mut_ptr().cast::<c_void>();
-    inner.lock_flags = flags;
-    inner.readback = Some(BackbufferSnapshot { page, region });
+    let bytes_per_pixel = mtld3d_core::format::map_d3d_format(inner.live_format())
+        .map_or(0, |mapping| mapping.bytes_per_pixel());
+    let offset = (y as usize)
+        .saturating_mul(bytes_per_row as usize)
+        .saturating_add((x as usize).saturating_mul(bytes_per_pixel as usize));
+    let Some(page) = inner.readback.as_mut().filter(|page| offset < page.len()) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the read-back page does not reach the locked rect → INVALIDCALL");
+        inner.readback = None;
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `locked_rect` is non-null (checked by the caller before
+    // entry) and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`
+    // slot owned by the caller.
+    let out = unsafe { &mut *locked_rect };
+    out.pitch = bytes_per_row.cast_signed();
+    out.bits = page.as_mut_slice()[offset..].as_mut_ptr().cast::<c_void>();
     D3D_OK
 }
 
-/// Copy a logical backbuffer region into owned, page-aligned storage.
+/// Read the back buffer, or `rect` of it, into the page a successful back-buffer lock maps.
 ///
-/// Flushes pending rendering before the synchronous readback. The pitch fits
-/// a positive `D3DLOCKED_RECT::Pitch`; failure publishes no snapshot.
-fn readback_backbuffer_region(
+/// The caller has recorded the lock; on a failure it is the caller that
+/// takes the record back.
+fn backbuffer_read_into_lock(
     inner: &mut SurfaceInner,
-    region: StretchRegion,
-) -> Option<(PageBox, u32)> {
-    let (full_width, full_height) = (inner.live_width(), inner.live_height());
+    locked_rect: *mut D3DLOCKED_RECT,
+    rect: *const c_void,
+) -> i32 {
+    // Implicit backbuffer surface resolves its extent + Metal handle live from
+    // the device (see `ImplicitKind`) — read before borrowing `device_inner`
+    // below so the two derefs of the raw device pointer never overlap.
+    let full_w = inner.live_width();
+    let full_h = inner.live_height();
     let tex_handle = inner.live_color_handle();
+    let (x, y, w, h) = parse_surface_rect(rect, full_w, full_h);
+    if w == 0 || h == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the locked area is empty → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+
+    // The read-back page is a host-visible store, so it takes the one pitch
+    // every host-visible store of this format uses: the blit writes rows at it,
+    // `LockRect` reports it, and a `GetDC` DIB over the same page steps by it.
+    // A back buffer is not pinned to `X8R8G8B8`, so the pitch comes from the
+    // surface's own format rather than a fixed four bytes per texel.
     let format = inner.live_format();
-    if inner.device_inner.is_null() || tex_handle.is_null() || region.w == 0 || region.h == 0 {
+    let Some(fmt) = mtld3d_core::format::map_d3d_format(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer read-back: nothing to read back ({}x{}, texture {:#x}, {}) → INVALIDCALL",
-            region.w, region.h, tex_handle.raw(),
-            if inner.device_inner.is_null() { "no owning device" } else { "owning device present" });
-        return None;
-    }
-    let bytes_per_pixel =
-        mtld3d_core::format::map_d3d_format(format).map_or(0, |mapping| mapping.bytes_per_pixel());
-    if bytes_per_pixel == 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer read-back: format {format:#x} has no read-back layout → INVALIDCALL");
-        return None;
-    }
-    let bytes_per_row = mtld3d_core::format::linear_row_pitch(region.w, bytes_per_pixel);
-    let bytes = i32::try_from(bytes_per_row)
-        .ok()
-        .and_then(|_| (bytes_per_row as usize).checked_mul(region.h as usize));
-    let Some(bytes) = bytes.filter(|&bytes| bytes != 0 && isize::try_from(bytes).is_ok()) else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer read-back: the {}x{} page is empty or too large → INVALIDCALL",
-            region.w, region.h);
-        return None;
+            "colour-surface LockRect: no format mapping for {format:#x} → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
     };
+    if fmt.bytes_per_pixel() == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "colour-surface LockRect: block-compressed format {format:#x} has no read-back layout → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, fmt.bytes_per_pixel());
+    let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
+    if bytes == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the read-back page would be empty → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     let mut page = PageBox::new_uninit(bytes);
-    // SAFETY: `device_inner` is non-null and the owning device outlives its
-    // child surface; its allocation is distinct from the surface's inner.
+
+    if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the surface has no owning device → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
+    // live `DeviceInner`; non-null here, and the device outlives all
+    // its child resources per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
     if let Err(hr) = device_inner.flush_current_frame_blocking() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer read-back: flushing the frame failed ({hr:#x}) → INVALIDCALL");
+            "back-buffer LockRect: flushing the frame before the read-back failed → {hr:#x}");
+        return hr;
+    }
+
+    let mut params = BlitTextureToBufferParams {
+        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        stencil_bytes_per_row: 0,
+        stencil_offset: 0,
+        record_handle: device_inner.record_handle(),
+        device_handle: device_inner.device_handle(),
+        tex_handle,
+        dst_ptr: page.as_mut_ptr() as u64,
+        dst_len: page.len() as u64,
+        mip_level: 0,
+        origin_x: x,
+        origin_y: y,
+        width: w,
+        height: h,
+        bytes_per_row,
+        slice: 0,
+        // `x/y/w/h` are a sub-rect of the full logical surface, which is what
+        // `parse_surface_rect` clamped them against. The unix side resolves the
+        // whole frame to this size before cropping, so the sub-rect lands where
+        // the game expects and `bytes_per_row` above stays logical.
+        source_width: full_w,
+        source_height: full_h,
+        // BGRA8 back buffer: a block row is a pixel row.
+        block_height: 1,
+    };
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "backbuffer LockRect: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+
+    // SAFETY: `locked_rect` is non-null (checked by the caller before
+    // entry) and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`
+    // slot owned by the caller.
+    let out = unsafe { &mut *locked_rect };
+    out.pitch = bytes_per_row.cast_signed();
+    out.bits = page.as_mut_ptr().cast::<c_void>();
+    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
+    D3D_OK
+}
+
+/// Read the FULL implicit backbuffer texture into a fresh PE-heap page.
+///
+/// The page is held on `inner.readback`, returning `(width, height,
+/// bytes_per_row)` or `None` on failure. Used by `GetDC` on the backbuffer (the
+/// `LockRect` portrait path has its own sub-rect variant above). The page is
+/// what the DC's DIB wraps, so it is sized and written at the surface format's
+/// host-visible pitch, which is the stride GDI derives for a DIB of the same
+/// width and bit count.
+fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)> {
+    if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: the surface has no owning device → INVALIDCALL");
+        return None;
+    }
+    let w = inner.live_width();
+    let h = inner.live_height();
+    let tex_handle = inner.live_color_handle();
+    let format = inner.live_format();
+    let bytes_per_pixel =
+        mtld3d_core::format::map_d3d_format(format).map_or(0, |mapping| mapping.bytes_per_pixel());
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, bytes_per_pixel);
+    let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
+    if tex_handle.is_null() || bytes == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: nothing to read back ({w}x{h}, format {format:#x}, \
+             texture {:#x}) → INVALIDCALL", tex_handle.raw());
+        return None;
+    }
+    let mut page = PageBox::new_uninit(bytes);
+    // SAFETY: `device_inner` is non-null (checked) and points to the live owning
+    // device, which outlives its child surfaces per D3D9 lifetime rules.
+    let device_inner = unsafe { &mut *inner.device_inner };
+    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: flushing the frame failed ({hr:#x}) → INVALIDCALL");
         return None;
     }
     let mut params = BlitTextureToBufferParams {
@@ -2590,100 +2722,87 @@ fn readback_backbuffer_region(
         dst_ptr: page.as_mut_ptr() as u64,
         dst_len: page.len() as u64,
         mip_level: 0,
-        origin_x: region.x,
-        origin_y: region.y,
-        width: region.w,
-        height: region.h,
+        origin_x: 0,
+        origin_y: 0,
+        width: w,
+        height: h,
         bytes_per_row,
         slice: 0,
-        // Resolve a scaled texture to the logical extent before cropping.
-        source_width: full_width,
-        source_height: full_height,
+        // Whole-surface read at its logical size; a scaled back buffer's
+        // texture is smaller and gets resolved up to this first, so the DIB
+        // this seeds is the size `GetDC` promised.
+        source_width: w,
+        source_height: h,
+        // BGRA8 back buffer: a block row is a pixel row.
         block_height: 1,
     };
     let status = unix_call(&mut params);
     if status != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer read-back: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL"
-        );
+            "back-buffer GetDC: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
         return None;
     }
-    Some((page, bytes_per_row))
+    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
+    Some((w, h, bytes_per_row))
 }
 
-/// Hold a full backbuffer snapshot for the DIB exposed by `GetDC`.
+/// Push the back buffer's whole-surface snapshot page back into its colour texture.
 ///
-/// Returns its logical width, height and row pitch, or `None` on failure.
-fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)> {
-    let (width, height) = (inner.live_width(), inner.live_height());
-    let region = StretchRegion {
-        x: 0,
-        y: 0,
-        w: width,
-        h: height,
-    };
-    let (page, pitch) = readback_backbuffer_region(inner, region)?;
-    inner.readback = Some(BackbufferSnapshot { page, region });
-    Some((width, height, pitch))
-}
-
-/// Push a writable lock or GDI snapshot back into the backbuffer texture.
-///
-/// The snapshot was read after flushing pending rendering. Its upload is
-/// queued after earlier clears and draws and before the next render pass, so
-/// later draws load the CPU-written pixels.
+/// The write half of [`readback_full_backbuffer`]. The DIB `GetDC` handed out
+/// and the pointer a writable `LockRect` handed out both point into that page,
+/// not the back buffer itself, so what was drawn or written lives only there
+/// until it is copied back. The copy takes the route a lockable render
+/// target's `UnlockRect` upload takes, the frame's leading blit pass, so it
+/// lands before the next draw (`GetDC` flushed everything before it).
 ///
 /// A `render.scale` below 100% rasterizes the back buffer into a texture
 /// smaller than the extent the DIB was handed out at, so the page cannot be
 /// copied in as it stands. It goes through a scratch texture at its own extent
 /// and a linear-filtered quad instead, the downscale counterpart of the
 /// `MetalFX` resolve that seeded the page at `GetDC`.
-fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
+fn backbuffer_page_upload(inner: &mut SurfaceInner) {
     let (width, height) = (inner.live_width(), inner.live_height());
     let color_handle = inner.live_color_handle().raw();
     let live_format = inner.live_format();
     let Some(mapping) = mtld3d_core::format::map_d3d_format(live_format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer ReleaseDC: format {live_format:#x} has no mapping; GDI's drawing is \
-             not written back");
+            "back-buffer write-back: format {live_format:#x} has no mapping; the page is not \
+             written back");
         return;
     };
     let format = mapping.metal_pixel_format();
     let bpp = mapping.bytes_per_pixel();
     if bpp == 0 || width == 0 || height == 0 || color_handle == 0 || inner.device_inner.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer ReleaseDC: nothing to write back into ({width}x{height}, {bpp} bytes \
-             per pixel, texture {color_handle:#x}); GDI's drawing is not written back");
+            "back-buffer write-back: nothing to write back into ({width}x{height}, {bpp} bytes \
+             per pixel, texture {color_handle:#x}); the page is not written back");
         return;
     }
     // SAFETY: `device_inner` is non-null (checked above) and points to the live
     // owning device, which outlives its child surfaces.
     let scale = unsafe { (*inner.device_inner).scale_for_created_target(width, height, true) };
-    let src_stride = mtld3d_core::format::linear_row_pitch(width, bpp);
-    let Some(needed) = (src_stride as usize).checked_mul(height as usize) else {
+    let needed = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(bpp as usize);
+    let Some(page) = inner.readback.as_ref() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer ReleaseDC: the {width}x{height} page size overflows; GDI's drawing is \
-             not written back");
+            "back-buffer write-back: the snapshot page is gone; nothing is written back");
         return;
     };
-    let Some(snapshot) = inner.readback.as_ref() else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer ReleaseDC: the DC's page is gone; GDI's drawing is not written back");
-        return;
-    };
-    let page = &snapshot.page;
     if page.len() < needed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "back-buffer ReleaseDC: the DC's page holds {} bytes, {needed} needed; GDI's \
-             drawing is not written back", page.len());
+            "back-buffer write-back: the snapshot page holds {} bytes, {needed} needed; the \
+             page is not written back", page.len());
         return;
     }
-    // Capture into frame-owned bytes before the caller can drop the snapshot page.
+    // Capture into frame-owned bytes before the caller can drop the page.
     // SAFETY: `inner.device_inner` is non-null (checked above) and points to
     // the live owning device, a different allocation from the page above.
     let device_inner = unsafe { &mut *inner.device_inner };
     // SAFETY: the captured token moves directly into this frame's upload operation.
     let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
+    // The snapshot page is tightly packed, so a row is exactly `width` pixels.
+    let src_stride = width * bpp;
     if scale.is_identity() {
         device_inner.push_control(crate::device::UploadColorOp {
             color_handle,
@@ -2699,11 +2818,17 @@ fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
         format,
         logical: (width, height),
         texture: (scale.dimension(width), scale.dimension(height)),
-        source_region: snapshot.region,
-        destination_region: {
-            let region = snapshot.region;
-            let (x, y, w, h) = scale.rect(region.x, region.y, region.w, region.h);
-            StretchRegion { x, y, w, h }
+        source_region: StretchRegion {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        },
+        destination_region: StretchRegion {
+            x: 0,
+            y: 0,
+            w: scale.dimension(width),
+            h: scale.dimension(height),
         },
         bytes_per_row: src_stride,
         msaa: inner.live_msaa_handle(),
@@ -2748,7 +2873,8 @@ fn systemmem_lock_rect(
     // pBits at the RAW, unclamped origin `top*pitch + left*bpp` — the XP
     // accept-invalid behaviour. An out-of-bounds or negative rect yields a
     // pointer outside the allocation that the caller is not expected to
-    // dereference; we compute it by integer arithmetic (no UB pointer `add`). A
+    // dereference; we compute it by wrapping integer arithmetic (no UB pointer
+    // `add`, and no overflow on a 32-bit pointer for a far-off rect). A
     // NULL rect locks the whole surface (origin 0,0). (DEFAULT offscreen-plain
     // surfaces are texture-backed and validate strictly in `texture_lock_rect`.)
     // SAFETY: `rect` is the *const D3DRECT delivered by LockRect; null → None.
@@ -2767,11 +2893,16 @@ fn systemmem_lock_rect(
         let bb = fmt.block_bytes();
         let pitch = full_w.div_ceil(bw).saturating_mul(bb);
         // Origin steps in whole blocks: block row `top / bh`, block column `left / bw`.
-        let offset = top.div_euclid(to_i(bh)) * to_i(pitch) + left.div_euclid(to_i(bw)) * to_i(bb);
+        let offset = top
+            .div_euclid(to_i(bh))
+            .wrapping_mul(to_i(pitch))
+            .wrapping_add(left.div_euclid(to_i(bw)).wrapping_mul(to_i(bb)));
         (pitch, offset)
     } else {
         let pitch = mtld3d_core::format::linear_row_pitch(full_w, bpp);
-        let offset = top * to_i(pitch) + left * to_i(bpp);
+        let offset = top
+            .wrapping_mul(to_i(pitch))
+            .wrapping_add(left.wrapping_mul(to_i(bpp)));
         (pitch, offset)
     };
     let Some(page) = inner.system_memory.as_mut() else {
@@ -2848,7 +2979,9 @@ fn lockable_rt_lock_rect(
     let (left, top) = unsafe { ValueIn::<D3DRECT>::read_opt(rect) }
         .map_or((0, 0), |r| (r.x1 as isize, r.y1 as isize));
     let to_i = |v: u32| isize::try_from(v).unwrap_or(isize::MAX);
-    let offset = top * to_i(pitch) + left * to_i(bpp);
+    let offset = top
+        .wrapping_mul(to_i(pitch))
+        .wrapping_add(left.wrapping_mul(to_i(bpp)));
     let Some(page) = inner.system_memory.as_mut() else {
         let _ = inner.try_end_lock();
         return D3DERR_INVALIDCALL;
@@ -3069,6 +3202,30 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
 }
 
+/// Parse a `RECT*` pointer passed to `LockRect` and clamp it against `(full_w, full_h)`.
+///
+/// `NULL` means "full surface". Returns `(x, y, w, h)` with
+/// `w == 0 || h == 0` indicating a zero-area (empty) rect the caller should
+/// treat as `INVALIDCALL`.
+fn parse_surface_rect(rect: *const c_void, full_w: u32, full_h: u32) -> (u32, u32, u32, u32) {
+    // SAFETY: vtable in-param; `rect` is *const D3DRECT per ABI.
+    let Some(r) = (unsafe { ValueIn::<D3DRECT>::read_opt(rect) }) else {
+        return (0, 0, full_w, full_h);
+    };
+    let x1 = r.x1.max(0).cast_unsigned();
+    let y1 = r.y1.max(0).cast_unsigned();
+    let x2 = r.x2.max(0).cast_unsigned();
+    let y2 = r.y2.max(0).cast_unsigned();
+    let x = x1.min(full_w);
+    let y = y1.min(full_h);
+    let right = x2.min(full_w);
+    let bottom = y2.min(full_h);
+    if right <= x || bottom <= y {
+        return (0, 0, 0, 0);
+    }
+    (x, y, right - x, bottom - y)
+}
+
 // ── GDI FFI (IDirect3DSurface9::GetDC / ReleaseDC over a memory-backed DC) ──
 
 #[link(name = "gdi32")]
@@ -3229,7 +3386,7 @@ impl SurfaceInner {
         // `self.readback` immediately before this call, so a held DC reads the
         // backbuffer's current pixels (BGRA8, matching the X8R8G8B8 DIB order).
         if self.implicit_kind == ImplicitKind::Backbuffer {
-            let page = &self.readback.as_ref()?.page;
+            let page = self.readback.as_ref()?;
             let format = self.live_format();
             let fmt = mtld3d_core::format::map_d3d_format(format)?;
             if fmt.bytes_per_pixel() == 0 {
@@ -3477,6 +3634,7 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
         bitmap: desc.h_bitmap,
     };
     dc_lock.dc_in_use = true;
+    dc_lock.holder = (inner.cube_face, inner.mip_level);
     // A `GetDC` counts toward the resource map count (per D3D9), so a
     // subsequent `GetDC`/`LockRect` on any face is rejected until `ReleaseDC`.
     dc_lock.map_count += 1;
@@ -3500,15 +3658,18 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
 
-    // A `ReleaseDC` is valid only while a `GetDC` is outstanding, and only for
-    // the exact `HDC` that `GetDC` returned. A second (stale) `ReleaseDC` of
-    // the same now-deleted DC is INVALIDCALL. The state is the shared cube
-    // state for a cube-map face; snapshot it, then release the borrow so the
-    // immutable `dc_pixels` read below does not alias it.
+    // A `ReleaseDC` is valid only while a `GetDC` is outstanding, only for
+    // the exact `HDC` that `GetDC` returned, and only on the subresource that
+    // took it: the state is resource-wide, but a DC belongs to one level of one
+    // face. A second (stale) `ReleaseDC` of the same now-deleted DC, or one
+    // through a sibling's surface, is INVALIDCALL. Snapshot the state, then
+    // release the borrow so the immutable `dc_pixels` read below does not
+    // alias it.
     let held = {
+        let subresource = (inner.cube_face, inner.mip_level);
         // SAFETY: `dc_lock_ptr` returns the live resource-wide state.
         let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
-        if !dc_lock.dc_in_use || hdc != dc_lock.held_dc.dc {
+        if !dc_lock.dc_in_use || hdc != dc_lock.held_dc.dc || dc_lock.holder != subresource {
             return D3DERR_INVALIDCALL;
         }
         dc_lock.held_dc
@@ -3553,7 +3714,7 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     // persistent store, so GDI's drawing exists only there: push it back into
     // the back buffer before the page is dropped just below.
     if inner.is_lockable_backbuffer() {
-        backbuffer_snapshot_upload(inner);
+        backbuffer_page_upload(inner);
     }
     // A backbuffer GetDC stashed a full read-back snapshot in `readback`; drop it
     // now the DC is gone (the LockRect path reuses the same slot). No-op for

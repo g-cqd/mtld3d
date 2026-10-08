@@ -143,7 +143,7 @@ pub enum PixelFormat {
     Depth32Float = 252,
     /// Combined 32-bit float depth + 8-bit stencil.
     ///
-    /// D3D9 D24S8 / D24FS8 / D24X4S4 / D15S1 promote here.
+    /// D3D9 D24S8 / D24FS8 / INTZ promote here.
     Depth32FloatStencil8 = 260,
 }
 
@@ -560,6 +560,31 @@ pub enum VertexFormat {
     Float4 = 31,
 }
 
+impl VertexFormat {
+    /// Bytes one element of this format occupies in a vertex buffer; 0 for `Invalid`.
+    #[must_use]
+    pub const fn byte_size(self) -> u32 {
+        match self {
+            Self::Invalid => 0,
+            Self::UChar4
+            | Self::UChar4Normalized
+            | Self::UChar4NormalizedBgra
+            | Self::Short2
+            | Self::UShort2Normalized
+            | Self::Short2Normalized
+            | Self::Half2
+            | Self::Float => 4,
+            Self::Short4
+            | Self::UShort4Normalized
+            | Self::Short4Normalized
+            | Self::Half4
+            | Self::Float2 => 8,
+            Self::Float3 => 12,
+            Self::Float4 => 16,
+        }
+    }
+}
+
 /// `MTLVertexStepFunction` wire encoding for one vertex buffer layout.
 ///
 /// Discriminants match the native Metal enum. `Constant` is the layout of a
@@ -581,6 +606,12 @@ pub enum VertexStepFunction {
 /// so the slot count equals `D3DCAPS9::MaxStreams`. mtld3d's own vertex
 /// uniforms sit above this range (see [`VS_POS_FIXUP_SLOT`]).
 pub const VERTEX_STREAM_SLOTS: u32 = 16;
+
+/// Entries in a Metal vertex descriptor's attribute table.
+///
+/// Every `[[attribute(N)]]` a vertex function declares, and every
+/// `attr_index` a pipeline recipe carries, is below this.
+pub const VERTEX_ATTRIBUTE_SLOTS: u32 = 31;
 
 /// Vertex-stage buffer slot of the half-pixel rasterization fixup uniform.
 ///
@@ -606,6 +637,15 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// Point size, its clamp range and the point scale factors, serialised by
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
+
+/// Vertex-stage buffer slot of the per-sampler LOD table (`vs_lod`).
+///
+/// One `float2` row per vertex sampler slot, `(offset, floor)`: a `texldl`
+/// samples `level(max(lod + offset, floor))`, which carries the texture's
+/// `SetLOD`, `D3DSAMP_MIPMAPLODBIAS` and the finest level the slot may
+/// sample, since Metal applies no sampler LOD clamp to an explicit level.
+/// Bound only for a draw whose vertex shader samples a slot that needs it.
+pub const VS_LOD_SLOT: u32 = 25;
 
 /// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
 ///
@@ -667,6 +707,7 @@ const _: () = {
     assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_BOOL_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_LOD_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };
 
@@ -955,6 +996,22 @@ bitflags::bitflags! {
     pub struct SnapshotFlags: u32 {
         const TAKEN = 1 << 0;
         const SLOT_WAITED = 1 << 1;
+    }
+}
+
+bitflags::bitflags! {
+    /// Presenter switches a queue keeps for its lifetime, from `CreateCommandQueueParams`.
+    ///
+    /// Diagnostic seams for the test suite; a game runs with none set.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PresentDebugFlags: u32 {
+        /// Acquire and present a drawable for a window that reads as occluded.
+        ///
+        /// `debug.presentOccluded`. Without it a present into a fully covered
+        /// or hidden window skips `nextDrawable`, which is every present of a
+        /// suite whose windows stay hidden, so nothing that call reaches runs
+        /// under the Main Thread Checker there.
+        const PRESENT_OCCLUDED = 1 << 0;
     }
 }
 

@@ -11,6 +11,7 @@
 /// logs to `"mtld3d::perf"`.
 const LOG_TARGET: &str = "mtld3d::d3d9";
 
+pub mod address_space;
 pub mod api_lock;
 pub mod app_profile;
 pub mod async_compile;
@@ -18,10 +19,12 @@ pub mod buffer_backing;
 pub mod buffer_rename;
 pub mod build_index;
 pub mod caps;
+pub mod capture_chord;
 pub mod config;
 pub mod convert;
 pub mod cursor;
 pub mod d3d8;
+pub mod departed_textures;
 pub mod depth_stencil_state;
 pub mod depth_texture;
 pub mod dirty_range;
@@ -50,6 +53,7 @@ pub mod guest_completions;
 pub mod guest_mem;
 pub mod guest_pages;
 pub mod guest_queries;
+pub mod held_pages;
 pub mod ids;
 pub mod level_authority;
 pub mod multisample;
@@ -94,3 +98,4 @@ pub mod upload_redirty;
 pub mod validate_device;
 pub mod visibility;
 pub mod vs_draw;
+pub mod window_subclass;

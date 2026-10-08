@@ -11,7 +11,7 @@ use mtld3d_types::{
     d3dps_version, d3dvs_version,
 };
 
-use crate::ff_state::{MAX_ACTIVE_LIGHTS, MAX_VERTEX_BLEND_MATRIX_INDEX};
+use crate::{dxso::MAX_VERTEX_BLEND_MATRIX_INDEX, ff_state::MAX_ACTIVE_LIGHTS};
 
 // Caps are a *truthful floor* under current capability: they advertise only
 // what the renderer actually implements. Every default below therefore names
@@ -202,9 +202,10 @@ const RASTER_DEFAULT: RasterCaps = RasterCaps::DITHER
 /// Blend factors, for both the colour and the alpha blend equation.
 ///
 /// Every `D3DBLEND_*` value `convert::d3d_to_metal_blend` maps, which is the
-/// contiguous `ZERO..SRCALPHASAT` range plus `BLENDFACTOR`. The `BOTH*` factors
-/// are DX7-era shorthand D3D9 no longer honours, and the dual-source `*2`
-/// factors need a second pixel-shader output.
+/// contiguous `ZERO..BOTHINVSRCALPHA` range plus `BLENDFACTOR`. The `BOTH*`
+/// shorthands resolve to their `SRCALPHA` / `INVSRCALPHA` pair in
+/// `pipeline_state`. The dual-source `*2` factors need a second pixel-shader
+/// output, and D3D9 advertises them on the reference rasterizer only.
 const BLEND_DEFAULT: BlendCaps = BlendCaps::ZERO
     .union(BlendCaps::ONE)
     .union(BlendCaps::SRCCOLOR)
@@ -216,6 +217,8 @@ const BLEND_DEFAULT: BlendCaps = BlendCaps::ZERO
     .union(BlendCaps::DESTCOLOR)
     .union(BlendCaps::INVDESTCOLOR)
     .union(BlendCaps::SRCALPHASAT)
+    .union(BlendCaps::BOTHSRCALPHA)
+    .union(BlendCaps::BOTHINVSRCALPHA)
     .union(BlendCaps::BLENDFACTOR);
 
 /// Shading caps.
@@ -405,6 +408,37 @@ const ADVERTISE_ALL_TEXTURE: TextureCaps = TextureCaps::all().difference(Texture
 /// `CONVOLUTIONMONO` stays out: it is a separate filter kind rather than a
 /// MIN/MIP/MAG mode, with no sampler-side path or warn to surface an attempt.
 const ADVERTISE_ALL_FILTER: FilterCaps = FilterCaps::all().difference(FilterCaps::CONVOLUTIONMONO);
+
+/// Whether a 2D or cube texture of `width` x `height` fits the extent the device reports.
+///
+/// `MaxTextureWidth` and `MaxTextureHeight` advertise [`MAX_TEXTURE_DIM`], so
+/// a request past it is refused even on a GPU whose own 2D limit is higher.
+/// Metal raises an exception, which ends the process, for a descriptor past
+/// its limit rather than returning nil, and so it does for a zero extent;
+/// every creator checks here first.
+#[must_use]
+pub const fn texture_extent_fits(width: u32, height: u32) -> bool {
+    width != 0 && height != 0 && width <= MAX_TEXTURE_DIM && height <= MAX_TEXTURE_DIM
+}
+
+/// Whether a volume texture of `width` x `height` x `depth` fits the extent Metal can create.
+///
+/// A volume more than one slice deep is a 3D Metal texture, held on every
+/// axis to `MaxVolumeExtent` ([`MAX_VOLUME_EXTENT`]), the 3D limit Metal
+/// enforces with an exception. A single-slice volume is created as a 2D
+/// texture, so it takes the 2D limit of [`texture_extent_fits`].
+#[must_use]
+pub const fn volume_extent_fits(width: u32, height: u32, depth: u32) -> bool {
+    if depth == 1 {
+        return texture_extent_fits(width, height);
+    }
+    width != 0
+        && height != 0
+        && depth != 0
+        && width <= MAX_VOLUME_EXTENT
+        && height <= MAX_VOLUME_EXTENT
+        && depth <= MAX_VOLUME_EXTENT
+}
 
 /// Single entry point for both `IDirect3D9::GetDeviceCaps` and `IDirect3DDevice9::GetDeviceCaps`.
 ///

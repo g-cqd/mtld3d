@@ -1,7 +1,10 @@
 use core::ffi::c_void;
 use std::{
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU32, Ordering, fence},
+    },
 };
 
 use log::{error, info, trace, warn};
@@ -21,21 +24,20 @@ use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
-    mtl::DeviceCapsFlags,
+    mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
-    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16,
-    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
-    IDirect3D9Vtbl,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
+    D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -284,7 +286,8 @@ static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
 #[repr(C)]
 pub struct Direct3D9 {
     vtbl: *const IDirect3D9Vtbl,
-    refcount: u32,
+    /// The public refcount, changed from any thread that holds the interface or a device it made.
+    refcount: AtomicU32,
     inner: Box<Direct3D9Inner>,
 }
 
@@ -310,9 +313,14 @@ impl Direct3D9 {
         ADAPTER_MODES.get_or_init(|| build_adapter_modes(config.display_legacy_4_by_3));
         Self {
             vtbl: &raw const DIRECT3D9_VTBL,
-            refcount: 1,
+            refcount: AtomicU32::new(1),
             inner: Box::new(Direct3D9Inner { config }),
         }
+    }
+
+    /// Take one more reference; the count after it.
+    fn add_ref(&self) -> u32 {
+        self.refcount.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// The configuration this interface resolved at `Direct3DCreate9`.
@@ -452,24 +460,18 @@ pub fn map_for_device(
     mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
 }
 
-/// Depth-stencil formats.
+/// Depth-stencil formats: the ones the capability answers offer.
 ///
-/// Includes the FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`)
-/// — created with `USAGE_DEPTHSTENCIL`, bound as the depth target during a
-/// caster pass and sampled as a depth texture in the receiver pass. Apple
-/// Silicon promotes all of them to `Depth32Float` (see
-/// `format::map_d3d_depth_format`).
+/// Read from `format::is_advertised_depth_format`, so a depth format the
+/// answers offer is one every create accepts. It includes the FOURCC
+/// sampleable-depth formats (`INTZ` / `DF24` / `DF16`), created with
+/// `USAGE_DEPTHSTENCIL`, bound as the depth target during a caster pass and
+/// sampled as a depth texture in the receiver pass, and `D24FS8`. It leaves
+/// out `D15S1` and `D24X4S4`, which nothing creates, and the two lockable
+/// formats, which the auto depth-stencil and a depth-stencil texture still
+/// take without the `LockRect` the format promises.
 pub const fn is_depth_stencil_format(fmt: u32) -> bool {
-    matches!(
-        fmt,
-        D3DFMT_D16
-            | D3DFMT_D24S8
-            | D3DFMT_D24X8
-            | D3DFMT_D32
-            | D3DFMT_INTZ
-            | D3DFMT_DF24
-            | D3DFMT_DF16
-    )
+    mtld3d_core::format::is_advertised_depth_format(fmt)
 }
 
 /// Subset of depth-stencil formats that carry a stencil plane.
@@ -484,7 +486,7 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
     // depth/stencil attachment formats desync from the bound depth texture — a
     // Metal validation failure, and heap-corrupting undefined behaviour with
     // the layer off. Deriving from the same mapping keeps them in lockstep:
-    // D15S1 and D24X4S4 are combined formats too, not just D24S8/D24FS8.
+    // D24FS8 and INTZ are combined formats too, not just D24S8.
     matches!(
         mtld3d_core::format::map_d3d_depth_format(fmt),
         Some(mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8)
@@ -562,26 +564,37 @@ extern "system" fn d3d9_add_ref(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 AddRef — null `this` is UB per spec; we preserve the
     // crash semantic so refcount miscounts surface as a null-deref.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount += 1;
-    obj.refcount
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    wrap.add_ref()
 }
 
 extern "system" fn d3d9_release(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 Release — same contract as AddRef above.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount -= 1;
-    let rc = obj.refcount;
-    if rc == 0 {
-        // SAFETY: refcount reached zero; `this` is the original
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    // The interface is not tied to a device's lock: every device it created
+    // takes and gives back references on it from its own threads, so the
+    // count is atomic. `checked_sub` only keeps a `Release` past zero from
+    // wrapping the count; it answers 0 and frees nothing.
+    let Ok(previous) = wrap
+        .refcount
+        .try_update(Ordering::Release, Ordering::Relaxed, |count| {
+            count.checked_sub(1)
+        })
+    else {
+        return 0;
+    };
+    if previous == 1 {
+        // Every other thread's last use of the interface happened before its
+        // own decrement, which the `Release` ordering publishes; this fence
+        // makes those uses happen before the free.
+        fence(Ordering::Acquire);
+        // SAFETY: the count reached zero; `this` is the original
         // `Box::into_raw(Direct3D9)` allocation from `Direct3DCreate9`,
         // and no other reference can survive a zero refcount.
         drop(unsafe { Box::from_raw(this.cast::<Direct3D9>()) });
     }
-    rc
+    previous - 1
 }
 
 // ── IDirect3D9 methods ──
@@ -777,7 +790,7 @@ pub fn float32_filtering_supported(deny: bool) -> bool {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "32-bit float filtering unavailable (forced={deny}): R32F/G32R32F/A32B32G32R32F \
-             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER"
+             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER and are sampled point-filtered"
         );
     }
     supported
@@ -905,10 +918,14 @@ extern "system" fn d3d9_check_device_type(
     // the device-restricted answer: where the packed 16-bit formats are
     // expansion-backed, a 16-bit back buffer is refused here as well, and an
     // engine picks X8R8G8B8 the way hardware without 16-bit render targets
-    // made it. `CreateDevice` stays lenient and substitutes the BGRA8 layer
-    // format for a 16-bit request (`warn_unsupported_backbuffer_format`).
+    // made it. Only a D3D9 back-buffer format is offered at all, so a title
+    // probing for its back buffer lands on one even where the device would
+    // render into a wider format. `CreateDevice` and `Reset` stay lenient and
+    // substitute the BGRA8 layer format for any format they are handed
+    // (`warn_unsupported_backbuffer_format`).
     let expand_packed16 = d3d.config().expand_packed16;
-    let presentable = is_render_target_format_on_device(effective_bb, expand_packed16)
+    let presentable = mtld3d_core::format::is_back_buffer_format(effective_bb, windowed != 0)
+        && is_render_target_format_on_device(effective_bb, expand_packed16)
         && if windowed != 0 {
             is_format_conversion_supported(effective_bb, adapter_format, expand_packed16)
         } else {
@@ -954,6 +971,12 @@ extern "system" fn d3d9_check_device_format(
     // rejects it with INVALIDCALL ahead of any availability check, for every
     // device type.
     if adapter_format == 0 {
+        return D3DERR_INVALIDCALL;
+    }
+    // Vertex and index buffers carry no format a query could weigh, so a
+    // buffer resource type is rejected as a malformed call rather than
+    // answered unavailable, with or without a usage.
+    if matches!(rtype, D3DRTYPE_VERTEXBUFFER | D3DRTYPE_INDEXBUFFER) {
         return D3DERR_INVALIDCALL;
     }
     if adapter != 0 || dev_type != D3DDEVTYPE_HAL || !is_display_format(adapter_format) {
@@ -1154,6 +1177,15 @@ extern "system" fn d3d9_check_device_multi_sample_type(
             "reject CheckDeviceMultiSampleType: adapter={adapter} → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
+    }
+    // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here,
+    // at every count the single-sampled `D3DMULTISAMPLE_NONE` answer aside,
+    // which any format gets.
+    if matches!(surface_format, D3DFMT_DF24 | D3DFMT_DF16)
+        && !d3d.config().df_formats
+        && multi_sample_type != D3DMULTISAMPLE_NONE
+    {
+        return D3DERR_NOTAVAILABLE;
     }
     let caps = device_caps_flags();
     // A format the device cannot render into at all cannot be multisampled
@@ -1437,7 +1469,7 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
-    if !crate::USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if !crate::USED.swap(true, Ordering::Relaxed) {
         crate::pin_image();
     }
 
@@ -1471,9 +1503,31 @@ extern "system" fn d3d9_create_device(
         );
         return D3DERR_INVALIDCALL;
     }
+    // An auto depth-stencil the depth answers refuse is refused here too,
+    // before the window or the display mode moves. A format of 0 keeps
+    // standing for no depth-stencil.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice: AutoDepthStencilFormat {} at MultiSampleType {} is no \
+             depth-stencil the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return D3DERR_INVALIDCALL;
+    }
 
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
+    let mut present_debug = PresentDebugFlags::empty();
+    present_debug.set(PresentDebugFlags::PRESENT_OCCLUDED, cfg.present_occluded);
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
@@ -1483,7 +1537,7 @@ extern "system" fn d3d9_create_device(
         gate_file_len: gate.as_ref().map_or(0, |path| {
             u32::try_from(path.len()).expect("a gate path fits u32")
         }),
-        pad0: 0,
+        present_debug,
     };
     let status = unix_call(&mut cq_params);
     if status != 0 {
@@ -1750,7 +1804,7 @@ extern "system" fn d3d9_create_device(
     // SAFETY: `inner_ptr` was just derived from a live `DeviceInner` we
     // own via `dev`; the borrow is local to this expression and `dev`
     // outlives it.
-    unsafe { (*inner_ptr).cursor_mut().install_subclass(inner_ptr) };
+    unsafe { (*inner_ptr).cursor().install_subclass(inner_ptr) };
 
     let dev_ptr = Box::into_raw(Box::new(dev));
     // Stamp the wrapper pointer so resource `GetDevice` thunks can hand it back
@@ -1835,9 +1889,8 @@ pub const fn attached_pacing(layer_params: &AttachMetalLayerParams) -> LayerPaci
 fn addref_parent_direct3d9(this: *mut c_void) {
     if !this.is_null() {
         // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-        let mut parent_wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-        let parent: &mut Direct3D9 = &mut parent_wrap;
-        parent.refcount += 1;
+        let parent = unsafe { VtableThis::<Direct3D9>::new(this) };
+        parent.add_ref();
     }
 }
 
@@ -1859,16 +1912,19 @@ fn spawn_native_encoder(
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
 ///
 /// That matches `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, which is
-/// all `WoW` requests. Windowed `CheckDeviceType` advertises the 16-bit and
-/// float backbuffer formats too (it answers with the `StretchRect` conversion
-/// predicate, as the runtime requires), and such a request is substituted by
-/// decision rather than plumbed: a real 16-bit backbuffer would need a
-/// conversion pass on every present, and a float one would need the whole
-/// present path to carry a format (a second drawable format, a present
-/// pipeline per format, and format-derived read-back pitches). Games that
-/// render HDR internally do it in their own off-screen float targets and
-/// tone-map into an 8-bit backbuffer, so nothing has needed it. Warn once so a
-/// game that asked shows up.
+/// all `WoW` requests. `CheckDeviceType` advertises the 16-bit back-buffer
+/// formats the device renders into too (it answers with the `StretchRect`
+/// conversion predicate, as the runtime requires), and offers no format
+/// outside the D3D9 back-buffer set. Any other request, a 16-bit one or a
+/// format no query offers, is substituted by decision rather than plumbed or
+/// refused: a real 16-bit backbuffer would need a conversion pass on every
+/// present, and a float one would need the whole present path to carry a
+/// format (a second drawable format, a present pipeline per format, and
+/// format-derived read-back pitches), while refusing would end a title that
+/// creates its device without probing. Games that render HDR internally do it
+/// in their own off-screen float targets and tone-map into an 8-bit
+/// backbuffer, so nothing has needed it. Warn once so a game that asked shows
+/// up.
 pub fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

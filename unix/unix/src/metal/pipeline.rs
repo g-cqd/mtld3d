@@ -36,8 +36,10 @@ pub fn create_render_pipeline(
 
     // Vertex descriptor: one attribute entry per supplied VertexAttrDesc and
     // one buffer layout per supplied VertexBufferLayoutDesc. A layout's
-    // `buffer_index` is the D3D9 stream the attributes on it come from; the
-    // PE side never emits an attribute on a buffer it did not lay out.
+    // `buffer_index` is the Metal vertex buffer slot: D3D9 stream `n` at slot
+    // `n`, plus the spare slots `streams::CrossingFetch` gives an attribute
+    // past its stream's stride. The PE side never emits an attribute on a
+    // buffer it did not lay out.
     //
     // The `unsafe` blocks below are all objc2 typed bindings whose
     // arguments (`attr_index`, `offset`, `buffer_index`, `stride`,
@@ -249,3 +251,6 @@ pub fn destroy_render_pipeline(pipeline_handle: u64) {
     // SAFETY: just wrapped the unique canonical retain.
     unsafe { handle.release_retain() };
 }
+
+#[cfg(test)]
+mod tests;

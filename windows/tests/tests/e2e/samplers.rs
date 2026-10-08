@@ -9,9 +9,12 @@ use mtld3d_types::{
     D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTEXF_PYRAMIDALQUAD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP,
 };
+
+use super::shaders::{PS_COLOR_PASSTHROUGH, centered_triangle};
 
 const BLACK: u32 = 0xFF00_0000;
 const YELLOW: u32 = 0xFFFF_FF00;
@@ -114,6 +117,53 @@ fn fetch4_gathers_and_restores_latched_sampler_state() {
         sample(),
         0x1020_3040,
         "sampler seven gathers alpha independently"
+    );
+}
+
+#[test]
+fn fetch4_recorded_numeric_bias_leaves_the_latch_out_across_capture() {
+    // A recorded numeric MIPMAPLODBIAS holds no Fetch4 latch, and a Capture
+    // keeps it out: refreshing the bias cannot add the latch to the block.
+    use mtld3d_types::{D3DFMT_L8, FETCH4_DISABLE, FETCH4_ENABLE};
+
+    let h = Harness::new();
+    let luminance = h.create_texture(2, 2, 1, 0, D3DFMT_L8, 0);
+    luminance
+        .lock_rect(0, 0)
+        .write_u8_rect(2, 2, &[0x10, 0x20, 0x30, 0x40]);
+    arm_texture(&h, &luminance, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    let mut quad = uv_quad(1.0);
+    for vertex in &mut quad {
+        vertex.u = 0.125;
+        vertex.v = 0.125;
+    }
+    let sample = || {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(160, 120)
+    };
+    let bias = 0.0f32.to_bits();
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias), 0);
+    let recorded = h.end_state_block();
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, FETCH4_ENABLE),
+        0
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias), 0);
+    assert_eq!(sample(), 0x1020_3040, "latched gather before Capture");
+    assert_eq!(recorded.capture(), 0);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, FETCH4_DISABLE),
+        0
+    );
+    assert_eq!(recorded.apply(), 0);
+    assert_eq!(h.sampler_state(0, D3DSAMP_MIPMAPLODBIAS), bias);
+    assert_eq!(
+        sample() & 0xffff_0000,
+        0xff10_0000,
+        "Apply of the numeric bias leaves the cleared latch alone"
     );
 }
 
@@ -415,9 +465,9 @@ fn point_and_linear_filtering_differ() {
 
 /// A `D3DSAMP_MINFILTER` DWORD wider than the four bits the sampler key packs.
 ///
-/// Its low nibble is `D3DTEXF_LINEAR`, so before the snapshot narrowed the
-/// state the key named LINEAR while the translation took its unmapped arm.
-const WIDE_FILTER: u32 = 0x12;
+/// Its low nibble is `D3DTEXF_POINT`, so a key that kept only the nibble would
+/// hand this state the POINT sampler while the translation reads LINEAR.
+const WIDE_FILTER: u32 = 0x11;
 
 /// A `D3DSAMP_ADDRESSU` DWORD wider than those four bits.
 ///
@@ -425,28 +475,29 @@ const WIDE_FILTER: u32 = 0x12;
 const WIDE_ADDRESS: u32 = 0x13;
 
 #[test]
-fn a_filter_above_the_key_width_reads_the_d3d9_default() {
+fn a_filter_above_the_key_width_samples_as_linear() {
     // `SetSamplerState` takes a DWORD and stores it, so the filter states are
-    // game input. A value no `D3DTEXF_*` names reads as the D3D9 default,
-    // POINT, however many samplers the device has already built: the state
+    // game input. Every value above `D3DTEXF_LINEAR`, named or not, filters
+    // linearly, however many samplers the device has already built: the state
     // that shares its low nibble must not hand over its sampler.
     let h = Harness::new();
     let tex = rgbw_2x2(&h);
     let quad = uv_quad(1.0);
 
-    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
-    h.render_once(BLACK, |d| {
-        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
-    });
-    let point = h.read_pixel(320, 240); // dead centre — texel boundary
-
-    // Build the LINEAR sampler first. Its key is what a filter of 0x12 used
-    // to compute, so this is the draw whose object the next one would reuse.
     arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR);
     h.render_once(BLACK, |d| {
         assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
     });
-    let linear = h.read_pixel(320, 240);
+    let linear = h.read_pixel(320, 240); // dead centre, a texel boundary
+
+    // Build the POINT sampler last. Its key is what a filter of 0x11 would
+    // compute from the low nibble, so this is the object the next draw would
+    // reuse.
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let point = h.read_pixel(320, 240);
     assert_ne!(point, linear, "POINT and LINEAR must differ here");
 
     arm_texture(&h, &tex, D3DTADDRESS_CLAMP, WIDE_FILTER);
@@ -466,8 +517,58 @@ fn a_filter_above_the_key_width_reads_the_d3d9_default() {
 
     assert_eq!(
         h.read_pixel(320, 240),
-        point,
-        "a filter outside D3DTEXF_* samples as the default POINT"
+        linear,
+        "a filter above D3DTEXF_LINEAR samples as LINEAR"
+    );
+}
+
+#[test]
+fn quad_filters_sample_as_linear() {
+    // The pyramidal and Gaussian quad filters have no Metal sampler; like
+    // every filter above LINEAR they filter linearly, for the min and mag
+    // filters and for the mip filter.
+    let h = Harness::new();
+    {
+        let tex = rgbw_2x2(&h);
+        let quad = uv_quad(1.0);
+        let draw = |filter: u32| {
+            arm_texture(&h, &tex, D3DTADDRESS_CLAMP, filter);
+            h.render_once(BLACK, |d| {
+                assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+            });
+            h.read_pixel(320, 240) // dead centre, a texel boundary
+        };
+        let linear = draw(D3DTEXF_LINEAR);
+        assert_ne!(
+            draw(D3DTEXF_POINT),
+            linear,
+            "POINT and LINEAR must differ here"
+        );
+        assert_eq!(
+            draw(D3DTEXF_PYRAMIDALQUAD),
+            linear,
+            "PYRAMIDALQUAD min and mag filter"
+        );
+        assert_eq!(
+            draw(D3DTEXF_GAUSSIANQUAD),
+            linear,
+            "GAUSSIANQUAD min and mag filter"
+        );
+    }
+
+    // A mip filter that filters selects levels: MAXMIPLEVEL 3 moves the
+    // sample to level 3, where an unmipmapped sampler would read level 0.
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_GAUSSIANQUAD),
+        0,
+        "SetSamplerState(MIPFILTER)"
+    );
+    assert_eq!(
+        sample_at_max_mip_level(&h, 3),
+        MIP_TINTS[3],
+        "a GAUSSIANQUAD mip filter mipmaps like LINEAR"
     );
 }
 
@@ -627,6 +728,21 @@ const PS_SAMPLE_TEXTURE_BIASED: [u32; 21] = [
     0x0200_0001, 0x800F_0001, 0x90E4_0000,              // mov r1, v0
     0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
     0x0302_0042, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldb r0, r1, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` sampling at the explicit LOD in `c0.x` through `texldl`.
+///
+/// As [`PS_SAMPLE_TEXTURE_BIASED`], with `texldl` reading `.w` as the level.
+#[rustfmt::skip]
+const PS_SAMPLE_TEXTURE_LOD: [u32; 21] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0200_0001, 0x800F_0001, 0x90E4_0000,              // mov r1, v0
+    0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
+    0x0300_005F, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldl r0, r1, s0
     0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
     0x0000_FFFF,                                        // end
 ];
@@ -794,6 +910,67 @@ fn out_of_range_max_mip_level_samples_the_smallest_level() {
         sample_at_max_mip_level(&h, 0x0001_0000),
         MIP_TINTS[MIP_TINTS.len() - 1],
         "an out-of-range MAXMIPLEVEL samples the smallest level"
+    );
+}
+
+/// [`texel_to_pixel_quad`] squeezed to `width` backbuffer pixels across.
+///
+/// The quad keeps one texel per pixel down and maps `MIP_TEX_DIM` texels onto
+/// `width` pixels across, so its footprint is anisotropic: an isotropic sample
+/// takes the level of the longer axis, log2(`MIP_TEX_DIM` / `width`).
+fn squeezed_quad(width: u32) -> [TexturedVertex; 6] {
+    let scale = f32::from(u16::try_from(width).expect("width fits u16"))
+        / f32::from(u16::try_from(MIP_TEX_DIM).expect("mip texture dim fits u16"));
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: (v.x + 1.0).mul_add(scale, -1.0),
+        ..v
+    })
+}
+
+#[test]
+fn max_anisotropy_needs_an_anisotropic_filter() {
+    // D3D9 filters anisotropically only through D3DTEXF_ANISOTROPIC: a stage
+    // whose filters are LINEAR samples isotropically whatever MAXANISOTROPY
+    // holds. 64 texels over 8 pixels across and 64 down is an 8:1 footprint,
+    // where the isotropic level is 3 and an anisotropic sample reads finer.
+    const WIDTH: u32 = 8;
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    let quad = squeezed_quad(WIDTH);
+    let draw = |min: u32, mag: u32| {
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, min),
+            (D3DSAMP_MAGFILTER, mag),
+            (D3DSAMP_MAXANISOTROPY, 16),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler {state}");
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(WIDTH / 2, MIP_TEX_DIM / 2)
+    };
+
+    // The control first: a GPU that ignores the sampler's anisotropy (the
+    // paravirtual device may) reads the isotropic level either way, and cannot
+    // tell the two cases apart.
+    if draw(D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR) == MIP_TINTS[3] {
+        eprintln!(
+            "max_anisotropy_needs_an_anisotropic_filter: the GPU samples an ANISOTROPIC min \
+             filter at the isotropic level, so anisotropy is not observable here; skipped"
+        );
+        return;
+    }
+    assert_eq!(
+        draw(D3DTEXF_LINEAR, D3DTEXF_LINEAR),
+        MIP_TINTS[3],
+        "LINEAR filters with MAXANISOTROPY 16 sample the isotropic level"
+    );
+    assert_ne!(
+        draw(D3DTEXF_LINEAR, D3DTEXF_ANISOTROPIC),
+        MIP_TINTS[3],
+        "an ANISOTROPIC mag filter turns anisotropy on as well"
     );
 }
 
@@ -1118,4 +1295,664 @@ fn texldb_adds_instruction_and_sampler_biases() {
     assert_eq!(sample_at_bias(&h, 1.0), MIP_TINTS[3], "2 + 1 selects mip 3");
 
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+/// Draw the mip-tinted quad through [`PS_SAMPLE_TEXTURE_LOD`] at `lod` and read it back.
+fn sample_at_explicit_lod(h: &Harness, lod: f32) -> u32 {
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[lod, 0.0, 0.0, 0.0]),
+        0,
+        "explicit LOD {lod}"
+    );
+    let quad = texel_to_pixel_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    h.read_pixel(MIP_TEX_DIM / 2, MIP_TEX_DIM / 2)
+}
+
+/// Bind [`PS_SAMPLE_TEXTURE_LOD`] over the armed mip-tinted stage.
+fn arm_explicit_lod_shader(h: &Harness) {
+    let ps = h.create_pixel_shader(&PS_SAMPLE_TEXTURE_LOD);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+}
+
+#[test]
+fn texldl_takes_max_mip_level_as_its_finest_level() {
+    // `D3DSAMP_MAXMIPLEVEL` is the finest level any sample of the stage may
+    // read, and it clamps an explicit LOD rather than shifting it. A Metal
+    // sampler's LOD clamp does not reach a sample at an explicit level.
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "texldl samples the level it names"
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 3), 0);
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "MAXMIPLEVEL 3 clamps an explicit LOD of 1"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 4.0),
+        MIP_TINTS[4],
+        "a coarser explicit LOD is kept, not shifted"
+    );
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_counts_its_lod_from_the_texture_lod() {
+    // `SetLOD` makes a level the texture's most detailed one, so an explicit
+    // LOD counts from it; `MAXMIPLEVEL` still clamps the result.
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    assert_eq!(
+        sample_at_explicit_lod(&h, 0.0),
+        MIP_TINTS[2],
+        "LOD 0 reads the texture's most detailed level"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "LOD 1 reads the level below it"
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 4), 0);
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[4],
+        "MAXMIPLEVEL 4 clamps level 3"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 3.0),
+        MIP_TINTS[5],
+        "level 5 is past the clamp"
+    );
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_adds_the_sampler_lod_bias() {
+    // `D3DSAMP_MIPMAPLODBIAS` shifts an explicit LOD as it does a computed one.
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    for (bias, lod, level) in [(1.0_f32, 1.0, 2), (-1.0, 3.0, 2), (2.0, 0.0, 2)] {
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias.to_bits()),
+            0
+        );
+        assert_eq!(
+            sample_at_explicit_lod(&h, lod),
+            MIP_TINTS[level],
+            "bias {bias} on LOD {lod}"
+        );
+    }
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, 0), 0);
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_takes_the_game_bias_and_not_the_render_scale_compensation() {
+    // `render.lodBias` corrects a LOD the sampler computes on the reduced
+    // render grid. An explicit LOD names a level outright, so it keeps the
+    // game's bias and takes none of the compensation.
+    let h = Harness::with_config("render.scale=0.5");
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "the scale's compensation leaves an explicit LOD alone"
+    );
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, 1.0_f32.to_bits()),
+        0
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[2],
+        "the game's +1 bias still lands"
+    );
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+/// [`texel_to_pixel_quad`] shrunk to `size` backbuffer pixels square.
+///
+/// `MIP_TEX_DIM` texels map onto `size` pixels on both axes, so the implicit
+/// LOD is log2(`MIP_TEX_DIM` / `size`).
+fn minified_quad(size: u32) -> [TexturedVertex; 6] {
+    let scale = f32::from(u16::try_from(size).expect("size fits u16"))
+        / f32::from(u16::try_from(MIP_TEX_DIM).expect("mip texture dim fits u16"));
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: (v.x + 1.0).mul_add(scale, -1.0),
+        y: (v.y - 1.0).mul_add(scale, 1.0),
+        ..v
+    })
+}
+
+#[test]
+fn without_mipmapping_the_texture_lod_is_the_only_level() {
+    // With `D3DSAMP_MIPFILTER` NONE D3D9 samples the texture's most detailed
+    // level whatever the footprint or the shader's LOD: a minified draw does
+    // not reach a coarser level, and neither does `texldl`.
+    use mtld3d_types::D3DPOOL_MANAGED;
+    const SIZE: u32 = 8;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+
+    let quad = minified_quad(SIZE);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_eq!(
+        h.read_pixel(SIZE / 2, SIZE / 2),
+        MIP_TINTS[2],
+        "a draw minified to level 3 samples the LOD level"
+    );
+
+    arm_explicit_lod_shader(&h);
+    for lod in [0.0, 4.0] {
+        assert_eq!(
+            sample_at_explicit_lod(&h, lod),
+            MIP_TINTS[2],
+            "texldl at LOD {lod} samples the LOD level"
+        );
+    }
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+/// `vs_3_0` fetching the mip-tinted texture at the explicit LOD in `c0.x`.
+///
+/// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
+/// def c4, 0.5, 0.5, 0, 0; mov r1, c4; mov r1.w, c0.x; texldl r0, r1, s0;
+/// mov o0, v0; mov o1, r0;` The fetched texel becomes the vertex colour.
+#[rustfmt::skip]
+const VS_FETCH_AT_LOD: [u32; 36] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0500_0051, 0xA00F_0004,                           // def c4,
+    0x3F00_0000, 0x3F00_0000, 0x0000_0000, 0x0000_0000, //   0.5, 0.5, 0, 0
+    0x0200_0001, 0x800F_0001, 0xA0E4_0004,              // mov r1, c4
+    0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
+    0x0300_005F, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldl r0, r1, s0
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0x80E4_0000,              // mov o1, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// Bind `tex` to vertex sampler 0 with point filtering on every level, under [`VS_FETCH_AT_LOD`].
+fn arm_vertex_fetch_at_lod(h: &Harness, tex: &Texture<'_>) {
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, tex),
+        0,
+        "SetTexture(257)"
+    );
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(
+            h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, state, value),
+            0
+        );
+    }
+    let vs = h.create_vertex_shader(&VS_FETCH_AT_LOD);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+}
+
+/// Draw a triangle whose colour [`VS_FETCH_AT_LOD`] fetches at `lod`, and read it back.
+fn vertex_fetch_at_lod(h: &Harness, lod: f32) -> u32 {
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[lod, 0.0, 0.0, 0.0]),
+        0,
+        "explicit LOD {lod}"
+    );
+    let tri = centered_triangle();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    h.read_pixel(320, 280)
+}
+
+/// Undo [`arm_vertex_fetch_at_lod`]'s bindings.
+fn disarm_vertex_fetch(h: &Harness) {
+    assert_eq!(h.clear_vertex_shader(), 0, "SetVertexShader(null)");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+    assert_eq!(
+        h.clear_texture(mtld3d_types::D3DVERTEXTEXTURESAMPLER0),
+        0,
+        "SetTexture(257, null)"
+    );
+}
+
+#[test]
+fn vertex_texldl_takes_max_mip_level_as_its_finest_level() {
+    // A vertex sampler's `D3DSAMP_MAXMIPLEVEL` clamps the level a vertex
+    // `texldl` names, as a pixel sampler's does.
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "texldl samples the level it names"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 3),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "MAXMIPLEVEL 3 clamps an explicit LOD of 1"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 4.0),
+        MIP_TINTS[4],
+        "a coarser explicit LOD is kept, not shifted"
+    );
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_counts_its_lod_from_the_texture_lod() {
+    // `SetLOD` on a texture bound to a vertex sampler makes that level the
+    // most detailed one, whether it was set before the bind or after it, and
+    // binding a texture without a LOD drops it again.
+    use mtld3d_types::{D3DPOOL_MANAGED, D3DVERTEXTEXTURESAMPLER0};
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 0.0),
+        MIP_TINTS[2],
+        "LOD 0 reads the texture's most detailed level"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "LOD 1 reads the level below it"
+    );
+    assert_eq!(tex.set_lod(1), 2, "SetLOD(1) on the bound texture");
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[2],
+        "a SetLOD after the bind reaches the next draw"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 4),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[4],
+        "MAXMIPLEVEL 4 clamps level 2"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 0),
+        0
+    );
+
+    let plain = mip_tinted_texture(&h);
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, &plain),
+        0,
+        "bind a texture without a LOD"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "the new texture counts from its level 0"
+    );
+    assert_eq!(tex.set_lod(0), 1, "SetLOD(0) restores the base level");
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_adds_the_sampler_lod_bias() {
+    // `D3DSAMP_MIPMAPLODBIAS` on a vertex sampler shifts the level a vertex
+    // `texldl` names.
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    for (bias, lod, level) in [(1.0_f32, 1.0, 2), (-1.0, 3.0, 2), (2.0, 0.0, 2)] {
+        assert_eq!(
+            h.set_sampler_state(
+                D3DVERTEXTEXTURESAMPLER0,
+                D3DSAMP_MIPMAPLODBIAS,
+                bias.to_bits()
+            ),
+            0
+        );
+        assert_eq!(
+            vertex_fetch_at_lod(&h, lod),
+            MIP_TINTS[level],
+            "bias {bias} on LOD {lod}"
+        );
+    }
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPMAPLODBIAS, 0),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "no bias leaves the level where texldl put it"
+    );
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_without_mipmapping_samples_the_texture_lod() {
+    // With the vertex sampler's `D3DSAMP_MIPFILTER` NONE, D3D9 samples the
+    // texture's most detailed level whatever LOD the shader names.
+    use mtld3d_types::{D3DPOOL_MANAGED, D3DVERTEXTEXTURESAMPLER0};
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_vertex_fetch_at_lod(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE),
+        0
+    );
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    for lod in [0.0, 4.0] {
+        assert_eq!(
+            vertex_fetch_at_lod(&h, lod),
+            MIP_TINTS[2],
+            "texldl at LOD {lod} samples the LOD level"
+        );
+    }
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn two_vertex_texldl_shaders_in_one_frame_each_run_their_own_function() {
+    // Two different `texldl` vertex shaders under a vertex sampler state that
+    // moves the level (a +1 bias) each compile their own function keyed for
+    // the vertex LOD table. Drawn back to back in one frame, the second draw
+    // must run the second shader: it reads its LOD from `c1.x`, the first
+    // from `c0.x`, so each half of the target shows a different level.
+    use mtld3d_tests::PosVertex;
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(
+            D3DVERTEXTEXTURESAMPLER0,
+            D3DSAMP_MIPMAPLODBIAS,
+            1.0_f32.to_bits()
+        ),
+        0
+    );
+    let mut from_c1 = VS_FETCH_AT_LOD;
+    // `mov r1.w, c0.x` becomes `mov r1.w, c1.x`.
+    from_c1[24] = 0xA000_0001;
+    let first = h.create_vertex_shader(&VS_FETCH_AT_LOD);
+    let second = h.create_vertex_shader(&from_c1);
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0]),
+        0,
+        "c0.x = 0, c1.x = 2"
+    );
+    let triangle = |dx: f32| {
+        centered_triangle().map(|v| PosVertex {
+            x: v.x.mul_add(0.5, dx),
+            ..v
+        })
+    };
+    let (left, right) = (triangle(-0.5), triangle(0.5));
+    // The first frame builds both functions; the second draws both from
+    // libraries that are already built, the path that answers a draw from
+    // the previous draw's.
+    for _ in 0..2 {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.set_vertex_shader(&first), 0, "first VS");
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0);
+            assert_eq!(d.set_vertex_shader(&second), 0, "second VS");
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right), 0);
+        });
+    }
+    assert_eq!(
+        h.read_pixel(160, 260),
+        MIP_TINTS[1],
+        "the first shader: LOD 0 plus the bias"
+    );
+    assert_eq!(
+        h.read_pixel(480, 260),
+        MIP_TINTS[3],
+        "the second shader: LOD 2 plus the bias"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPMAPLODBIAS, 0),
+        0
+    );
+    disarm_vertex_fetch(&h);
+}
+
+/// Position, diffuse and one four-component texture coordinate.
+///
+/// The FVF is `D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 |
+/// D3DFVF_TEXCOORDSIZE4(0)`, the shape a projective shadow-map lookup takes.
+#[repr(C)]
+struct ProjectiveVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+    coord: [f32; 4],
+}
+
+/// A projected fixed-function shadow-map stage compares `z / w` against the stored depth.
+///
+/// The D24S8 texture holds depth 0.5 everywhere. Each half of the target
+/// draws the coordinate `(0.5, 0.5, r, 1)` scaled by `w = 4` through
+/// `D3DTTFF_COUNT4 | D3DTTFF_PROJECTED` and an identity texture matrix, so
+/// the comparison reads the reference `r`: 0.25 passes (white) on the left
+/// and 0.75 fails (black) on the right. An undivided reference reads 1.0 and
+/// 3.0 and fails on both halves.
+#[test]
+fn projected_shadow_map_lookup_divides_the_reference_by_w() {
+    use mtld3d_types::{
+        D3DFMT_D24S8, D3DPOOL_DEFAULT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DTS_TEXTURE0,
+        D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4, D3DTTFF_PROJECTED, D3DUSAGE_DYNAMIC,
+    };
+    const TEXCOORDSIZE4_0: u32 = 2 << 16;
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let h = Harness::new();
+    let depth = h.create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
+    depth
+        .lock_rect(0, 0)
+        .write_u32_rect(4, 4, &[0x8000_0000; 16]);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | TEXCOORDSIZE4_0),
+        0
+    );
+    h.select_texture_stage(0);
+    assert_eq!(h.set_texture(0, &depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &IDENTITY), 0);
+    assert_eq!(
+        h.set_texture_stage_state(
+            0,
+            D3DTSS_TEXTURETRANSFORMFLAGS,
+            D3DTTFF_COUNT4 | D3DTTFF_PROJECTED
+        ),
+        0
+    );
+    let quad = |left: f32, right: f32, reference: f32| {
+        let v = |x, y| ProjectiveVertex {
+            x,
+            y,
+            z: 0.5,
+            color: 0xFFFF_FFFF,
+            coord: [2.0, 2.0, reference * 4.0, 4.0],
+        };
+        [
+            v(left, 1.0),
+            v(right, 1.0),
+            v(left, -1.0),
+            v(right, 1.0),
+            v(right, -1.0),
+            v(left, -1.0),
+        ]
+    };
+    h.render_once(YELLOW, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(-1.0, 0.0, 0.25)),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0.0, 1.0, 0.75)),
+            0
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(160, 240),
+        0xFFFF_FFFF,
+        "reference 0.25 after the divide passes against 0.5",
+    );
+    assert_pixel_eq(
+        h.read_pixel(480, 240),
+        0x0000_0000,
+        "reference 0.75 after the divide fails against 0.5",
+    );
+}
+
+/// A shadow-map stage samples the level `D3DSAMP_MAXMIPLEVEL` names.
+///
+/// A depth sample pins its level, since a shadow map's derivatives are not
+/// reliable, and Metal applies no sampler clamp to a pinned level, so the
+/// stage's finest level reaches the sample in the shader. The two-level D24S8
+/// texture holds depth 0.25 in level 0 and 0.75 in level 1, and the reference
+/// 0.5 fails against the first and passes against the second.
+#[test]
+fn shadow_map_lookup_samples_the_max_mip_level() {
+    use mtld3d_types::{
+        D3DFMT_D24S8, D3DPOOL_DEFAULT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DTS_TEXTURE0,
+        D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4, D3DTTFF_PROJECTED, D3DUSAGE_DYNAMIC,
+    };
+    const TEXCOORDSIZE4_0: u32 = 2 << 16;
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let h = Harness::new();
+    let depth = h.create_texture(4, 4, 2, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
+    depth
+        .lock_rect(0, 0)
+        .write_u32_rect(4, 4, &[0x4000_0000; 16]);
+    depth
+        .lock_rect(1, 0)
+        .write_u32_rect(2, 2, &[0xC000_0000; 4]);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | TEXCOORDSIZE4_0),
+        0
+    );
+    h.select_texture_stage(0);
+    assert_eq!(h.set_texture(0, &depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &IDENTITY), 0);
+    assert_eq!(
+        h.set_texture_stage_state(
+            0,
+            D3DTSS_TEXTURETRANSFORMFLAGS,
+            D3DTTFF_COUNT4 | D3DTTFF_PROJECTED
+        ),
+        0
+    );
+    let v = |x, y| ProjectiveVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        coord: [0.5, 0.5, 0.5, 1.0],
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    let sample = || {
+        h.render_once(YELLOW, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(320, 240)
+    };
+    assert_pixel_eq(
+        sample(),
+        0x0000_0000,
+        "level 0 holds 0.25, which the reference 0.5 fails against",
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_pixel_eq(
+        sample(),
+        0xFFFF_FFFF,
+        "MAXMIPLEVEL 1 samples level 1, which holds 0.75",
+    );
 }

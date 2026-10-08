@@ -3,40 +3,57 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
+use core::ffi::{c_char, c_void};
 use std::{
     sync::{
         Barrier, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window,
-    cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child,
-    spawn_scoped, window_rect,
+    Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP,
+    WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var,
+    create_window, cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes,
+    run_child, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
-    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
-    D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DF24,
-    D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_NV12,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
-    D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
-    D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    DevCaps, TextureCaps,
+    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
+    D3DERR_NOTFOUND, D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8,
+    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F,
+    D3DFMT_INDEX16, D3DFMT_L8, D3DFMT_NV12, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DGAMMARAMP, D3DLOCK_READONLY, D3DMULTISAMPLE_2_SAMPLES,
+    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_8_SAMPLES, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_FOUR,
+    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE,
+    D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_COLORWRITEENABLE,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSAMP_ADDRESSU, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_WORLD,
+    D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, IDirect3D9Vtbl, TextureCaps,
 };
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+}
+
+/// `LdrLockLoaderLock(flags, result, cookie)`; flags 0 waits for the lock.
+type LdrLockLoaderLockFn = unsafe extern "system" fn(u32, *mut u32, *mut usize) -> i32;
+/// `LdrUnlockLoaderLock(flags, cookie)`.
+type LdrUnlockLoaderLockFn = unsafe extern "system" fn(u32, usize) -> i32;
 
 #[test]
 fn adapter_basics() {
@@ -98,7 +115,7 @@ fn adapter_mode_enumeration() {
 fn adapter_modes_capture_the_first_factory_configuration() {
     const CHILD_NAME: &str = "adapter-mode-config.exe";
     if !running_as(CHILD_NAME) {
-        run_in_private_log_child(
+        run_in_private_log_child_with(
             CHILD_NAME,
             "device::adapter_modes_capture_the_first_factory_configuration",
             "warn,mtld3d::d3d9=info",
@@ -1222,6 +1239,169 @@ fn reset_counts_a_held_texture_once_across_public_references() {
     );
 }
 
+/// A `Reset` an outstanding resource rejects still restores the state defaults.
+///
+/// D3D9 resets the device state before it checks for outstanding resources,
+/// so after a rejected `Reset` every getter reports what a successful one
+/// would: render, sampler and stage states, the world transform and the
+/// viewport at their defaults, no texture, stream, index buffer or
+/// declaration bound, render target 0 on the back buffer with the other
+/// slots empty, and the implicit depth surface back after an explicit
+/// unbind. The frame in flight follows the defaults as well: a `Clear` after
+/// the rejection lands on the back buffer and leaves the render target the
+/// application had bound with what it held.
+#[test]
+fn rejected_reset_restores_the_state_defaults() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::with_depth();
+    // The held DEFAULT-pool render target is what rejects the Reset.
+    let target = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let second = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &target), D3D_OK, "bind target 0");
+    assert_eq!(h.set_render_target(1, &second), D3D_OK, "bind target 1");
+    assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the bound targets");
+    assert_eq!(h.clear_depth_stencil_surface(), D3D_OK, "unbind the depth");
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, 12),
+        D3D_OK,
+        "SetStreamSource"
+    );
+    let ib = h.create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
+    assert_eq!(h.set_indices(&ib), D3D_OK, "SetIndices");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        D3D_OK
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        D3D_OK
+    );
+    let world: [f32; 16] = core::array::from_fn(|i| if i % 5 == 0 { 2.0 } else { 0.0 });
+    assert_eq!(h.set_transform(D3DTS_WORLD, &world), D3D_OK);
+    let custom = D3DVIEWPORT9 {
+        x: 8,
+        y: 8,
+        width: 32,
+        height: 32,
+        min_z: 0.25,
+        max_z: 0.75,
+    };
+    assert_eq!(h.set_viewport(&custom), D3D_OK);
+
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a held DEFAULT-pool render target blocks Reset"
+    );
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+
+    assert_eq!(h.render_state(D3DRS_LIGHTING), 1, "LIGHTING default");
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_ADDRESSU),
+        D3DTADDRESS_WRAP,
+        "ADDRESSU default"
+    );
+    assert_eq!(
+        h.texture_stage_state(0, D3DTSS_COLOROP),
+        D3DTOP_MODULATE,
+        "stage-0 COLOROP default"
+    );
+    let identity: [f32; 16] = core::array::from_fn(|i| if i % 5 == 0 { 1.0 } else { 0.0 });
+    assert_eq!(
+        h.transform(D3DTS_WORLD).map(f32::to_bits),
+        identity.map(f32::to_bits),
+        "world transform default"
+    );
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.x, vp.y, vp.width, vp.height),
+        (0, 0, 640, 480),
+        "viewport covers the back buffer"
+    );
+    assert_eq!(
+        (vp.min_z.to_bits(), vp.max_z.to_bits()),
+        (0.0_f32.to_bits(), 1.0_f32.to_bits()),
+        "viewport depth range default"
+    );
+    assert!(h.texture_raw(0).is_null(), "stage-0 texture unbound");
+    let (hr, stream, _, _) = h.get_stream_source(0);
+    assert_eq!(hr, D3D_OK, "GetStreamSource");
+    assert!(stream.is_none(), "stream 0 unbound");
+    let (hr, bound_ib) = h.get_indices();
+    assert_eq!(hr, D3D_OK, "GetIndices");
+    assert!(bound_ib.is_none(), "index buffer unbound");
+    assert!(
+        h.vertex_declaration_raw().is_null(),
+        "vertex declaration unbound"
+    );
+    assert_eq!(h.fvf(), 0, "no FVF");
+    {
+        let rt0 = h.render_target(0);
+        let back_buffer = h.back_buffer(0);
+        assert_eq!(
+            rt0.as_ptr(),
+            back_buffer.as_ptr(),
+            "render target 0 is the back buffer"
+        );
+    }
+    let (hr, rt1) = h.render_target_hr(1);
+    assert_eq!(hr, D3DERR_NOTFOUND, "render target 1 unbound");
+    assert!(rt1.is_none());
+    let (hr, depth) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3D_OK, "the implicit depth surface is bound again");
+    assert!(depth.is_some());
+    drop(depth);
+
+    assert_eq!(
+        h.clear_target(RED),
+        D3D_OK,
+        "Clear after the rejected Reset"
+    );
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        RED,
+        "the Clear reaches the back buffer",
+    );
+    let (hr, desc) = target.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc of the formerly bound target");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&target, &sysmem),
+        D3D_OK,
+        "read back the formerly bound target"
+    );
+    let held = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (32 * pitch_px + 32) as usize;
+        locked.as_u32(idx + 1)[idx]
+    };
+    assert_pixel_eq(held, GREEN, "the formerly bound target keeps its contents");
+
+    drop(sysmem);
+    drop(target);
+    drop(second);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the targets are released"
+    );
+    drop(tex);
+    drop(vb);
+    drop(ib);
+}
+
 #[test]
 fn reset_bad_dims_rejected() {
     let h = Harness::new();
@@ -1245,11 +1425,20 @@ fn reset_bad_dims_rejected() {
         full_screen_refresh_rate_in_hz: 0,
         presentation_interval: 0,
     };
+    // The parameters pass the swap-effect, count and interval checks, so the
+    // rejection still ends an open recording.
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
     assert_eq!(
         h.reset_params(&mut pp),
         D3DERR_INVALIDCALL,
         "fullscreen 0x0 Reset must be INVALIDCALL"
     );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the rejected Reset ended the open recording"
+    );
+    drop(h.end_state_block());
 }
 
 #[test]
@@ -1346,7 +1535,7 @@ fn reset_flips_the_presentation_interval() {
     // every Reset of every test running beside this one writes a line of its
     // own into the suite's. The workload therefore runs in a process of its
     // own, alone in its log directory, so the lines there are its device's.
-    run_in_private_log_child(
+    run_in_private_log_child_with(
         PACING_CHILD_NAME,
         "device::reset_flips_the_presentation_interval",
         PRIVATE_LOG_FILTER,
@@ -1402,7 +1591,7 @@ fn reset_to_a_divided_interval_moves_the_ceiling() {
     }
     // Read out of the process log like the flip above, so it runs the same
     // way: in a process of its own, alone in its log directory.
-    run_in_private_log_child(
+    run_in_private_log_child_with(
         CEILING_CHILD_NAME,
         "device::reset_to_a_divided_interval_moves_the_ceiling",
         PRIVATE_LOG_FILTER,
@@ -1484,7 +1673,7 @@ fn logged_ceilings() -> Vec<(String, u32)> {
 }
 
 /// Whether this process is the copy of the test executable named `child_name`.
-fn running_as(child_name: &str) -> bool {
+pub fn running_as(child_name: &str) -> bool {
     std::env::current_exe()
         .expect("resolve test executable")
         .file_name()
@@ -1494,14 +1683,56 @@ fn running_as(child_name: &str) -> bool {
 /// The log filter a workload child runs under unless it needs more: unix-side info records.
 const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 
+/// The filter of a child that counts its drawables: the present target's debug lines too.
+pub const DRAWABLE_LOG_FILTER: &str = "warn,mtld3d::unix=info,mtld3d::unix::present=debug";
+
+/// The entry that has the presenter acquire drawables for the suite's hidden windows.
+///
+/// A present into an occluded window skips `nextDrawable` otherwise, so the
+/// call and everything it reaches would never run under the suite's Main
+/// Thread Checker here; on a machine whose windows turn visible it runs
+/// either way.
+pub const PRESENT_OCCLUDED: &str = "debug.presentOccluded=true";
+
+/// How long one `nextDrawable` may wait before it gives up and drops the frame.
+///
+/// The layer allows the timeout (`allowsNextDrawableTimeout`, set at
+/// attach), which `CAMetalLayer` documents as one second.
+pub const DRAWABLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Wait until the presenter has acquired `expected` drawables for `hwnd`, and hand the lines back.
+///
+/// The presenter logs one line per drawable under [`DRAWABLE_LOG_FILTER`], so
+/// a test that counts them knows its presents reached `nextDrawable` rather
+/// than being skipped, and cannot pass without running that call. The bound
+/// leaves every one of them its whole [`DRAWABLE_TIMEOUT`] on top of the
+/// usual ten seconds, so a runner whose hidden windows vend drawables slowly
+/// but do vend them passes; a drawable that never comes drops its frame and
+/// fails the count.
+pub fn await_acquired_drawables(hwnd: usize, expected: usize) -> Vec<String> {
+    let wait = DRAWABLE_TIMEOUT * u32::try_from(expected).expect("a drawable count fits u32");
+    await_logged_lines_within(
+        &format!("drawable acquired on window {hwnd:#x} for"),
+        expected,
+        Duration::from_secs(10) + wait,
+    )
+}
+
 /// Run `test` in a copy of this executable named `child_name`, alone in a log directory of its own.
 ///
 /// The copy logs under `filter` whatever the suite's filter is, and the
 /// layer writes its log into a directory only that process uses, so a test
 /// that reads its own process log reads its device's lines and nobody
-/// else's. `entries` overrides the suite's configuration in the child.
-/// Panics with the child's standard error when the child fails.
-fn run_in_private_log_child(child_name: &str, test: &str, filter: &str, entries: &str) {
+/// else's. Panics with the child's standard error when the child fails.
+pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+    run_in_private_log_child_with(child_name, test, filter, "");
+}
+
+/// [`run_in_private_log_child`] with `entries` added to the child's configuration.
+///
+/// `entries` are `key=value` entries, `;`-separated, for every interface the
+/// child creates; empty adds none.
+pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, entries: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1528,11 +1759,11 @@ fn run_in_private_log_child(child_name: &str, test: &str, filter: &str, entries:
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    let output = run_child(
-        &mut command,
-        &format!("{entries};log.dir={}", dir.display()),
-    )
-    .expect("run the workload child");
+    let mut config = format!("log.dir={}", dir.display());
+    if !entries.is_empty() {
+        config = format!("{entries};{config}");
+    }
+    let output = run_child(&mut command, &config).expect("run the workload child");
     assert!(
         output.status.success(),
         "workload child {child_name} failed: {}",
@@ -1657,7 +1888,7 @@ fn logged_pacing() -> Vec<String> {
 ///
 /// The log is the one the layer writes into this process's log directory,
 /// which for a workload child holds its device's lines and nobody else's.
-fn logged_lines(needle: &str) -> Vec<String> {
+pub fn logged_lines(needle: &str) -> Vec<String> {
     process_log()
         .lines()
         .filter(|line| line.contains(needle))
@@ -1690,8 +1921,13 @@ fn process_log() -> String {
 ///
 /// The layer's log thread writes a line a moment after the call that
 /// produced it returns, so the lines are polled for, within a bound.
-fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
+    await_logged_lines_within(needle, expected, Duration::from_secs(10))
+}
+
+/// [`await_logged_lines`] with a bound of the caller's.
+fn await_logged_lines_within(needle: &str, expected: usize, bound: Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + bound;
     loop {
         let logged = logged_lines(needle);
         if logged.len() >= expected {
@@ -2007,6 +2243,78 @@ fn reset_resize_grows_backbuffer() {
     assert_pixel_eq(h.read_pixel(400, 300), blue, "new center renders");
     // (700,500) only exists in the grown 800x600 backbuffer.
     assert_pixel_eq(h.read_pixel(700, 500), blue, "grown backbuffer reachable");
+}
+
+/// The name the workload child of the resized-drawable test runs under.
+const RESIZED_DRAWABLE_CHILD_NAME: &str = "resized-drawable.exe";
+
+/// A window resized under a presenting device gets a drawable of its new size.
+///
+/// The presenter re-points the layer's `drawableSize` at its backing store
+/// before each `nextDrawable`, on its own thread, so a resize of the window
+/// between two presents is the one moment it writes the layer off the main
+/// thread. The child presents into occluded windows ([`PRESENT_OCCLUDED`]),
+/// so that write and the drawables after it run under the suite's Main
+/// Thread Checker, and it reads the resize back from its log: once at the
+/// attach, which writes the window's first size, and once more for the new
+/// one.
+#[test]
+fn a_resized_window_presents_through_a_drawable_of_its_new_size() {
+    if running_as(RESIZED_DRAWABLE_CHILD_NAME) {
+        resized_drawable_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        RESIZED_DRAWABLE_CHILD_NAME,
+        "device::a_resized_window_presents_through_a_drawable_of_its_new_size",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// Present, resize the window and `Reset` to its size, and present until the drawable follows.
+fn resized_drawable_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    /// Presents at most after the resize, 20 ms apart, for Wine to resize the views.
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound.
+    const RESIZE_PRESENTS: usize = 20;
+
+    let h = Harness::new();
+    h.render_once(RED, |_| {});
+    await_acquired_drawables(h.hwnd(), 1);
+    let attached = await_logged_lines("drawable resized", 1);
+    mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 800, 600);
+    assert_eq!(h.reset(800, 600), D3D_OK, "Reset to the window's new size");
+    let mut resized = Vec::new();
+    let mut presents = 0;
+    while presents < RESIZE_PRESENTS {
+        h.render_once(BLUE, |_| {});
+        presents += 1;
+        resized = logged_lines("drawable resized");
+        if resized.len() > attached.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        resized.len() > attached.len(),
+        "the presenter resized the drawable after the window grew: {resized:?}"
+    );
+    let size = |line: &str| {
+        line.rsplit_once("-> ")
+            .map(|(_, size)| size.trim().to_owned())
+    };
+    assert_ne!(
+        size(&resized[0]),
+        size(&resized[resized.len() - 1]),
+        "the drawable moved off the window's first size: {resized:?}"
+    );
+    // The present before the resize and every one after it reached `nextDrawable`.
+    await_acquired_drawables(h.hwnd(), 1 + presents);
+    assert_pixel_eq(h.read_pixel(700, 500), BLUE, "the grown back buffer");
 }
 
 /// Whether the display lists the 640x480 mode the fullscreen tests request.
@@ -2477,6 +2785,189 @@ fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
         second_rect,
         "leaving fullscreen gives back the window the device presented into",
     );
+    destroy_window(second);
+}
+
+/// The name `a_texture_moving_between_live_devices_leaves_the_first` runs its workload under.
+const TEXTURE_MOVE_CHILD_NAME: &str = "texture-move.exe";
+
+/// The child's log filter: the texture's move and the encoders' cache records.
+const TEXTURE_MOVE_LOG_FILTER: &str =
+    "warn,mtld3d::d3d9::tex=info,mtld3d::unix=debug,mtld3d::unix::command=warn";
+
+/// A texture taken over by a second live device leaves the first device's encoder.
+///
+/// A `D3DPOOL_MANAGED` texture follows the device it is drawn with. The
+/// device it leaves had created Metal storage for it, and the destroy a
+/// texture's release sends goes to the device it is attached to at that
+/// point, which is the new one: without a destroy of its own, the first
+/// device kept that storage until it was released. The workload runs in a
+/// process of its own, so the log it reads holds its devices' lines alone.
+#[test]
+fn a_texture_moving_between_live_devices_leaves_the_first() {
+    if running_as(TEXTURE_MOVE_CHILD_NAME) {
+        texture_move_workload();
+        return;
+    }
+    run_in_private_log_child(
+        TEXTURE_MOVE_CHILD_NAME,
+        "device::a_texture_moving_between_live_devices_leaves_the_first",
+        TEXTURE_MOVE_LOG_FILTER,
+    );
+}
+
+/// Draw with a managed texture on one device, then on a second, and wait for the first to drop it.
+fn texture_move_workload() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let triangle = [
+        PosVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+    ];
+    let draw_with = |h: &Harness, texture: &Texture<'_>| {
+        assert_eq!(h.set_texture(0, texture), D3D_OK, "SetTexture");
+        assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+        h.render_once(GREEN, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle),
+                D3D_OK,
+                "draw"
+            );
+        });
+        // The read-back waits for the encoder to have replayed the frame.
+        let _ = h.read_pixel(1, 1);
+        assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+    };
+
+    let first = Harness::new();
+    let second = Harness::new();
+    let texture = first.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+    draw_with(&first, &texture);
+    draw_with(&second, &texture);
+
+    let moved = await_logged_lines("rehydrated for new device", 1);
+    let id = moved[0]
+        .split_once(" tex ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("the move line names the texture")
+        .to_owned();
+    // The first device's next frame carries the destroy its encoder runs.
+    assert_eq!(
+        first.present(),
+        D3D_OK,
+        "a present on the device the texture left"
+    );
+    let _ = first.read_pixel(1, 1);
+    await_logged_lines(&format!("texture {id} left the encoder cache"), 1);
+    drop(texture);
+}
+
+/// The name the workload child of `fullscreen_retarget_reset_carries_the_gamma_ramp` runs under.
+const GAMMA_RETARGET_CHILD_NAME: &str = "gamma-retarget.exe";
+
+/// A fullscreen `Reset` onto another device window carries the gamma ramp to the layer it attaches.
+///
+/// The retarget attaches a fresh layer, which carries no ramp, so the device
+/// sends the one it holds again. It has to ride a frame that names the new
+/// layer: the frames the Reset flushes on its way still name the layer the
+/// retarget detached, and the unix side drops a ramp for a layer no
+/// attachment record names, logging that once. The workload runs in a
+/// process of its own, so the log it reads holds its device's lines alone.
+///
+/// The child presents into occluded windows too ([`PRESENT_OCCLUDED`]), so
+/// every present after the retarget acquires a drawable, whether or not the
+/// window turns visible, and the workload counts them. Those presents run the
+/// layer's `nextDrawable` under the suite's Main Thread Checker, which ends
+/// the process if anything on that call walks `AppKit` off the main thread,
+/// as winemac's override of it on the layer Wine creates does.
+#[test]
+fn fullscreen_retarget_reset_carries_the_gamma_ramp() {
+    if running_as(GAMMA_RETARGET_CHILD_NAME) {
+        gamma_retarget_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        GAMMA_RETARGET_CHILD_NAME,
+        "device::fullscreen_retarget_reset_carries_the_gamma_ramp",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// Set a ramp on a fullscreen device, retarget it fullscreen onto a second window, and present.
+fn gamma_retarget_workload() {
+    /// Presents after the retarget, 50 ms apart, past the moment the window may turn visible.
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound with the Resets around them.
+    const VISIBLE_PRESENTS: u32 = 8;
+    let h = Harness::new();
+    let second = create_window(320, 240, false);
+    h.hold_display_mode();
+    let (screen_w, screen_h) = Harness::screen_size();
+    let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset on the device's own window"
+    );
+    // Every level at half its identity value: usable, and not identity.
+    let half: [u16; 256] = core::array::from_fn(|level| {
+        u16::try_from(level * 128).expect("a level of the halved ramp fits u16")
+    });
+    h.set_gamma_ramp(
+        0,
+        0,
+        &D3DGAMMARAMP {
+            red: half,
+            green: half,
+            blue: half,
+        },
+    );
+    assert_eq!(h.present(), D3D_OK, "the present that carries the ramp");
+
+    let mut pp = fullscreen_params(second, screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset onto a second device window"
+    );
+    assert_eq!(h.present(), D3D_OK, "the present after the retarget");
+    // A window that turns visible does so once its occlusion state arrives
+    // on the main thread; the child acquires a drawable either way.
+    for _ in 0..VISIBLE_PRESENTS {
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(h.present(), D3D_OK, "a present into the covered window");
+    }
+    // The presents after the retarget reached `nextDrawable` on the second
+    // window's layer; the first of them may race the window's own attach.
+    await_acquired_drawables(
+        second,
+        usize::try_from(VISIBLE_PRESENTS).expect("a present count fits usize"),
+    );
+    // The read-back waits for the encoder to have replayed every frame before
+    // it, which is where a ramp reaches the layer its frame names.
+    let _ = h.read_pixel(1, 1);
+    let dropped = logged_lines("with no attachment record");
+    assert!(
+        dropped.is_empty(),
+        "a ramp rode a frame naming a detached layer: {dropped:?}"
+    );
+
+    assert_eq!(h.reset(screen_w, screen_h), D3D_OK, "windowed Reset");
     destroy_window(second);
 }
 
@@ -3737,6 +4228,49 @@ fn each_direct3d9_resolves_its_own_configuration() {
 }
 
 #[test]
+fn hidden_df_formats_answer_no_to_every_multisample_count() {
+    // `caps.dfFormats = false` hides DF16 and DF24 from the format and
+    // depth-stencil-match answers, and the multisample answer hides them at
+    // every count above one too, while the interface that advertises them
+    // multisamples them where the device multisamples at all.
+    let hidden = Harness::factory_only_with_config("caps.dfFormats=false");
+    let advertised = Harness::factory_only_with_config("caps.dfFormats=true");
+    let device_multisamples = |samples| {
+        advertised
+            .check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, samples)
+            .0
+            == D3D_OK
+    };
+    for format in [D3DFMT_DF16, D3DFMT_DF24] {
+        assert_eq!(
+            hidden.check_depth_stencil_match(D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8, format),
+            D3DERR_NOTAVAILABLE,
+            "hidden {format:#x} depth-stencil match"
+        );
+        for samples in [
+            D3DMULTISAMPLE_2_SAMPLES,
+            D3DMULTISAMPLE_4_SAMPLES,
+            D3DMULTISAMPLE_8_SAMPLES,
+        ] {
+            assert_eq!(
+                hidden.check_device_multi_sample_type(format, 1, samples).0,
+                D3DERR_NOTAVAILABLE,
+                "hidden {format:#x} at {samples} samples"
+            );
+            if device_multisamples(samples) {
+                assert_eq!(
+                    advertised
+                        .check_device_multi_sample_type(format, 1, samples)
+                        .0,
+                    D3D_OK,
+                    "advertised {format:#x} at {samples} samples"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_device_keeps_the_configuration_of_the_interface_that_created_it() {
     // The device takes its configuration from the interface that created it.
     // `memory.vramBudgetMB` caps what `GetAvailableTextureMem` reports, so a
@@ -4024,6 +4558,90 @@ fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
     drop(second);
 }
 
+/// The name the workload child of the two-devices-on-one-window surface test runs under.
+const SHARED_WINDOW_CHILD_NAME: &str = "shared-window-surface.exe";
+
+/// A device leaving a window another device still presents into hands the window back to it.
+///
+/// Wine shows one client surface per window, and a device's attach creates
+/// one and shows it, hiding the surface of a device already on the window.
+/// The layer presents through `CAMetalLayer`'s own `nextDrawable`, which
+/// tells Wine nothing, so the departing device's teardown has Wine show the
+/// remaining device's surface again; otherwise the window would keep the
+/// departed device's last frame. Each attach names its layer class and its
+/// client surface, and every surface shown is logged, so the workload runs
+/// in a process of its own and reads them back. Every Wine the suite runs on
+/// keeps the client surface where attach reads it, so a null one fails. The
+/// child presents into occluded windows ([`PRESENT_OCCLUDED`]), so both
+/// layers on the window acquire drawables under the Main Thread Checker,
+/// before and after the handback.
+#[test]
+fn a_device_leaving_a_shared_window_hands_it_back_to_the_other() {
+    if running_as(SHARED_WINDOW_CHILD_NAME) {
+        shared_window_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        SHARED_WINDOW_CHILD_NAME,
+        "device::a_device_leaving_a_shared_window_hands_it_back_to_the_other",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// Two devices on one window, the later one released first, and the surfaces Wine was told to show.
+fn shared_window_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    first.render_once(RED, |_| {});
+    let second = Harness::create(&HarnessConfig {
+        device_window: first.hwnd(),
+        ..HarnessConfig::default()
+    });
+    second.render_once(BLUE, |_| {});
+    let attached = await_logged_lines("presents through CAMetalLayer", 2);
+    assert_eq!(attached.len(), 2, "both devices attached: {attached:?}");
+    for line in &attached {
+        assert!(
+            line.contains("CAMetalLayer (Bypassed)") || line.contains("CAMetalLayer (Plain)"),
+            "every layer presents through CAMetalLayer's own nextDrawable: {line}"
+        );
+    }
+    let surface = attached[0]
+        .split_once("client surface ")
+        .map(|(_, rest)| rest.trim().to_owned())
+        .expect("the attach line names the client surface");
+    // Every Wine the suite runs on keeps the client surface on the cocoa
+    // view, so a null one means the field moved and the handback is untested.
+    assert_ne!(
+        surface, "0x0",
+        "the attach read the first device's client surface"
+    );
+    assert_eq!(second.release_device(), 0, "release the later device");
+    let needle = format!("Wine shows client surface {surface}");
+    let shown = await_logged_lines(&needle, 2);
+    assert_eq!(
+        shown.len(),
+        2,
+        "the first device's surface shown at its attach and after the release: {shown:?}"
+    );
+    let last = logged_lines("Wine shows client surface");
+    assert_eq!(
+        last.last(),
+        Some(&shown[1]),
+        "the first device's surface is the last one shown: {last:?}"
+    );
+    first.render_once(RED, |_| {});
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "the remaining device");
+    // One drawable per present: the first device, the second on the same
+    // window, and the first again after the handback.
+    await_acquired_drawables(first.hwnd(), 3);
+    drop(second);
+    drop(first);
+}
+
 #[test]
 fn a_device_on_a_new_window_presents_through_the_metal_view_a_destroyed_window_left() {
     // An application that destroys its device window between two devices:
@@ -4067,7 +4685,7 @@ const LIVE_CHILD_VIEW_CHILD_NAME: &str = "kept-child-view.exe";
 #[test]
 fn a_live_child_window_keeps_its_metal_view() {
     if !running_as(LIVE_CHILD_VIEW_CHILD_NAME) {
-        run_in_private_log_child(
+        run_in_private_log_child_with(
             LIVE_CHILD_VIEW_CHILD_NAME,
             "device::a_live_child_window_keeps_its_metal_view",
             PRIVATE_LOG_FILTER,
@@ -4110,12 +4728,14 @@ fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
     // Which window took which view is read out of the process log, and in
     // the suite's process the kept view a window takes may be any test's.
     // The workload therefore runs in a process of its own, where the only
-    // kept view is its first device's.
-    run_in_private_log_child(
+    // kept view is its first device's. It presents into occluded windows
+    // too, so the moved layer acquires drawables under the Main Thread
+    // Checker.
+    run_in_private_log_child_with(
         KEPT_VIEW_CHILD_NAME,
         "device::a_new_window_takes_the_metal_view_a_destroyed_window_left",
-        PRIVATE_LOG_FILTER,
-        "",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
     );
 }
 
@@ -4153,6 +4773,9 @@ fn kept_view_move_workload() {
                 "the move names the new window: {}",
                 moved[0]
             );
+            // The moved layer presents through `CAMetalLayer`'s own
+            // `nextDrawable`, which the attach of a moved view reinstates.
+            await_acquired_drawables(second.hwnd(), 1);
         });
     });
 }
@@ -4170,7 +4793,7 @@ fn device_recreation_releases_every_pipeline_it_built() {
     // in the suite's process other tests' devices build and release their
     // own. The workload runs in a process of its own, with the unix side's
     // debug records on: those are the lines that carry the handles.
-    run_in_private_log_child(
+    run_in_private_log_child_with(
         PIPELINE_CYCLES_CHILD_NAME,
         "device::device_recreation_releases_every_pipeline_it_built",
         "warn,mtld3d::unix=debug",
@@ -4342,4 +4965,106 @@ fn a_harness_with_its_own_configuration_leaves_the_environment_alone() {
         "the entry reached its own interface"
     );
     assert_eq!(probe(&plain), D3D_OK, "and no interface created after it");
+}
+
+/// The copy of the test executable whose last interface is released under the loader lock.
+const LOADER_LOCK_CHILD_NAME: &str = "loader-lock-release.exe";
+
+/// How long the last `Release` may take under the loader lock before it counts as hung.
+const LOADER_LOCK_RELEASE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The exit code the loader-lock child ends with when its release hung, libtest's failure code.
+const LOADER_LOCK_HUNG_EXIT_CODE: u32 = 101;
+
+/// An `ntdll` export by name, for the loader-lock calls no import library names.
+fn ntdll_export(name: &core::ffi::CStr) -> *mut c_void {
+    // SAFETY: plain kernel32 lookup by a NUL-terminated name.
+    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr()) };
+    assert!(!ntdll.is_null(), "ntdll.dll is loaded in every process");
+    // SAFETY: `ntdll` is a live module handle and the name is NUL-terminated.
+    let entry = unsafe { GetProcAddress(ntdll, name.as_ptr()) };
+    assert!(!entry.is_null(), "ntdll exports {}", name.to_string_lossy());
+    entry
+}
+
+/// Release the process's last `IDirect3D9` on a thread that holds the loader lock.
+///
+/// The last interface stops the layer's log thread, and that thread leaves
+/// through `FreeLibraryAndExitThread`, which needs the loader lock. A caller
+/// that holds it, another DLL's `DLL_PROCESS_DETACH` during a `FreeLibrary`
+/// or a TLS destructor, must get its `Release` back rather than wait for a
+/// thread that cannot exit before the caller lets the lock go. The main
+/// thread watches the release, and a hang ends the process at the limit
+/// with a failing exit code. Not through a panic: the default hook's
+/// backtrace loads `dbghelp`, which waits for the loader lock the stuck
+/// worker holds, so the process would hang instead of failing.
+fn last_release_under_loader_lock_workload() {
+    let h = Harness::factory_only();
+    let factory = h.factory() as usize;
+    // The worker releases the harness's reference, the only one in this
+    // process, so the harness must not release it again.
+    core::mem::forget(h);
+    // SAFETY: the export has the `LdrLockLoaderLock` signature declared above.
+    let lock: LdrLockLoaderLockFn =
+        unsafe { core::mem::transmute(ntdll_export(c"LdrLockLoaderLock")) };
+    // SAFETY: the export has the `LdrUnlockLoaderLock` signature declared above.
+    let unlock: LdrUnlockLoaderLockFn =
+        unsafe { core::mem::transmute(ntdll_export(c"LdrUnlockLoaderLock")) };
+
+    let released = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = spawn_scoped(scope, || {
+            let mut cookie = 0usize;
+            // SAFETY: flags 0 waits for the lock; a null result is allowed
+            // and `cookie` receives the value the unlock takes back.
+            let status = unsafe { lock(0, core::ptr::null_mut(), &raw mut cookie) };
+            assert_eq!(status, 0, "LdrLockLoaderLock");
+            let interface = factory as *mut c_void;
+            // SAFETY: `interface` is the live `IDirect3D9` the harness created,
+            // whose first word is its vtable.
+            let vtbl_ptr = unsafe { *interface.cast::<*const IDirect3D9Vtbl>() };
+            // SAFETY: the vtable of a live interface is a `'static` table.
+            let vtbl = unsafe { &*vtbl_ptr };
+            // SAFETY: vtable thunk; this releases the one reference there is.
+            let remaining = unsafe { (vtbl.release)(interface) };
+            released.store(true, Ordering::Release);
+            // SAFETY: balances the lock above with the cookie it handed out.
+            let status = unsafe { unlock(0, cookie) };
+            assert_eq!(status, 0, "LdrUnlockLoaderLock");
+            remaining
+        });
+        let deadline = Instant::now() + LOADER_LOCK_RELEASE_LIMIT;
+        while !released.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "the last IDirect3D9 Release did not return within \
+                     {LOADER_LOCK_RELEASE_LIMIT:?} while its thread held the loader lock"
+                );
+                // SAFETY: plain kernel32 call answering this process's pseudo-handle.
+                let process = unsafe { GetCurrentProcess() };
+                // SAFETY: the current process's pseudo-handle; the documented
+                // self-terminate form.
+                unsafe { TerminateProcess(process, LOADER_LOCK_HUNG_EXIT_CODE) };
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = worker.join().expect("the releasing thread panicked");
+        assert_eq!(remaining, 0, "the release was the interface's last");
+    });
+}
+
+#[test]
+fn the_last_interface_release_returns_while_its_caller_holds_the_loader_lock() {
+    if running_as(LOADER_LOCK_CHILD_NAME) {
+        last_release_under_loader_lock_workload();
+        return;
+    }
+    // Only the process's last interface stops the log thread, and the
+    // suite's process always has other interfaces alive, so the workload
+    // runs in a process of its own.
+    run_in_private_log_child(
+        LOADER_LOCK_CHILD_NAME,
+        "device::the_last_interface_release_returns_while_its_caller_holds_the_loader_lock",
+        PRIVATE_LOG_FILTER,
+    );
 }

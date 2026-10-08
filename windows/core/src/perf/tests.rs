@@ -122,12 +122,13 @@ fn snapshots_survive_begin_frame_until_sampled() {
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
-/// A submission's encode split replaces the last one's, and its GPU time adds to what came before.
+/// Every submission folded before a sample adds its execute, its split and its GPU time.
 ///
-/// The GPU sums also outlive the per-frame reset, like the snapshots: a
-/// report folded between a summary and the next frame still counts.
+/// All of it outlives the per-frame reset, like the snapshots: a report
+/// folded between a summary and the next frame still counts, and the
+/// sample that takes it clears it.
 #[test]
-fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
+fn submit_timings_fold_adds_and_survives_until_sampled() {
     let frame = CommandBufferRole::Frame as usize;
     let upload = CommandBufferRole::Upload as usize;
     let present = CommandBufferRole::Present as usize;
@@ -147,9 +148,11 @@ fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
     let mut state = EncoderPerfState::new();
     state.fold_submit_timings(&first, 7_000);
     state.fold_submit_timings(&second, 8_000);
-    assert_eq!(state.enc.submit_blits_cycles, 0, "the later split replaces");
-    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(5_000));
-    assert_eq!(state.enc.submit_commit_cycles, 0);
+    assert_eq!(state.enc.submit_exec_cycles, 15_000, "the executes add");
+    assert_eq!(state.enc.submit_blits_cycles, ns_to_cycles(1_000));
+    let passes = ns_to_cycles(2_000) + ns_to_cycles(5_000);
+    assert_eq!(state.enc.submit_passes_cycles, passes, "the splits add");
+    assert_eq!(state.enc.submit_commit_cycles, ns_to_cycles(3_000));
     let frame_cycles = ns_to_cycles(4_000_000) + ns_to_cycles(6_000_000);
     assert_eq!(state.enc.gpu_cycles[frame], frame_cycles, "GPU time adds");
     assert_eq!(state.enc.gpu_cycles[upload], 0);
@@ -162,7 +165,95 @@ fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
         "sticky across the reset"
     );
     assert_eq!(state.enc.gpu_buffers, [2, 0, 2]);
-    assert_eq!(state.enc.submit_passes_cycles, 0, "the split is per frame");
+    assert_eq!(
+        state.enc.submit_passes_cycles, passes,
+        "and so is the split"
+    );
+    assert_eq!(state.enc.submit_exec_cycles, 15_000);
+
+    let sampled = state.take_sample(&sample_caches(), &[], 0, 0);
+    assert_eq!(sampled.enc.submit_passes_cycles, passes);
+    assert_eq!(sampled.enc.gpu_buffers, [2, 0, 2]);
+    assert_eq!(state.enc.submit_exec_cycles, 0, "the sample clears it");
+    assert_eq!(state.enc.submit_passes_cycles, 0);
+    assert_eq!(state.enc.gpu_buffers, [0; CommandBufferRole::COUNT]);
+}
+
+/// Both waits add over a sample's submissions.
+///
+/// Two present-bearing submissions returning in one frame each report the
+/// drawable waits committed before them, so neither wait may be dropped.
+#[test]
+fn submit_waits_add_over_a_samples_submissions() {
+    let mut state = EncoderPerfState::new();
+    state.add_submit_wait_nanos(3_000_000, 1_000_000);
+    state.add_submit_wait_nanos(2_000_000, 2_000_000);
+    assert_eq!(
+        state.enc.drawable_wait_cycles,
+        ns_to_cycles(3_000_000) + ns_to_cycles(2_000_000)
+    );
+    assert_eq!(
+        state.enc.present_wait_cycles,
+        ns_to_cycles(1_000_000) + ns_to_cycles(2_000_000)
+    );
+}
+
+/// The submit thread's timings reach the window when a blocking flush drains them.
+///
+/// The order a game that flushes every frame produces: an async present,
+/// the flush's barrier draining that present's submission before the
+/// flush's own frame begins, the flush's synchronous submit, then the next
+/// async present. The present's passes land in the flush's sample with the
+/// flush's own, and the next frame reports nothing twice.
+#[test]
+fn a_drained_present_submission_reaches_the_flush_sample() {
+    let timed = || {
+        let mut payload = FramePerfPayload::new();
+        payload.counters.timed = 1;
+        payload
+    };
+    let caches = sample_caches();
+    let mut state = EncoderPerfState::new();
+    let mut window = PerfWindow::new();
+
+    // The async present: its submission returns after its own summary.
+    state.begin_frame(&timed());
+    window.accumulate(&state.take_sample(&caches, &[], 0, 0));
+
+    // The flush: the barrier drains the present's submission first.
+    let mut present = SubmitTimings::new();
+    present.passes_ns = 2_000_000;
+    present.commit_ns = 100_000;
+    state.add_submit_wait_nanos(4_000_000, 500_000);
+    state.fold_submit_timings(&present, 3_000_000);
+    state.begin_frame(&timed());
+    let mut flush = SubmitTimings::new();
+    flush.passes_ns = 100_000;
+    state.add_submit_wait_nanos(0, 0);
+    state.fold_submit_timings(&flush, 200_000);
+    let flushed = state.take_sample(&caches, &[], 0, 0);
+    window.accumulate(&flushed);
+
+    // The next async present, with nothing returned yet.
+    state.begin_frame(&timed());
+    let next = state.take_sample(&caches, &[], 0, 0);
+    window.accumulate(&next);
+
+    let passes = ns_to_cycles(2_000_000) + ns_to_cycles(100_000);
+    assert_eq!(flushed.enc.submit_passes_cycles, passes);
+    assert_eq!(
+        window.submit_passes.sum, passes,
+        "the present's passes reach the window"
+    );
+    assert_eq!(window.submit_exec.sum, 3_200_000);
+    assert_eq!(window.submit_commit.sum, ns_to_cycles(100_000));
+    assert_eq!(window.present_wait.sum, ns_to_cycles(500_000));
+    assert_eq!(window.drawable_wait.sum, ns_to_cycles(4_000_000));
+    assert_eq!(
+        next.enc.submit_passes_cycles, 0,
+        "nothing is reported twice"
+    );
+    assert_eq!(next.enc.submit_exec_cycles, 0);
 }
 
 /// The encode children and their residual partition `Encode+commit` on every frame.
@@ -187,13 +278,12 @@ fn perf_window_submit_children_leave_a_residual() {
     assert_eq!(w.gpu[CommandBufferRole::Frame as usize].sum, 700);
 }
 
-/// A synchronous submit behind a barrier reports its own execute with its own split.
+/// A synchronous submit behind a barrier adds to the async submission the barrier drained.
 ///
-/// The async payload folded first carries a larger execute and a different
-/// split; the barrier's submit replaces both, so `Encode+commit` and its
-/// children describe one submission and the residual is that submission's.
+/// Parent and children add together, so `Encode+commit` and its children
+/// describe the same two submissions and the residual is theirs.
 #[test]
-fn barrier_submit_keeps_parent_and_children_together() {
+fn barrier_submit_adds_parent_and_children_together() {
     let mut async_timings = SubmitTimings::new();
     async_timings.leading_blits_ns = 4_000;
     async_timings.passes_ns = 9_000;
@@ -204,20 +294,20 @@ fn barrier_submit_keeps_parent_and_children_together() {
     let mut state = EncoderPerfState::new();
     state.fold_submit_timings(&async_timings, 900_000);
     state.fold_submit_timings(&sync_timings, 300_000);
-    assert_eq!(
-        state.enc.submit_exec_cycles, 300_000,
-        "the barrier's own execute"
-    );
-    assert_eq!(state.enc.submit_blits_cycles, 0);
-    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(1_000));
-    assert_eq!(state.enc.submit_commit_cycles, 0);
+    assert_eq!(state.enc.submit_exec_cycles, 1_200_000, "both executes");
+    let blits = ns_to_cycles(4_000);
+    let passes = ns_to_cycles(9_000) + ns_to_cycles(1_000);
+    let commit = ns_to_cycles(2_000);
+    assert_eq!(state.enc.submit_blits_cycles, blits);
+    assert_eq!(state.enc.submit_passes_cycles, passes);
+    assert_eq!(state.enc.submit_commit_cycles, commit);
 
     let mut w = PerfWindow::new();
     let mut s = sample(0, 0);
     s.enc = state.enc;
     w.accumulate(&s);
-    assert_eq!(w.submit_exec.sum, 300_000);
-    assert_eq!(w.submit_resid.max, 300_000 - ns_to_cycles(1_000));
+    assert_eq!(w.submit_exec.sum, 1_200_000);
+    assert_eq!(w.submit_resid.max, 1_200_000 - blits - passes - commit);
 }
 
 /// Upload outcome totals partition successful renames and survive only their reporting window.
@@ -577,7 +667,7 @@ fn summary_golden_layout() {
         "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
         "ret cap     drain=2 submit=1        peak/frame submit=1         API: VB/IB retention cap hit before a rename alloc (drain=cheap, submit=GPU wait)\n",
         "retention   depth= 6.0  3.5 MB avg  peak depth=6   3.5 MB       encoder: shared PageBox queue (VB/IB renames + texture-blit padded staging + visibility pool)\n",
-        "pool        hit=14 miss=1 (93.3%)   recycled=14  672 KB         API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)\n",
+        "pool        hit=14 miss=1 (93.3%)   recycled=14  672 KB         API pops a warm same-size PageBox; both runtimes park retired ones (memory.pageboxPoolCapMB, 0 = off)\n",
         "  parked    1.0 MB avg              peak 1.0 MB                 bytes held in the pool for reuse (already retired; excluded from retention above)\n",
         "\n",
         "Resources (textures)  — same layout as VB/IB; n/a rows omitted\n",
@@ -591,8 +681,10 @@ fn summary_golden_layout() {
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
         "  pass      0                                                   encoder: render pass; staging read by a fragment function (16-bit widening, sub-alignment pitch)\n",
         "reorder     1                                                   encoder: MTLTexture rename-at-overlap (upload hit a texture sampled earlier this frame)\n",
-        "destroys    1                                                   encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + texture release)\n",
+        "destroys    1                                                   encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + staging release + texture release)\n",
         "retention   depth= 0.0  0 KB avg    peak 0 KB                   encoder: blit source staging Arcs (separate from VB/IB retention; MTLTexture handles in destroys)\n",
+        "wrapped     4.0 MB                                              encoder: staging under cached per-level bytesNoCopy wrappers at the summary (pins its guest pages)\n",
+        "  churn     new=3 retired=2         peak/frame new=3            encoder: wrappers created, and queued for destroy (backing change, staging release, texture release)\n",
         "dirtyrect   4                       3 partial, 25% mip          API: AddDirtyRect calls; partial = sub-region narrower than mip (feeds dirty-rect snapshot upload decision)\n",
         "\n",
         "Caches (live sizes at summary emit)\n",
@@ -646,9 +738,11 @@ fn summary_golden_layout() {
         "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
         "  size      64 KB avg               peak 64 KB                  submitted payload Vec<Command> capacity (excludes idle pool and other payloads)\n",
         "  realloc   192 KB avg              peak 192 KB                 Vec<Command> potential growth copies on emit_command (excludes initial allocations)\n",
-        "pagebox     alloc=17  4.8 MB        free=15  4.6 MB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)\n",
+        "pagebox     alloc=17  4.8 MB        free=15  4.6 MB             window totals of PageBox allocs/frees reaching either runtime's allocator (fresh pages fault on first touch)\n",
         "  uncached  1 (5.9%)                peak 1/frame                allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time\n",
-        "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
+        "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here\n",
+        "footprint   3072.0 MB                                           process phys_footprint at the summary, the Metal HUD's app memory (Wine and the game included)\n",
+        "metal alloc 1536.0 MB                                           MTLDevice currentAllocatedSize at the summary (every Metal allocation of the process)",
     );
     assert_eq!(got, want, "perf summary drifted — diff above");
 }
@@ -773,17 +867,22 @@ fn kv_golden_line() {
         " vbib_retention_peak_count=6 vbib_retained_bytes=3670016 vbib_pool_hit_total=14",
         " vbib_pool_miss_total=1 pagebox_pool_recycled_total=14",
         " pagebox_pool_recycled_bytes_total=688128 pagebox_pool_parked_bytes=1048576",
+        " pe_pagebox_pool_recycled_total=0 pe_pagebox_pool_recycled_bytes_total=0",
+        " pe_pagebox_pool_parked_bytes=0",
         " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
         " tex_preserve_cpu_total=1",
         " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
+        " tex_staging_wrapped_bytes=4194304 tex_wrapper_create_total=3",
+        " tex_wrapper_retire_total=2",
         " tex_dirtyrect_calls_total=4 tex_dirtyrect_partial_total=3",
         " cache_textures_count=48 cache_pipelines_count=12 cache_samplers_count=6",
         " cache_programs_count=8 cache_libs_count=8 cache_depth_states_count=4",
+        " metal_allocated_bytes=1610612736",
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
-        " pipeline_memo_calls_total=100 fan_generated_total=0 up_indexed_total=3",
-        " up_oversized_total=2 keys_set_texture_calls_total=0",
+        " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
+        " up_indexed_total=3 up_oversized_total=2 keys_set_texture_calls_total=0",
         " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
         " keys_set_render_state_skips_total=0 keys_set_tex_stage_state_calls_total=0",
         " keys_set_tex_stage_state_skips_total=0 keys_set_fvf_calls_total=0",
@@ -799,9 +898,48 @@ fn kv_golden_line() {
         " cmd_vec_capacity_bytes=65536 cmd_vec_realloc_bytes_total=196608",
         " pagebox_alloc_total=17 pagebox_alloc_bytes_total=4980736 pagebox_free_total=15",
         " pagebox_free_bytes_total=4849664 pagebox_uncached_total=1",
+        " pe_pagebox_alloc_total=0 pe_pagebox_alloc_bytes_total=0 pe_pagebox_free_total=0",
+        " pe_pagebox_free_bytes_total=0 pe_pagebox_uncached_total=0",
         " faults_minor_total=4200 faults_major_total=3",
+        " process_footprint_bytes=3221225472",
     );
     assert_eq!(got, want, "perf-kv line drifted");
+}
+
+/// A window closed before its memory sample prints `n/a` in the three rows and has no keys.
+///
+/// The grid and the line are otherwise the goldens above, cell for cell: the
+/// `n/a` cells keep the comment column, and nothing else moves.
+#[test]
+fn an_unsampled_window_prints_n_a_and_leaves_the_memory_keys_out() {
+    let w = sample_window();
+    let unsampled = CacheSizes {
+        memory: None,
+        ..sample_caches()
+    };
+    let grid = Summary::render_with_ansi(&w, &unsampled, 2.01, false);
+    let mut want = Summary::render_with_ansi(&w, &sample_caches(), 2.01, false);
+    for (sampled, missing) in [
+        ("\nwrapped     4.0 MB    ", "\nwrapped     n/a       "),
+        ("\nfootprint   3072.0 MB ", "\nfootprint   n/a       "),
+        ("\nmetal alloc 1536.0 MB ", "\nmetal alloc n/a       "),
+    ] {
+        assert!(want.contains(sampled), "the sampled grid has {sampled:?}");
+        want = want.replace(sampled, missing);
+    }
+    assert_eq!(grid, want, "only the three memory cells change");
+
+    let kv = render_kv(&w, &w, &unsampled, 2.01).finish();
+    let mut want = render_kv(&w, &w, &sample_caches(), 2.01).finish();
+    for key in [
+        " tex_staging_wrapped_bytes=4194304",
+        " metal_allocated_bytes=1610612736",
+        " process_footprint_bytes=3221225472",
+    ] {
+        assert!(want.contains(key), "the sampled line has {key:?}");
+        want = want.replace(key, "");
+    }
+    assert_eq!(kv, want, "only the three memory keys are left out");
 }
 
 /// Over two unequal frames, `_ms` averages, `_peak_ms` takes the worst frame and `_total` sums.
@@ -1124,6 +1262,16 @@ fn sample_window() -> PerfWindow {
             // The sampled draws spent 10 000 in `keys`, 5 000 of them in RS,
             // so `rest` scales to 10 000.
             draw_snapshot_keys_sampled_cycles: 10_000,
+            // `d3d9.dll`'s traffic, which the window keeps apart under the
+            // `pe_pagebox_*` keys and the grid adds to the encoder's own.
+            pagebox_alloc_bytes: 0,
+            pagebox_free_bytes: 0,
+            pool_recycled_bytes: 0,
+            pool_parked_bytes: 0,
+            pagebox_allocs: 0,
+            pagebox_frees: 0,
+            pagebox_uncached_allocs: 0,
+            pool_recycled: 0,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,
@@ -1155,6 +1303,8 @@ fn sample_window() -> PerfWindow {
             texture_blit_padded_uploads: 0,
             texture_expand_uploads: 0,
             texture_gpu_renames: 1,
+            staging_wrapper_creates: 3,
+            staging_wrapper_retires: 2,
             op_cycles: 1_400_000,
             // Decompose op_cyc 1.40M into the nine phases (six draw phases sum
             // 1.35M + three non-draw phases sum 0.03M = 1.38M) so the golden
@@ -1169,6 +1319,7 @@ fn sample_window() -> PerfWindow {
             // 97 of 100 pipeline resolves served from the memo → 97.0%.
             pipeline_memo_hits: 97,
             fan_generated: 0,
+            draw_unpinned: 0,
             // Three indexed UP draws and two oversized inline vertex streams
             // went through the unix upload ring.
             up_indexed: 3,
@@ -1266,6 +1417,11 @@ const fn sample_caches() -> CacheSizes {
         pending_blit_retention_depth: 0,
         pending_resource_retention_depth: 1,
         pagebox_pool_bytes: 1_048_576,
+        memory: Some(MemoryGauges {
+            process_footprint: 3 << 30,
+            metal_allocated: 3 << 29,
+            staging_wrapped: 4 << 20,
+        }),
     }
 }
 
@@ -2136,4 +2292,107 @@ fn frame_picks_depend_only_on_the_seed_and_the_frame_count() {
         1,
         "a zero seed is made odd, since xorshift stays at 0"
     );
+}
+
+/// `d3d9.dll`'s page-box and pool traffic rides the payload and joins the encoder's own.
+///
+/// The `PageBox` counters and the pool the game recycles through belong to
+/// `d3d9.dll`, while the summary runs in `mtld3d.so`. The API thread
+/// carries the delta since its previous drain (none on the first, which has
+/// no baseline) and the parked gauge; the sample adds them to the encoder's.
+#[test]
+fn pe_pagebox_traffic_rides_the_payload_into_the_window() {
+    const fn volume(allocs: u64, frees: u64, uncached_allocs: u64) -> PageBoxVolume {
+        PageBoxVolume {
+            allocs,
+            alloc_bytes: allocs * 16_384,
+            frees,
+            free_bytes: frees * 16_384,
+            uncached_allocs,
+        }
+    }
+    const fn pool(recycled: u64, parked_bytes: u64) -> PoolTraffic {
+        PoolTraffic {
+            recycled,
+            recycled_bytes: recycled * 32_768,
+            parked_bytes,
+        }
+    }
+    let mut api = ApiPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    api.drain_into_payload(&mut payload, true);
+    api.carry_pagebox_traffic(&mut payload, volume(100, 40, 3), pool(10, 4_096));
+    assert_eq!(
+        payload.counters.pagebox_allocs, 0,
+        "the first drain has no baseline"
+    );
+    assert_eq!(payload.counters.pool_recycled, 0);
+    assert_eq!(
+        payload.counters.pool_parked_bytes, 4_096,
+        "the gauge needs none"
+    );
+
+    api.drain_into_payload(&mut payload, true);
+    api.carry_pagebox_traffic(&mut payload, volume(130, 55, 4), pool(4_016, 8_192));
+    let carried = &payload.counters;
+    assert_eq!(carried.pagebox_allocs, 30);
+    assert_eq!(carried.pagebox_alloc_bytes, 30 * 16_384);
+    assert_eq!(carried.pagebox_frees, 15);
+    assert_eq!(carried.pagebox_free_bytes, 15 * 16_384);
+    assert_eq!(carried.pagebox_uncached_allocs, 1);
+    assert_eq!(carried.pool_recycled, 4_006);
+    assert_eq!(carried.pool_recycled_bytes, 4_006 * 32_768);
+    assert_eq!(carried.pool_parked_bytes, 8_192);
+
+    let mut enc = EncoderPerfState::new();
+    enc.begin_frame(&payload);
+    enc.bump_pagebox_pool_recycled(16_384);
+    let mut caches = sample_caches();
+    caches.pagebox_pool_bytes = 1_000;
+    // A fresh encoder has no baseline of its own, so its runtime adds no
+    // `PageBox` traffic to this sample.
+    let frame = enc.take_sample(&caches, &[], 0, 0);
+    assert_eq!(frame.pagebox_allocs, 0, "the sample's own runtime only");
+    assert_eq!(frame.pagebox_pool_bytes, 1_000);
+
+    let mut window = PerfWindow::new();
+    window.accumulate(&frame);
+    assert_eq!(
+        window.pagebox_pool_recycled.sum, 1,
+        "the encoder's pool only"
+    );
+    assert_eq!(window.pagebox_allocs.sum, 0);
+    assert_eq!(window.pe_pagebox_allocs.sum, 30);
+    assert_eq!(window.pe_pagebox_alloc_bytes.sum, 30 * 16_384);
+    assert_eq!(window.pe_pagebox_frees.sum, 15);
+    assert_eq!(window.pe_pagebox_uncached_allocs.sum, 1);
+    assert_eq!(window.pe_pagebox_pool_recycled.sum, 4_006);
+    assert_eq!(window.pe_pagebox_pool_recycled_bytes.sum, 4_006 * 32_768);
+    assert_eq!(window.pe_pagebox_pool_bytes.max, 8_192);
+    assert_eq!(
+        window.pagebox_pool_bytes_both.max,
+        1_000 + 8_192,
+        "both pools parked"
+    );
+    assert_eq!(window.pagebox_uncached_both.max, 1);
+
+    // The old keys keep the encoder's runtime; `d3d9.dll`'s get keys of their own.
+    let kv = render_kv(&window, &window, &caches, 2.0).finish();
+    for pair in [
+        " pagebox_alloc_total=0 ",
+        " pagebox_pool_recycled_total=1 ",
+        " pagebox_pool_parked_bytes=1000 ",
+        " pe_pagebox_alloc_total=30 ",
+        " pe_pagebox_free_total=15 ",
+        " pe_pagebox_uncached_total=1",
+        " pe_pagebox_pool_recycled_total=4006 ",
+        " pe_pagebox_pool_parked_bytes=8192 ",
+    ] {
+        assert!(kv.contains(pair), "{pair} missing from {kv}");
+    }
+    // The grid's rows show the two runtimes together.
+    let grid = Summary::render_with_ansi(&window, &caches, 2.0, false);
+    assert!(grid.contains("recycled=4007 "), "{grid}");
+    assert!(grid.contains("alloc=30 "), "{grid}");
+    assert!(grid.contains("free=15 "), "{grid}");
 }

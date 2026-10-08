@@ -21,6 +21,7 @@ fn resolved_configuration_preserves_nondefaults() {
     let mut value = Mtld3dConfig::default();
     value.caps_all = !value.caps_all;
     value.main_thread_checker = !value.main_thread_checker;
+    value.fail_next_submit = !value.fail_next_submit;
     value.expand_packed16 = !value.expand_packed16;
     value.deny_float32_filtering = !value.deny_float32_filtering;
     value.managed_memory = !value.managed_memory;
@@ -35,6 +36,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.bytecode_dump_dir = "bytecode_dump_dir/utf8-ä".into();
     value.skip_shaders = vec![0, u64::MAX, 55];
     value.present_gate_file = "present_gate_file/utf8-ä".into();
+    value.present_occluded = !value.present_occluded;
     value.query_flush_immediate = !value.query_flush_immediate;
     value.query_event_immediate = !value.query_event_immediate;
     value.depth_alias_same_size = !value.depth_alias_same_size;

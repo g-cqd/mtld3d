@@ -8,13 +8,18 @@
 use log::{Level, log_enabled};
 use mtld3d_core::{
     async_compile::{ClearPlanes, DeferredState, JobTicket, LibrarySlot, Resolution},
-    convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
+    convert::{
+        d3d_depth_bias_to_clip, d3d_slope_scale_to_metal, d3d_to_metal_cull, d3d_to_metal_fill,
+    },
     depth_stencil_state::STENCIL_MASK_BITS,
-    dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range, vertex_read_size},
-    draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
+    dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
+    draw_data::{
+        AttrSnapshot, FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource,
+    },
     dxso::{VariantFlags, VariantKey, bound_sampler_type},
     encoder_draw::draw_record::{
-        DrawView, IndexView, StreamViewFeed as VertexFeed, VertexView, stream_layouts_view,
+        DrawView, IndexView, StreamRecord, StreamViewFeed as VertexFeed, VertexView,
+        stream_layouts_view,
     },
     ids::BufferId,
     passes::{
@@ -22,16 +27,19 @@ use mtld3d_core::{
         null_texture_tex_sentinel, sampler_cache_key,
     },
     perf::{CycleAddTimer, OpSub, OpSubDetail},
-    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot},
-    streams::{instance_count, instanced_stream_read_bytes, is_instance_data},
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot, StreamLayout},
+    streams::{
+        CrossingFetch, crossing_read_size, instance_count, instanced_stream_read_bytes,
+        is_instance_data, offset_shift, slot_binding_offset, stream_shifts,
+    },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
 use mtld3d_shared::{
-    Command, MetalHandle, VertexAttrDesc,
+    Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-        VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
+        VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
     mtl_handle::MTLFunctionKind,
 };
@@ -50,7 +58,7 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
     )
 });
 
-use super::encoder::{FrameEncoder, STAGE_COUNT, StageLibHandles};
+use super::encoder::{FrameEncoder, PsSamplerDecls, STAGE_COUNT, StageLibHandles};
 
 /// Sub-target for the per-`(VS, PS, state)` diagnostic from the depth-bias site below.
 ///
@@ -71,9 +79,9 @@ const DECAL_TRACE_TARGET: &str = "mtld3d::d3d9::decal";
 const CASTER_TRACE_TARGET: &str = "mtld3d::d3d9::caster";
 
 pub use mtld3d_core::draw_data::{
-    CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
+    CurrentSnapshot, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
     RenderStateSnapshot, ScratchSlice, ShaderRef, StageBindingsPtr, VsSourceView,
-    arena_alloc_bytes, null_texture_kind,
+    arena_alloc_bytes, missing_texture_kind, null_texture_kind,
 };
 
 /// Close the `draw N` debug group `emit_draw` opened for a dumped draw.
@@ -83,12 +91,6 @@ fn close_dump_group(enc: &mut FrameEncoder, dump_draw: Option<u32>) {
     }
 }
 
-/// Encoder-thread draw dispatch.
-///
-/// Pulls the cumulative state from `enc.current_snapshot` (updated by
-/// the draw op before dispatch) and combines it with `draw`'s
-/// per-call varying parameters (primitive type + vertex/index source).
-/// UP spans borrow the API frame capture until native submit replay completes.
 /// The depth and stencil planes a draw tests or writes, as a pending build's skip needs them.
 fn planes_used(
     render_state: &RenderStateSnapshot,
@@ -306,19 +308,41 @@ fn resolve_pipeline_slow(
 
 /// Execute a draw directly from its retained command record.
 ///
+/// Combines the cumulative state in `snap`, which the packet's snapshot
+/// records built up before this draw, with `draw`'s per-call parameters
+/// (primitive type and vertex and index source). UP spans borrow the API
+/// frame capture until native submit replay completes.
 /// [`DrawView::new`] has already rejected malformed draw fields, so nothing
-/// here fails.
+/// here fails. The draw runs at a fixed stack page offset (see
+/// [`crate::stack_page`]), so its speed does not depend on the frames above it.
 ///
 /// # Safety
 /// The view must belong to the authentic admitted packet. Its captured bytes and
 /// backing allocations remain immutable and retained until submit completion. The
-/// encoder snapshot cache must name initialized snapshots retained by that packet.
-pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) {
-    emit_draw_view(enc, draw.metal_primitive(), draw.vertices(), draw.indices());
+/// tokens in `snap` must have been decoded from records retained by that packet.
+pub unsafe fn emit_draw(enc: &mut FrameEncoder, snap: &CurrentSnapshot, draw: &DrawView<'_>) {
+    crate::stack_page::run_pinned(|| {
+        #[cfg(perf_tracking)]
+        if !crate::stack_page::at_pin() {
+            enc.bump_draw_unpinned();
+        }
+        emit_draw_view(
+            enc,
+            snap,
+            draw.metal_primitive(),
+            draw.vertices(),
+            draw.indices(),
+        );
+    });
 }
 
+// Kept out of line so that its frame, and so every call it makes, sits below
+// the gap `run_pinned` reserves; inlined, each of the 64 gap instances would
+// also carry its own copy of this function.
+#[inline(never)]
 fn emit_draw_view(
     enc: &mut FrameEncoder,
+    snap: &CurrentSnapshot,
     metal_prim: PrimitiveType,
     vertex_source: &VertexView<'_>,
     index_source: &IndexView<'_>,
@@ -334,21 +358,6 @@ fn emit_draw_view(
     // next begins, and a draw-drop `return` folds the open phase in on the way
     // out. All no-ops unless perf tracking is on.
     let t_resolve = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Resolve));
-    // Lifetime-launder the scratch-resident snapshot ptr off `enc` so
-    // the rest of emit_draw can freely reborrow `&mut enc`. A snapshot
-    // command in this frame decoded the pointee into `enc.scratch` and
-    // installed the pointer before this draw.
-    let snap_ptr = enc
-        .current_snapshot_ptr()
-        .expect("emit_draw: snapshot not supplied")
-        .as_ptr();
-    // SAFETY: snap_ptr is non-null (NonNull invariant) and points to a live
-    // CurrentSnapshot in `enc.scratch`. That arena is only appended to until
-    // `finalize_submit` moves it into the frame's payload, which is cleared only
-    // after submission returns; a failed replay stops every later message before
-    // `begin_frame` could clear it. Appending never moves a chunk or writes bytes
-    // already handed out, so the pointee outlives every `enc` reborrow below.
-    let snap: &CurrentSnapshot = unsafe { &*snap_ptr };
     // Every Option must be Some by the time a Draw runs — the API
     // thread populates every field before queuing the changed snapshot.
     let render_state: &RenderStateSnapshot = snap
@@ -361,11 +370,38 @@ fn emit_draw_view(
         .as_ref()
         .expect("emit_draw: stage_bindings not populated");
     let attrs = snap.attrs.expect("emit_draw: attrs not populated");
-    let vs: VsSourceView<'_> = snap
+    // The snapshot's own VS record. Its address is the record's identity in
+    // the library memo, which `vs` below may not keep.
+    let vs_snapshot: VsSourceView<'_> = snap
         .vs
         .as_ref()
         .expect("emit_draw: vs not populated")
         .as_ref();
+    // The samplers a programmable VS declares, read once for the key below
+    // and for the vertex texture binds.
+    let vs_decls = match vs_snapshot {
+        VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
+            enc.ps_declared_samplers(*vs_id)
+        }
+        VsSourceView::FixedFunction(_) => PsSamplerDecls::default(),
+    };
+    // Every vertex sample names its level, and Metal applies no sampler LOD
+    // clamp to an explicit level, so a vertex slot whose state moves that
+    // level (a texture LOD, a LOD bias, a finest level) reaches the shader
+    // through the vertex LOD table. The VS key carries the table only for a
+    // shader whose `texldl` samples such a slot; a draw with no such slot
+    // keeps its library. The keyed copy is a local, so the memo lookup
+    // names the snapshot record alongside it.
+    let vs_lod_source;
+    let vs = match vs_snapshot {
+        VsSourceView::Programmable(source)
+            if vs_decls.explicit_lod_mask() & u16::from(enc.vertex_lod_mask()) != 0 =>
+        {
+            vs_lod_source = source.with_lod_table();
+            VsSourceView::Programmable(&vs_lod_source)
+        }
+        other => other,
+    };
     let ps: PsSourceView<'_> = snap
         .ps
         .as_ref()
@@ -432,14 +468,22 @@ fn emit_draw_view(
     // sampler and per-slot bias bind below is confined to this mask: a stage
     // the game bound a texture to that the shader never samples has no
     // argument in the emitted function, so binding it only adds encoder work.
-    let ps_sampled_mask = match ps {
+    //
+    // The explicit-level slots are the ones whose stage clamp the shader has
+    // to apply itself, since Metal ignores sampler LOD clamps at an explicit
+    // level: the `texldl` samplers of a programmable shader and every depth
+    // slot, whose samples pin a level.
+    let (ps_sampled_mask, texldl_mask) = match ps {
         PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
-            enc.ps_declared_samplers(*ps_id).mask()
+            let decls = enc.ps_declared_samplers(*ps_id);
+            (decls.mask(), decls.explicit_lod_mask())
         }
         PsSourceView::FixedFunction(FixedPsSource {
             sampled_stage_mask, ..
-        }) => *sampled_stage_mask,
+        }) => (*sampled_stage_mask, 0),
     };
+    let lod_table_mask = ps_sampled_mask & !variant.fetch4_mask;
+    let explicit_lod_mask = (texldl_mask | variant.depth_sampler_mask) & lod_table_mask;
     // `D3DSAMP_MIPMAPLODBIAS` has no Metal sampler equivalent, so the bias
     // reaches the GPU as a fragment uniform the sample sites read. Resolving
     // it here keeps every draw that leaves the state at its zero default on
@@ -456,10 +500,14 @@ fn emit_draw_view(
     } else {
         0.0
     };
+    // An explicit level takes the game's bias in its row, never the scale
+    // term, which compensates a LOD computed on the reduced grid.
     let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
+    let mut explicit_lod: Option<[[f32; 2]; mtld3d_core::sampler_state::LOD_BIAS_SLOTS]> = None;
     let mut any_lod_bias = false;
     for (stage_u32, b) in stage_bindings {
-        if (ps_sampled_mask & !variant.fetch4_mask) & (1u16 << stage_u32) == 0 {
+        let bit = 1u16 << stage_u32;
+        if lod_table_mask & bit == 0 {
             continue;
         }
         let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state) + scale_bias;
@@ -467,7 +515,14 @@ fn emit_draw_view(
             lod_bias[stage_u32 as usize] = bias;
             any_lod_bias = true;
         }
+        if explicit_lod_mask & bit != 0
+            && let Some(row) = mtld3d_core::sampler_state::explicit_lod_row(&b.sampler_state)
+        {
+            explicit_lod.get_or_insert(mtld3d_core::sampler_state::EXPLICIT_LOD_OPEN_ROWS)
+                [stage_u32 as usize] = row;
+        }
     }
+    let any_lod_table = any_lod_bias || explicit_lod.is_some();
     // `D3DRS_SRGBWRITEENABLE` picks the pass's colour attachment views, so it
     // has to reach the pass state before anything this draw emits opens a
     // pass. A change ends the current one, since the views are frozen at
@@ -517,8 +572,8 @@ fn emit_draw_view(
             !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
         );
     }
-    // Both emitters honour the bias, so the flag rides on the shared PS key.
-    ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_bias);
+    // Both emitters honour the table, so the flag rides on the shared PS key.
+    ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_table);
     // `vPos` is the rasterized pixel coordinate. Into a target rasterized
     // below the resolution D3D9 reports, a shader that declares the register
     // reads it through the `PsDraw` uniform so it stays in the reported space;
@@ -543,6 +598,17 @@ fn emit_draw_view(
         ps_variant.flags.insert(VariantFlags::SAMPLE_MASK);
         ps_variant.sample_mask = render_state.sample_mask;
     }
+    // A `ps_3_0` input semantic outside the fixed-function varyings (NORMAL,
+    // TANGENT, COLOR2, …) links by name to the vertex output of the same
+    // semantic, and Metal rejects a fragment input the vertex function does
+    // not write, so the pixel variant records which of them this draw's
+    // vertex shader outputs. Every other draw's flag is clear and its byte
+    // stays zero.
+    if let PsSourceView::Programmable(source) = ps
+        && source.reads_linked_inputs()
+    {
+        ps_variant.linked_input_mask = enc.linked_input_mask(source.ps_id, vs);
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -566,8 +632,16 @@ fn emit_draw_view(
         }
     };
     let ps_constants = match ps {
-        PsSourceView::Programmable(ProgrammablePsSource { max_const_used, .. }) => {
-            enc.ps_const_scratch(*max_const_used)
+        PsSourceView::Programmable(value) => {
+            // A `c[aL + N]` read names its row only at draw time. The
+            // statically named rows stay bound even when the application
+            // has populated fewer, so the bound prefix covers both.
+            let rows = if value.uses_rel_const() {
+                enc.ps_constants_populated_rows().max(value.max_const_used)
+            } else {
+                value.max_const_used
+            };
+            enc.ps_const_scratch(rows)
         }
         PsSourceView::FixedFunction(FixedPsSource { constant_rows, .. }) if *constant_rows != 0 => {
             snap.ps_constants.unwrap_or(ScratchSlice::EMPTY)
@@ -713,7 +787,7 @@ fn emit_draw_view(
     //    installs finished builds before probing again and queues both
     //    stages before deciding whether to wait, defer or skip the draw.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
-    let libraries = enc.lookup_libraries(vs, ps, ps_variant);
+    let libraries = enc.lookup_libraries(vs, vs_snapshot, ps, ps_variant);
     let Some((vs_handles, ps_handles)) = libraries.or_else(|| {
         resolve_libraries_slow(
             enc,
@@ -735,22 +809,76 @@ fn emit_draw_view(
         variant: ps_variant,
     };
     enc.maybe_log_pass_shader(shaders, stage_bindings);
+    // Carry the bound RT's D3D "has alpha" bit so destination-alpha blend
+    // factors clamp on alpha-less targets (X8R8G8B8 shares `Bgra8Unorm` with
+    // A8R8G8B8, so the color format alone can't distinguish them).
+    let mut attach = target_planes | PipelineAttachFlags::HAS_COLOR_OUTPUT;
+    attach.set(
+        PipelineAttachFlags::COLOR_HAS_ALPHA,
+        enc.current_color_rt_has_alpha(),
+    );
     // One vertex buffer layout per stream the declaration reads: stride and
     // step function from the binding (a zero stride is one constant element,
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
-    // feed where nothing is bound. Part of the pipeline identity.
-    let layouts = stream_layouts_view(vertex_source, &attrs);
+    // feed where nothing is bound. Part of the pipeline identity, so they are
+    // written into the snapshot itself rather than copied into it.
+    let mut crossing = 0;
+    let mut offsets = 0;
+    let mut pipeline_snapshot = PipelineSnapshot {
+        vs_fn: vs_handles.func,
+        ps_fn: ps_handles.func,
+        vdecl_hash: attrs.vdecl_hash(),
+        stream_layouts: [StreamLayout::UNUSED; mtld3d_types::MAX_STREAMS as usize],
+        color_format: enc.current_color_format(),
+        attach,
+        rs: render_state.pipeline_rs,
+        extra: extra_attachments,
+        ps_color_out_mask,
+        sample_count: enc.current_color_sample_count(),
+    };
+    stream_layouts_view(
+        &mut pipeline_snapshot.stream_layouts,
+        vertex_source,
+        &attrs,
+        &mut crossing,
+        &mut offsets,
+    );
+    // An attribute that ends past its stream's stride is fetched through a
+    // binding of its own, and a stream offset off a four-byte boundary binds
+    // rounded down with its remainder in the attribute offsets
+    // (`CrossingFetch`), which writes the snapshot's layouts and declaration
+    // identity; every other draw takes the declaration's attributes and the
+    // stream layouts as they are.
+    let fetch = if crossing == 0 && offset_shift(offsets) == 0 {
+        None
+    } else {
+        crossing_fetch(
+            enc,
+            vertex_source,
+            &attrs,
+            &mut pipeline_snapshot.stream_layouts,
+            &mut pipeline_snapshot.vdecl_hash,
+            crossing,
+        )
+    };
+    let attrs_ref = fetch
+        .as_ref()
+        .map_or(attrs.as_slice(), |fetch| fetch.attrs());
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
         vertex_source,
         index_source,
-        layouts[0].stride,
+        fetch
+            .as_ref()
+            .map_or(&pipeline_snapshot.stream_layouts, |fetch| {
+                fetch.stream_layouts()
+            })[0]
+            .stride,
     );
     drop(t_resolve);
 
     let t_pipeline = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Pipeline));
-    let attrs_ref = attrs.as_slice();
     // Instances of an indexed draw: stream 0's frequency count, but only when
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
@@ -763,33 +891,11 @@ fn emit_draw_view(
             instance_count(*stream0_freq, any_instanced)
         }
     };
-    let vdecl_hash = attrs.vdecl_hash();
     let alpha_ref_bytes = alpha_ref_slice.as_slice();
     let fog_color_bytes = fog_color_slice.as_slice();
     let bump_env_bytes = bump_env_slice.as_slice();
 
     // 3. Pipeline + depth state + cull.
-    let color_format = enc.current_color_format();
-    let mut attach = target_planes | PipelineAttachFlags::HAS_COLOR_OUTPUT;
-    // Carry the bound RT's D3D "has alpha" bit so destination-alpha blend
-    // factors clamp on alpha-less targets (X8R8G8B8 shares `Bgra8Unorm` with
-    // A8R8G8B8, so the color format alone can't distinguish them).
-    attach.set(
-        PipelineAttachFlags::COLOR_HAS_ALPHA,
-        enc.current_color_rt_has_alpha(),
-    );
-    let mut pipeline_snapshot = PipelineSnapshot {
-        vs_fn: vs_handles.func,
-        ps_fn: ps_handles.func,
-        vdecl_hash,
-        stream_layouts: layouts,
-        color_format,
-        attach,
-        rs: render_state.pipeline_rs,
-        extra: extra_attachments,
-        ps_color_out_mask,
-        sample_count: enc.current_color_sample_count(),
-    };
     if rt0_drop {
         pipeline_snapshot.remove_color_output();
     }
@@ -862,10 +968,13 @@ fn emit_draw_view(
     // `pos_fixup` (emitted below): Metal's own constant bias scales with the
     // depth's exponent on a float depth buffer, D3D9's does not. Only the
     // slope term, which Metal applies unscaled, stays on `setDepthBias`,
-    // routed through `LastBoundCache` so it re-binds only when it changes.
+    // routed through `LastBoundCache` so it re-binds only when it changes;
+    // Metal measures its slope per render pixel, so it follows the target's
+    // render scale.
     let (min_z, max_z) = enc.viewport_depth_range();
     let depth_bias = d3d_depth_bias_to_clip(render_state.depth_bias, min_z, max_z);
-    let slope_scale = f32::from_bits(render_state.slope_scale_depth_bias);
+    let render_scale = enc.target_scale().factor();
+    let slope_scale = d3d_slope_scale_to_metal(render_state.slope_scale_depth_bias, render_scale);
     if enc.last_bound().depth_bias_changed(0.0, slope_scale) {
         enc.emit_command(Command::set_depth_bias(0.0, slope_scale));
     }
@@ -1032,16 +1141,48 @@ fn emit_draw_view(
             continue;
         }
         let handle = stage_texture_handles[stage_u32 as usize];
+        let bit = 1u16 << stage_u32;
         if handle == 0 {
+            // A texture whose Metal texture could not be made. The fragment
+            // function still declares the slot, typed by the bound texture,
+            // and Metal requires every declared slot to be bound, so it reads
+            // the shared fallback of that type: black, or depth zero for a
+            // depth texture's `depth2d` slot.
             mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
                 key: b.texture_id.raw(),
-                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0 — bind \
-                 skipped, an unbound declared sampler reads opaque black",
+                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0; sampled \
+                 as opaque black",
                 b.texture_id
             );
+            let slot = u16::try_from(stage_u32).expect("sampler stage is below STAGE_COUNT");
+            let kind = missing_texture_kind(variant, slot);
+            if enc
+                .last_bound()
+                .fragment_texture_changed(stage_u32, null_texture_tex_sentinel(kind as u64))
+            {
+                enc.emit_command(Command::set_fragment_null_texture(kind, stage_u32));
+                // The bind installs the default sampler, which is not the
+                // comparison or raw-fetch one a depth slot reads through.
+                enc.last_bound()
+                    .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
+            }
+            if kind == NullTextureKind::Depth2D {
+                let is_compare = (fetch_mask & bit) == 0;
+                let sampler =
+                    enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare, !is_compare);
+                if enc
+                    .last_bound()
+                    .fragment_sampler_changed(stage_u32, sampler_cache_key(sampler))
+                {
+                    enc.emit_command(Command::set_fragment_sampler_state(sampler, stage_u32));
+                }
+            } else {
+                enc.last_bound()
+                    .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
+            }
+            bound_mask |= bit;
             continue;
         }
-        let bit = 1u16 << stage_u32;
         bound_mask |= bit;
         let is_compare = (depth_mask & bit) != 0 && (fetch_mask & bit) == 0;
         let is_fetch = (fetch_mask & bit) != 0;
@@ -1097,14 +1238,20 @@ fn emit_draw_view(
     // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
     // encoder rather than the per-draw snapshot; a declared slot the game
     // never bound gets the shared black fallback, as on the fragment side.
-    if let VsSourceView::Programmable(ProgrammableVsSource {
-        vs_id,
-        sampler_kinds,
-        ..
-    }) = vs
-    {
-        let decls = enc.ps_declared_samplers(*vs_id);
-        let mut mask = decls.unbound(0) & 0xF;
+    if let VsSourceView::Programmable(ProgrammableVsSource { sampler_kinds, .. }) = vs {
+        // The table persists on the encoder, so a later draw of the pass
+        // carrying the same rows skips the re-bind.
+        if sampler_kinds.lod_table
+            && let Some(ptr) = enc.alloc_vs_lod_if_changed()
+        {
+            enc.emit_command(Command::set_vertex_bytes_at(
+                ptr,
+                u32::try_from(mtld3d_core::sampler_state::VS_LOD_BYTES)
+                    .expect("the vertex LOD table fits u32"),
+                VS_LOD_SLOT,
+            ));
+        }
+        let mut mask = vs_decls.unbound(0) & 0xF;
         while mask != 0 {
             let slot = mask.trailing_zeros();
             mask &= mask - 1;
@@ -1184,7 +1331,7 @@ fn emit_draw_view(
         1.0 / to_f(vp_w.max(1)),
         -1.0 / to_f(vp_h.max(1)),
         f32::from(u8::from(depth_clamp_z)),
-        enc.target_scale().factor(),
+        render_scale,
         depth_bias,
     ];
     // SAFETY: `[f32; 5]` is POD with no padding; reinterpreting the array as
@@ -1244,10 +1391,17 @@ fn emit_draw_view(
         let (p, n) = bump_env_slice.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 12));
     }
-    // Per-slot LOD bias. Bound only for a draw whose shader declares the
-    // uniform; the binding then persists on the encoder, so a later biased
-    // draw carrying the same table skips the re-bind.
-    if any_lod_bias && let Some(ptr) = enc.alloc_lod_bias_if_changed(&lod_bias) {
+    // Per-slot LOD table. Bound only for a draw whose shader declares the
+    // uniform; the binding then persists on the encoder, so a later draw
+    // carrying the same table skips the re-bind.
+    if any_lod_table
+        && let Some(ptr) = enc.alloc_lod_bias_if_changed(
+            &lod_bias,
+            explicit_lod
+                .as_ref()
+                .unwrap_or(&mtld3d_core::sampler_state::EXPLICIT_LOD_OPEN_ROWS),
+        )
+    {
         enc.emit_command(Command::set_fragment_bytes_at(
             ptr,
             u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)
@@ -1295,6 +1449,13 @@ fn emit_draw_view(
     //    MTLBuffer lazily — the cache hits after the first draw post-rename
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
+    // The layouts per D3D9 stream, which a fetch keeps: the snapshot then
+    // holds them per Metal slot.
+    let layouts = fetch
+        .as_ref()
+        .map_or(&pipeline_snapshot.stream_layouts, |fetch| {
+            fetch.stream_layouts()
+        });
     match vertex_source {
         VertexView::Up { record, .. } => {
             let scratch_ptr = record.address;
@@ -1302,10 +1463,15 @@ fn emit_draw_view(
             if usize::try_from(size).is_ok_and(|size| size > SET_BYTES_MAX) {
                 enc.bump_up_vertex_oversized();
             }
-            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
+            if let Some(fetch) = &fetch {
+                bind_crossing_inline(enc, fetch, scratch_ptr, size);
+            } else {
+                enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
+            }
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
             // re-emits its `setVertexBuffer` instead of reading these bytes.
+            // A crossing draw's inline slots forget their own bindings.
             enc.last_bound().invalidate_vertex_buffer();
         }
         VertexView::Bound { .. } => {
@@ -1333,27 +1499,31 @@ fn emit_draw_view(
                     );
                     return;
                 }
-                let bind = enc.last_bound().vertex_buffer_changed(
-                    slot,
-                    buffer_handle,
-                    b.offset,
-                    b.generation,
-                );
-                if bind == VertexBufferBind::ReusedHandle {
-                    // The dedup would have kept the wrapper this address used
-                    // to name bound; that wrapper was destroyed inside this
-                    // pass, which the retention schedule is meant to rule out.
-                    mtld3d_shared::log_once_warn!(
-                        target: crate::LOG_TARGET,
-                        "vertex buffer handle {buffer_handle:#x} reused within a pass for \
-                         buffer {:#x} generation {}: rebinding instead of deduplicating",
-                        b.buffer,
-                        b.generation
+                if let Some(fetch) = &fetch {
+                    bind_crossing_stream(enc, fetch, b, buffer_handle);
+                } else {
+                    let bind = enc.last_bound().vertex_buffer_changed(
+                        slot,
+                        buffer_handle,
+                        b.offset,
+                        b.generation,
                     );
-                }
-                let vb_emitted = bind != VertexBufferBind::Same;
-                if vb_emitted {
-                    enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
+                    if bind == VertexBufferBind::ReusedHandle {
+                        // The dedup would have kept the wrapper this address used
+                        // to name bound; that wrapper was destroyed inside this
+                        // pass, which the retention schedule is meant to rule out.
+                        mtld3d_shared::log_once_warn!(
+                            target: crate::LOG_TARGET,
+                            "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                             buffer {:#x} generation {}: rebinding instead of deduplicating",
+                            b.buffer,
+                            b.generation
+                        );
+                    }
+                    let vb_emitted = bind != VertexBufferBind::Same;
+                    if vb_emitted {
+                        enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
+                    }
                 }
                 // Only a staged buffer takes staging uploads, so only its
                 // ranges are ever asked about.
@@ -1436,16 +1606,18 @@ fn emit_draw_view(
                     )),
                 };
                 if let Some((range_off, range_size)) = read_range {
-                    enc.note_buffer_draw_range(
-                        b.buffer,
-                        range_off,
-                        vertex_read_size(
+                    // A crossing stream's last element reads past its stride;
+                    // on a stream that does not cross this adds nothing.
+                    let range_size = if fetch.is_none() {
+                        range_size
+                    } else {
+                        crossing_read_size(
                             range_size,
-                            layout.stride,
                             attrs.extents()[b.stream as usize],
-                        ),
-                        logical_len,
-                    );
+                            layout.stride,
+                        )
+                    };
+                    enc.note_buffer_draw_range(b.buffer, range_off, range_size, logical_len);
                 }
             }
         }
@@ -1488,8 +1660,9 @@ fn emit_draw_view(
     if matches!(index_source, IndexView::Generated { .. }) {
         enc.bump_fan_generated();
     }
-    // While the F12 dump runs, the Metal draw sits in a `draw N` debug group
-    // so the trace node and the `[dump] draw N` line name each other.
+    // While the Ctrl+Shift+P dump runs, the Metal draw sits in a `draw N`
+    // debug group so the trace node and the `[dump] draw N` line name each
+    // other.
     if let Some(index) = dump_draw {
         enc.emit_command(Command::push_debug_group(index));
     }
@@ -1638,4 +1811,137 @@ fn emit_draw_view(
         variant.alpha_func,
         u32::from(render_state.cull_mode),
     );
+    if let Some(fetch) = fetch {
+        enc.keep_crossing_fetch(fetch);
+    }
+}
+
+/// The vertex fetch of a draw with a crossing attribute or a stream offset off four bytes.
+///
+/// `crossing` names the streams that carry an attribute past their stride.
+/// `layouts` (built per D3D9 stream) and `vdecl_hash` are the draw's
+/// pipeline snapshot fields: a fetch replaces them with its layouts per Metal
+/// slot and its declaration identity, and keeps the per-stream layouts
+/// ([`CrossingFetch::stream_layouts`]).
+/// `None` when a crossing attribute cannot take a binding of its own (one
+/// wider than its stride, or an advanced offset Metal refuses): `layouts`
+/// then step each crossing stream by its extent, as a draw did before
+/// crossing attributes had bindings, and the draw fetches wrong data rather
+/// than none; its streams bind at the offsets the application set. A draw
+/// whose streams only sit off a four-byte boundary has no crossing attribute
+/// and never takes that path.
+#[cold]
+#[inline(never)]
+fn crossing_fetch(
+    enc: &mut FrameEncoder,
+    vertex_source: &VertexView<'_>,
+    attrs: &AttrSnapshot,
+    layouts: &mut [StreamLayout; mtld3d_types::MAX_STREAMS as usize],
+    vdecl_hash: &mut u64,
+    crossing: u16,
+) -> Option<Box<CrossingFetch>> {
+    let stream = |stream| match (vertex_source, vertex_source.feed(stream)) {
+        (VertexView::Up { record, .. }, VertexFeed::Inline { .. }) => {
+            Some((0, u64::from(record.size)))
+        }
+        (_, VertexFeed::Buffer(record)) => Some((record.offset, record.length)),
+        _ => None,
+    };
+    let shifts = stream_shifts(
+        vertex_source
+            .bindings()
+            .filter(|b| attrs.used_streams() & (1 << b.stream) != 0)
+            .map(|b| (b.stream, b.offset)),
+    );
+    let mut fetch = enc
+        .take_crossing_fetch()
+        .unwrap_or_else(|| Box::new(CrossingFetch::empty()));
+    let record = core::ptr::from_ref(attrs.header()).addr();
+    let checked = fetch
+        .reuse_or_rebuild(record, attrs.as_slice(), layouts, shifts)
+        .and_then(|()| fetch.check_advanced_offsets(crossing, stream));
+    match checked {
+        Ok(()) => {
+            if crossing != 0 {
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "vertex attribute ends past its stream stride: fetched through a binding of its own");
+            }
+            if shifts != 0 {
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "stream offset off a four-byte boundary: bound at the multiple of 4 below it, \
+                     the remainder added to its attribute offsets");
+            }
+            *layouts = *fetch.layouts();
+            *vdecl_hash = fetch.snapshot_vdecl_hash(*vdecl_hash);
+            Some(fetch)
+        }
+        Err(error) => {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "vertex attribute past its stream stride has no binding of its own ({error:?}): \
+                 layout widened to the consumed extent, the draw fetches wrong data, and a \
+                 stream offset off a four-byte boundary binds as set and draws nothing");
+            enc.keep_crossing_fetch(fetch);
+            // The stride a draw had before crossing attributes had bindings;
+            // a UP draw here still reads past its payload's last vertex, as
+            // it did then.
+            let mut streams = crossing;
+            while streams != 0 {
+                let stream = streams.trailing_zeros() as usize;
+                streams &= streams - 1;
+                layouts[stream].stride = attrs.extents()[stream];
+            }
+            None
+        }
+    }
+}
+
+/// Bind a crossing draw's inline (UP) vertices at every slot that reads stream 0.
+///
+/// The payload carries `size` bytes, zero-filled past the vertices the
+/// application supplied up to the last crossing attribute's end. A payload
+/// past the inline-bytes limit is copied into the upload ring once per slot
+/// that reads stream 0, a cost kept on this rare path rather than sharing
+/// one upload between the slots.
+fn bind_crossing_inline(enc: &mut FrameEncoder, fetch: &CrossingFetch, address: u64, size: u32) {
+    for (slot, advance) in fetch.slots_of(0) {
+        enc.emit_command(Command::set_vertex_bytes(
+            address + u64::from(advance),
+            size - advance,
+            slot,
+        ));
+        enc.last_bound().invalidate_vertex_buffer_slot(slot);
+    }
+}
+
+/// Bind a fetch's vertex buffer `b` at every slot that reads its stream.
+///
+/// Each slot binds the stream offset rounded down to a multiple of 4 plus
+/// its advance; [`crossing_fetch`] checked each advanced offset against the
+/// buffer.
+fn bind_crossing_stream(
+    enc: &mut FrameEncoder,
+    fetch: &CrossingFetch,
+    b: &StreamRecord,
+    buffer_handle: u64,
+) {
+    for (slot, advance) in fetch.slots_of(b.stream) {
+        let offset = slot_binding_offset(b.offset, advance);
+        let bind =
+            enc.last_bound()
+                .vertex_buffer_changed(slot, buffer_handle, offset, b.generation);
+        if bind == VertexBufferBind::ReusedHandle {
+            // As on the ordinary bind: the retention schedule is meant to rule
+            // out a wrapper destroyed inside the pass that binds its address.
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                 buffer {:#x} generation {}: rebinding instead of deduplicating",
+                b.buffer,
+                b.generation
+            );
+        }
+        if bind != VertexBufferBind::Same {
+            enc.emit_command(Command::set_vertex_buffer(buffer_handle, offset, slot));
+        }
+    }
 }
