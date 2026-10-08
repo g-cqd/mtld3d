@@ -8,7 +8,9 @@ use mtld3d_core::{
     perf::SurfaceSubCategory,
     render_scale::RenderScale,
     stretch_rect::StretchRegion,
-    surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
+    surface_lock::{
+        ColorSurfaceLock, classify_color_surface_lock, region_offset, writeback_regions,
+    },
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
@@ -1116,6 +1118,41 @@ bitflags::bitflags! {
     }
 }
 
+/// A back-buffer read-back page and the rect of it the application locked.
+///
+/// The page is [`HeldPages`], charged to the surface gauge. Its `region` is in
+/// the surface's logical space: the rect a writable `LockRect` named, or the
+/// whole surface for a `GetDC` snapshot. `UnlockRect` and `ReleaseDC` write
+/// back that rect alone, so at a `render.scale` below 100% the texels around
+/// a locked sub-rect are not resampled.
+struct ReadbackPage {
+    pages: HeldPages,
+    region: StretchRegion,
+}
+
+impl ReadbackPage {
+    fn new(page: PageBox, region: StretchRegion) -> Self {
+        Self {
+            pages: HeldPages::new(page, PageHolder::Surface),
+            region,
+        }
+    }
+}
+
+impl core::ops::Deref for ReadbackPage {
+    type Target = HeldPages;
+
+    fn deref(&self) -> &HeldPages {
+        &self.pages
+    }
+}
+
+impl core::ops::DerefMut for ReadbackPage {
+    fn deref_mut(&mut self) -> &mut HeldPages {
+        &mut self.pages
+    }
+}
+
 struct SurfaceInner {
     /// `DeviceInner` back-reference for `ApiTimer` accumulation.
     ///
@@ -1205,7 +1242,7 @@ struct SurfaceInner {
     /// Allocated on the `LockRect` readback path (backbuffer), dropped on
     /// `UnlockRect`. Persists across the Lock so the game can read the returned
     /// pointer.
-    readback: Option<HeldPages>,
+    readback: Option<ReadbackPage>,
     /// Backing store for a `D3DPOOL_SYSTEMMEM` offscreen plain surface.
     ///
     /// From `CreateOffscreenPlainSurface`. Allocated full-size at creation;
@@ -2550,15 +2587,20 @@ fn backbuffer_map_for_write(
     };
     let bytes_per_pixel = mtld3d_core::format::map_d3d_format(inner.live_format())
         .map_or(0, |mapping| mapping.bytes_per_pixel());
-    let offset = (y as usize)
-        .saturating_mul(bytes_per_row as usize)
-        .saturating_add((x as usize).saturating_mul(bytes_per_pixel as usize));
-    let Some(page) = inner.readback.as_mut().filter(|page| offset < page.len()) else {
+    // The page holds the whole surface, but what the application locked is
+    // `region` of it: `UnlockRect` writes back only that rect.
+    let region = StretchRegion { x, y, w, h };
+    let offset = inner
+        .readback
+        .as_ref()
+        .and_then(|snapshot| region_offset(region, bytes_per_row, bytes_per_pixel, snapshot.len()));
+    let (Some(offset), Some(page)) = (offset, inner.readback.as_mut()) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "back-buffer LockRect: the read-back page does not reach the locked rect → INVALIDCALL");
         inner.readback = None;
         return D3DERR_INVALIDCALL;
     };
+    page.region = region;
     // SAFETY: `locked_rect` is non-null (checked by the caller before
     // entry) and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`
     // slot owned by the caller.
@@ -2671,7 +2713,10 @@ fn backbuffer_read_into_lock(
     let out = unsafe { &mut *locked_rect };
     out.pitch = bytes_per_row.cast_signed();
     out.bits = page.as_mut_ptr().cast::<c_void>();
-    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
+    // A read-only lock maps the rect alone and never writes back, so the
+    // region only records what the page holds.
+    let region = StretchRegion { x, y, w, h };
+    inner.readback = Some(ReadbackPage::new(page, region));
     D3D_OK
 }
 
@@ -2742,7 +2787,8 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
             "back-buffer GetDC: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
         return None;
     }
-    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
+    let region = StretchRegion { x: 0, y: 0, w, h };
+    inner.readback = Some(ReadbackPage::new(page, region));
     Some((w, h, bytes_per_row))
 }
 
@@ -2789,6 +2835,7 @@ fn backbuffer_page_upload(inner: &mut SurfaceInner) {
             "back-buffer write-back: the snapshot page is gone; nothing is written back");
         return;
     };
+    let region = page.region;
     if page.len() < needed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "back-buffer write-back: the snapshot page holds {} bytes, {needed} needed; the \
@@ -2813,23 +2860,14 @@ fn backbuffer_page_upload(inner: &mut SurfaceInner) {
         });
         return;
     }
+    let (source_region, destination_region) = writeback_regions(scale, region);
     let target = ResampledUpload {
         color_handle,
         format,
         logical: (width, height),
         texture: (scale.dimension(width), scale.dimension(height)),
-        source_region: StretchRegion {
-            x: 0,
-            y: 0,
-            w: width,
-            h: height,
-        },
-        destination_region: StretchRegion {
-            x: 0,
-            y: 0,
-            w: scale.dimension(width),
-            h: scale.dimension(height),
-        },
+        source_region,
+        destination_region,
         bytes_per_row: src_stride,
         msaa: inner.live_msaa_handle(),
         msaa_srgb: inner.live_msaa_srgb_handle(),
