@@ -17,10 +17,11 @@ bitflags::bitflags! {
         const INTEGER = 2;
         const BOOLEAN = 4;
         const BUMP_ENV = 8;
+        const LINKED_INPUTS = 16;
     }
 }
 
-/// Canonical programmable vertex source, with no implicit padding.
+/// Canonical programmable vertex source, with initialized reserved bytes.
 #[repr(C, align(8))]
 pub struct ProgrammableVsSource {
     pub vs_id: ProgramId,
@@ -29,9 +30,28 @@ pub struct ProgrammableVsSource {
     pub flags: ShaderSourceFlags,
     pub clip_plane_count: u8,
     pub sampler_kinds: VsSamplerKinds,
+    pub reserved: [u8; 7],
 }
 
 impl ProgrammableVsSource {
+    /// This source keyed for a draw that binds the vertex LOD table.
+    ///
+    /// Sets [`VsSamplerKinds::lod_table`], which the API leaves false.
+    #[must_use]
+    pub const fn with_lod_table(&self) -> Self {
+        Self {
+            vs_id: self.vs_id,
+            max_const_used: self.max_const_used,
+            provided_input_mask: self.provided_input_mask,
+            flags: ShaderSourceFlags::from_bits_retain(self.flags.bits()),
+            clip_plane_count: self.clip_plane_count,
+            sampler_kinds: VsSamplerKinds {
+                lod_table: true,
+                ..self.sampler_kinds
+            },
+            reserved: [0; 7],
+        }
+    }
     #[must_use]
     pub const fn uses_rel_const(&self) -> bool {
         self.flags.contains(ShaderSourceFlags::RELATIVE)
@@ -57,6 +77,15 @@ pub struct ProgrammablePsSource {
 }
 
 impl ProgrammablePsSource {
+    /// Whether the shader reads an input semantic the vertex shader must output by name.
+    #[must_use]
+    pub const fn reads_linked_inputs(&self) -> bool {
+        self.flags.contains(ShaderSourceFlags::LINKED_INPUTS)
+    }
+    #[must_use]
+    pub const fn uses_rel_const(&self) -> bool {
+        self.flags.contains(ShaderSourceFlags::RELATIVE)
+    }
     #[must_use]
     pub const fn uses_bump_env(&self) -> bool {
         self.flags.contains(ShaderSourceFlags::BUMP_ENV)

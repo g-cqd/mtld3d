@@ -903,15 +903,16 @@ fn emit_scissor_disabled_falls_back_to_viewport() {
 }
 
 #[test]
-fn emit_scissor_zero_rect_falls_back_to_viewport() {
+fn emit_scissor_empty_rect_lets_nothing_through() {
+    // The device seeds the scissor with the whole target, so an empty rect
+    // under the test is one the game set, and it lets no pixel through.
     let mut s = fresh();
     s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
-    // SetScissorRect was never called (scissor_rect = [0; 4]) but the
-    // game turned the test on anyway → fall back to viewport so Metal
-    // doesn't clip to an empty rect.
     s.emit_scissor(true, [0, 0, 0, 0]);
+    s.emit_scissor(true, [100, 50, 0, 30]);
     let cmds = s.passes()[0].commands();
-    assert_eq!(unpack_scissor(&cmds[1]), (0, 0, 640, 480));
+    assert_eq!(unpack_scissor(&cmds[1]), (0, 0, 0, 0));
+    assert_eq!(unpack_scissor(&cmds[2]), (100, 50, 0, 30));
 }
 
 #[test]
@@ -2902,10 +2903,10 @@ fn rule_h_skipped_for_clear_only_pass() {
 #[test]
 fn rule_h_aborts_strip_on_missing_alt_handle() {
     // A zero-mask draw bound PSO_WITH but the side-map is empty
-    // (would mean the FrameEncoder skipped the dual-build path —
-    // an upstream bug). The rule must keep the color attachment
-    // intact rather than bind a with-color pipeline against a
-    // depth-only render pass descriptor.
+    // (its no-colour twin is still building, or was never queued).
+    // The rule must keep the color attachment intact rather than
+    // bind a with-color pipeline against a depth-only render pass
+    // descriptor.
     let mut s = fresh();
     s.note_draw_color_write_mask(0);
     s.emit_command(set_pso(PSO_WITH));
@@ -2938,7 +2939,7 @@ fn rule_h_strips_color_with_self_mapped_depth_clear_quad() {
     // zero-mask caster SetPSO + draws. The depth clear-quad
     // pipeline is built `has_color: false` and self-maps in
     // `no_color_pipeline_alt` (encoder.rs); Rule H must strip
-    // color cleanly without firing the side-map-miss warn.
+    // color cleanly without taking the side-map-miss path.
 
     let mut s = fresh();
     for _ in 0..3 {
@@ -5617,15 +5618,16 @@ fn a_scoped_pass_with_srgb_write_off_attaches_the_base_view() {
     );
 }
 
-/// Retiring the bound depth texture unbinds it and forgets every set naming it.
+/// Retiring the bound depth texture unbinds it and leaves its records to the retirement boundary.
 ///
 /// The standalone surface that owns the texture finalizes while the device
 /// still has it bound, and the Metal texture is destroyed once the submit
-/// seq gating it retires. A handle left in the session-wide sampled or
-/// sampleable-depth sets would then answer for whatever Metal hands back at
-/// the same address next.
+/// seq gating it retires. Until then the passes already built name the
+/// texture, so the sampled and sampleable-depth sets keep it; the retention
+/// drain's `unregister_texture` is what forgets it, before Metal can hand the
+/// address to another texture.
 #[test]
-fn retiring_the_bound_depth_texture_unbinds_and_forgets_it() {
+fn retiring_the_bound_depth_texture_unbinds_it_and_retirement_forgets_it() {
     let mut s = fresh();
     let shadow = tex(0x9100);
     s.set_depth_stencil_attachment(shadow, (256, 256), true, true);
@@ -5642,8 +5644,62 @@ fn retiring_the_bound_depth_texture_unbinds_and_forgets_it() {
     assert_eq!(s.current_depth_size(), (0, 0));
     assert!(!s.current_depth_has_stencil());
     assert!(!s.current_depth_is_sampleable());
+    assert!(
+        s.is_depth_handle_sampleable(shadow),
+        "the passes built this frame still classify the texture"
+    );
+    assert!(s.texture_sampled_this_frame(shadow));
+
+    s.unregister_texture(shadow);
+
     assert!(!s.is_depth_handle_sampleable(shadow));
     assert!(!s.texture_sampled_this_frame(shadow));
+}
+
+/// A depth surface released after a `StretchRect` out of it keeps the store the copy reads.
+///
+/// The transfer is queued as a blit leading the next pass and reads the
+/// source's device memory, so the source's last pass has to store its depth.
+/// The copy marks the source read, which is what exempts that store from the
+/// last-use discard. The surface is released before the frame is submitted,
+/// as a game that copies its scene depth into a sampleable texture and lets
+/// the original go does, and the release must leave that mark in place.
+#[test]
+fn releasing_a_depth_transfer_source_keeps_the_store_the_transfer_reads() {
+    let source = tex(0x9300);
+    let destination = tex(0x9400);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
+    depth_draw(&mut s);
+    s.push_leading_blit_after_clears(
+        BlitCommand {
+            cmd: BlitCommandType::TransferDepth as u32,
+            ..BlitCommand::copy_texture_to_texture_full_mip(
+                source.raw(),
+                destination.raw(),
+                0,
+                BB_SIZE.0,
+                BB_SIZE.1,
+            )
+        },
+        "depth_transfer",
+    );
+    s.set_depth_stencil_attachment(destination, BB_SIZE, true, false);
+    s.retire_depth_texture(source);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    let source_pass = s
+        .passes()
+        .iter()
+        .find(|pass| pass.depth_texture() == source)
+        .expect("the pass that drew into the source");
+    assert_eq!(
+        source_pass.depth_store(),
+        StoreAction::Store,
+        "the transfer out of the released source reads the depth that pass stores"
+    );
 }
 
 /// Retiring a texture that is not the bound one leaves the attachment alone.
@@ -6348,6 +6404,7 @@ fn apply_submit_rules(s: &mut PassState) {
     s.strip_dead_color_in_clear_only_passes();
     s.cull_dead_clear_only_passes();
     s.merge_adjacent_identical_passes();
+    s.discard_covered_color_loads();
 }
 
 #[test]
@@ -10566,4 +10623,222 @@ fn rule_h_strips_a_pass_whose_placeholders_were_resolved() {
         "every bind swapped to the sibling: {:?}",
         bound_pipelines(pass)
     );
+}
+
+/// Bind `target` alone at `size` the way the `StretchRect` render quad does, and draw over it all.
+///
+/// No depth attachment, a viewport over the whole target, and the pass for
+/// the quad opened through `open_pass_for_covering_draw`, then closed.
+fn covering_copy(s: &mut PassState, target: MetalHandle<MTLTextureKind>, size: (u32, u32)) {
+    s.set_color_render_target(target, size.0, size.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, size.0, size.1, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.note_color_read_back(target);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+}
+
+#[test]
+fn rule_k_discards_the_load_of_a_pass_its_first_draw_covers() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    covering_copy(&mut s, target, (1280, 720));
+    // The pass opens like any other on a game render target, and every rule
+    // before Rule K sees that load.
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    // Rule A's correction would put a sampled target's discard back; the
+    // copy marked the target read, and the discard still stands, since no
+    // pixel of the result comes from the load.
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_texture(), target);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_that_was_opened_the_ordinary_way() {
+    // The same pass opened through `ensure_pass_open`, as a copy into part
+    // of the target is, keeps its load.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 640, 360, 0.0, 1.0);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_that_was_already_open_with_draws() {
+    // A copy into the target already bound without depth joins the open
+    // pass, whose load serves the draws it holds before the quad.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_keeps_a_pending_clear_the_covered_pass_opens_with() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.clear_color(1, 2, 3, 4);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    let cleared = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    assert_eq!(s.passes()[0].color_load(), cleared);
+}
+
+#[test]
+fn rule_k_keeps_a_clear_rule_e_folds_into_the_covered_pass() {
+    // A clear of the target, a detour through another target, then the
+    // covering copy: Rule E finds the copy's pass loading and folds the
+    // clear into it, as it did before Rule K existed.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.set_color_render_target(tex(0x3100), 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    covering_copy(&mut s, target, (1280, 720));
+    assert_eq!(s.passes().len(), 2, "the clear-only pass and the copy");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the clear folds into the copy's pass");
+    assert_eq!(s.passes()[0].color_texture(), target);
+    assert!(matches!(
+        s.passes()[0].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+}
+
+#[test]
+fn rule_k_leaves_a_covered_pass_rule_j_joins_onto_the_one_before() {
+    // A pass drawn into the target alone, then the covering copy into it on
+    // the same attachments: Rule J joins the copy onto that pass, whose own
+    // load serves its draws, so the joined pass keeps loading.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    covering_copy(&mut s, target, (1280, 720));
+    assert_eq!(s.passes().len(), 2);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the copy joins the pass before it");
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_discards_the_load_of_a_covered_multisampled_target() {
+    // The quad writes every sample of each pixel it covers, so the companion
+    // the pass attaches has nothing to load either.
+    let target = tex(0x3000);
+    let companion = tex(0x3001);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(companion, MetalHandle::NULL, 4);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), companion);
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn rule_k_keeps_the_discard_when_rule_j_joins_later_draws_onto_the_covered_pass() {
+    // The copy into a texture the game then draws into, on the same
+    // attachments: Rule J joins the draws onto the copy's pass, whose quad
+    // still runs first, so the joined pass keeps the discard.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    covering_copy(&mut s, target, (1280, 720));
+    s.emit_command(dummy_draw());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the draws join the copy's pass");
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), target);
+    assert_eq!(
+        pass.commands().iter().filter(|c| c.is_draw()).count(),
+        3,
+        "the quad and the two draws"
+    );
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+    assert_eq!(pass.color_store(), StoreAction::Store);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_with_another_colour_target_beside_render_target_0() {
+    // The quad writes render target 0 alone, so an extra target bound beside
+    // it would keep whatever it held only through its load.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3100), BB_SIZE)));
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert!(s.passes()[0].extra_color()[0].is_bound());
+
+    apply_submit_rules(&mut s);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_load(), ColorLoad::Load);
+    assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
 }

@@ -165,6 +165,11 @@ impl FrameRecorder {
                 let value = *value;
                 self.record_typed(scratch, value)
             }
+            Op::DestroyBuffer(value) => {
+                #[cfg(not(windows))]
+                let value = *value;
+                self.record_typed(scratch, value)
+            }
             Op::NoteColorRead(value) => {
                 #[cfg(not(windows))]
                 let value = *value;
@@ -314,7 +319,7 @@ impl FrameRecorder {
                     size,
                 },
             ),
-            op @ (Op::RegisterProgram(_) | Op::SetSnapshot(_)) => {
+            op @ Op::RegisterProgram(_) => {
                 self.rejected_ops.push(op);
                 self.finish_record(Err(WireError::InvalidValue))
             }

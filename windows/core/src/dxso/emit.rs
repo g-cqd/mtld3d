@@ -26,14 +26,15 @@ use std::{
 
 use mtld3d_shared::mtl::{
     PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_BOOL_CONST_SLOT,
-    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
     ir::{
-        DeclUsage, Declaration, DstMods, DstOperand, DxsoProgram, InstrFlags, Instruction, RegKind,
-        Register, ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
+        Declaration, DstMods, DstOperand, DxsoProgram, InstrFlags, Instruction, RegKind, Register,
+        ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
     },
+    link::{self, PsInputs, Semantic, VsOutputs},
     opcode::Opcode,
 };
 
@@ -88,14 +89,16 @@ bitflags::bitflags! {
         /// fragment function declares a depth output against no depth
         /// attachment. Folded into the PS cache key.
         const NO_DEPTH_ATTACHMENT = 1 << 4;
-        /// A sampler slot this draw binds carries a non-zero `D3DSAMP_MIPMAPLODBIAS`.
+        /// A sampler slot this draw binds carries a LOD bias or an explicit-LOD clamp.
         ///
-        /// Metal samplers have no LOD bias, so it is applied at the sample
-        /// site: the PS takes the per-slot bias table on
-        /// `PS_LOD_BIAS_SLOT` and every implicit-LOD sample passes
-        /// `bias(...)`. A draw with no biased slot compiles the unchanged
-        /// shader and binds nothing, so the common case costs nothing.
-        /// Folded into the PS cache key.
+        /// Metal samplers have no LOD bias, and ignore their LOD clamps for a
+        /// sample at an explicit level, so both are applied at the sample
+        /// site: the PS takes the per-slot LOD table on `PS_LOD_BIAS_SLOT`,
+        /// every implicit-LOD sample passes `bias(...)`, and every sample at
+        /// an explicit level clamps it by the slot's row
+        /// (`sampler_state::explicit_lod_row`). A draw with neither compiles
+        /// the unchanged shader and binds nothing, so the common case costs
+        /// nothing. Folded into the PS cache key.
         const LOD_BIAS = 1 << 5;
         /// The bound colour target is rasterized below the resolution D3D9 reports.
         ///
@@ -143,8 +146,16 @@ pub struct VariantKey {
     /// params arrive in `fog_data[1]` = (start, end, density, depth-bias) on
     /// buffer 13.
     pub fog_table_mode: u8,
-    /// Initialized padding in the canonical capture record.
-    pub reserved: u8,
+    /// Bit `i` set ⇒ the bound vertex shader outputs the PS's `i`-th extra input semantic.
+    ///
+    /// The extra inputs are the `ps_3_0` input semantics outside the members
+    /// every `Varyings` struct declares (NORMAL, TANGENT, COLOR2, …), in the
+    /// order [`super::LinkInputs`] lists them. The PS declares a stage-in
+    /// member for each set bit and reads zero for each clear one, since Metal
+    /// rejects a fragment input the vertex function does not write. The
+    /// encoder derives it from the draw's two shaders; the API sends zero.
+    /// Part of the PS cache key.
+    pub linked_input_mask: u8,
     /// Bit `i` set ⇒ sampler slot `i` is bound to a depth-format texture.
     ///
     /// The PS emitter outputs `depth2d<float>` for that slot and wraps
@@ -213,7 +224,7 @@ pub struct VariantKey {
     pub flags: VariantFlags,
 }
 
-// Preserve the existing cache identity: canonical padding is not shader state.
+// Field by field, so the hash shape stays explicit and independent of the record layout.
 impl core::hash::Hash for VariantKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         core::hash::Hash::hash(&self.alpha_func, state);
@@ -230,6 +241,7 @@ impl core::hash::Hash for VariantKey {
         core::hash::Hash::hash(&self.color_out_mask, state);
         core::hash::Hash::hash(&self.sample_mask, state);
         core::hash::Hash::hash(&self.flags, state);
+        core::hash::Hash::hash(&self.linked_input_mask, state);
     }
 }
 
@@ -270,6 +282,17 @@ pub struct VsSamplerKinds {
     pub volume_mask: u8,
     /// Bit `i` set ⇒ vertex slot `i` binds a cube texture.
     pub cube_mask: u8,
+    /// A slot the shader samples carries a texture LOD, a LOD bias or a finest level.
+    ///
+    /// Metal ignores a sampler's LOD clamps for a sample at an explicit level
+    /// and has no sampler bias, so every `texldl` then reads its slot's row of
+    /// the vertex LOD table on `VS_LOD_SLOT`
+    /// (`sampler_state::VertexLodTable`) and samples
+    /// `level(max(lod + offset, floor))`. The encoder derives it from the
+    /// draw's vertex sampler states and the shader's `texldl` slots; the API
+    /// sends false. A draw without it compiles the unchanged shader and binds
+    /// nothing. Part of the VS library and disk keys.
+    pub lod_table: bool,
 }
 
 impl VsSamplerKinds {
@@ -406,7 +429,13 @@ pub fn emit_vs_programmable_named(
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs, provided_mask);
-    emit_varyings(&mut out, false, clip_plane_count);
+    let outputs = VsOutputs::build(vs);
+    emit_varyings(
+        &mut out,
+        false,
+        clip_plane_count,
+        outputs.as_ref().map_or(&[], VsOutputs::extras),
+    );
     w(&mut out, POS_FIXUP_MSL);
     w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
@@ -419,6 +448,7 @@ pub fn emit_vs_programmable_named(
             clip_plane_count,
             sampler_kinds,
         },
+        outputs.as_ref(),
     )?;
     Ok(out)
 }
@@ -480,10 +510,12 @@ pub fn emit_ps_programmable_named(
     let mut out = String::new();
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
+    let inputs = PsInputs::build(ps, variant.linked_input_mask);
     emit_varyings(
         &mut out,
         variant.flags.contains(VariantFlags::FLAT_SHADE),
         0,
+        inputs.extras(),
     );
     emit_const_rel_helper(&mut out, ps);
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
@@ -492,7 +524,7 @@ pub fn emit_ps_programmable_named(
     if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
         w(&mut out, crate::ps_draw::PS_DRAW_MSL);
     }
-    emit_ps_function(&mut out, ps, variant, entry)?;
+    emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)
 }
 
@@ -555,7 +587,7 @@ fn emit_vertex_in(out: &mut String, vs: &DxsoProgram, provided_mask: u16) {
 // return; Metal's pipeline validation doesn't complain, and unused inputs get
 // dead-code-eliminated by the MSL compiler.
 
-fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8, extras: &[Semantic]) {
     w(out, "struct Varyings {\n");
     // `invariant` — the analog of an `Invariant` decoration on a SPIR-V
     // `gl_Position` output — keeps the clip-space position bit-stable WITHIN a
@@ -598,6 +630,12 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // into fragment input. Always-present so VS and PS struct layouts
     // stay aligned (FF + programmable mix-and-match).
     w(out, "    float point_size [[point_size]];\n");
+    // SM3 semantics outside the members above (NORMAL, TANGENT, COLOR2, …),
+    // one member each, named after the semantic. Metal links a vertex output
+    // to a fragment input by member name, so the two structs may differ
+    // here: the VS declares every extra it outputs, the PS only those the
+    // bound VS outputs (see `dxso::link`).
+    link::write_extra_members(out, extras);
     // User clip planes: one `[[clip_distance]]` lane per enabled plane, a
     // VS-only output the rasterizer consumes (a fragment with any negative
     // lane is discarded). Metal rejects the attribute on a fragment input,
@@ -633,6 +671,7 @@ fn emit_vs_function(
     out: &mut String,
     vs: &DxsoProgram,
     key: &VsFunctionKey<'_>,
+    outputs: Option<&VsOutputs>,
 ) -> Result<(), EmitError> {
     let entry = key.entry;
     let provided_mask = key.provided_mask;
@@ -694,8 +733,20 @@ fn emit_vs_function(
             ",\n    {tex_ty} s{idx} [[texture({idx})]],\n    sampler samp{idx} [[sampler({idx})]]"
         );
     }
+    // The per-slot `(offset, floor)` rows every `texldl` applies to the level
+    // it names (see `VsSamplerKinds::lod_table`).
+    let lod_table = key.sampler_kinds.lod_table && !samplers.is_empty();
+    if lod_table {
+        let _ = write!(
+            out,
+            ",\n    constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
+        );
+    }
     w(out, "\n) {\n");
-    w(out, "    float4 r[32];\n");
+    // Temporaries start at zero, so a register read before any write (a
+    // partly written output alpha, say) yields 0 rather than whatever the
+    // GPU register held.
+    w(out, "    float4 r[32] = {};\n");
     // D3D9 address register `a0`. SM2 has exactly one int4 a0; the emitter
     // allocates one int4 local so `mova` / `c[a0.x + N]` / reading `a0`
     // directly all go through the same identifier. Zero-init so early
@@ -743,6 +794,11 @@ fn emit_vs_function(
     // Writing to this local instead of `out.position` keeps the
     // position computation from being clobbered on the following line.
     w(out, "    float4 _rastout_discard = float4(0.0);\n");
+    // SM3: the extra semantic members start at zero, and every output
+    // register several semantics share gets its staging local.
+    if let Some(outputs) = outputs {
+        outputs.write_prologue(out);
+    }
 
     for def in &vs.def_constants {
         let v = def.value;
@@ -776,7 +832,6 @@ fn emit_vs_function(
     let def_int_consts: BTreeSet<u16> = vs.def_int_constants.iter().map(|d| d.reg.index).collect();
     let def_bool_consts: BTreeSet<u16> =
         vs.def_bool_constants.iter().map(|d| d.reg.index).collect();
-    let vs_output_map = build_vs_output_map(vs);
     let subs = (!vs.subroutines.is_empty()).then_some(&vs.subroutines);
     let ctx = EmitContext::vs(&VsInit {
         major: vs.major,
@@ -785,12 +840,18 @@ fn emit_vs_function(
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
         def_bool_consts: &def_bool_consts,
-        vs_output_map: vs_output_map.as_ref(),
+        vs_output_map: outputs.map(VsOutputs::targets),
         subroutines: subs,
         vs_provided_mask: provided_mask,
+        lod_table,
     });
     for inst in &vs.instructions {
         translate_instruction(out, inst, &ctx)?;
+    }
+    // SM3: move each semantic out of a shared output register into its
+    // member, before the fog fallback and the position epilogue read them.
+    if let Some(outputs) = outputs {
+        outputs.write_epilogue(out);
     }
 
     // SM1/SM2 clamp the vertex colour outputs (oD0/oD1) to [0,1] before
@@ -807,7 +868,7 @@ fn emit_vs_function(
     // (which then also covers a dynamically-skipped predicated oFog write).
     // `out.color1` defaults to 0.0, so a shader writing neither oFog nor oD1
     // is fully fogged — matching the D3D9 zero specular-alpha default.
-    if !vs_writes_fog(vs, vs_output_map.as_ref()) {
+    if !vs_writes_fog(vs, outputs) {
         w(out, "    out.fog = float4(out.color1.w);\n");
     }
     // User clip planes are clip-space for the programmable pipeline: one
@@ -848,80 +909,21 @@ fn emit_vs_function(
     Ok(())
 }
 
-/// SM3 VS routes every output through a `dcl_<usage> <reg>` declaration.
-///
-/// The dcl carries the semantic regardless of which output-flavor register
-/// kind the HLSL compiler picked. Some compilers ship SM3 outputs as
-/// `RegKind::TexcoordOut` (`D3DSPR_TEXCRDOUT`, type 6, aliased as
-/// `D3DSPR_OUTPUT` in SM3); others emit `RegKind::Output` (type 11),
-/// `RegKind::RastOut`, or `RegKind::AttrOut`. Walk all of them and key
-/// on `(kind, index)` so SM3-aware lookup overrides the SM2
-/// register-kind defaults in `register_write_target`.
-fn build_vs_output_map(vs: &DxsoProgram) -> Option<BTreeMap<(RegKind, u16), String>> {
-    if vs.major != 3 {
-        return None;
-    }
-    let mut map: BTreeMap<(RegKind, u16), String> = BTreeMap::new();
-    for decl in &vs.declarations {
-        if let Declaration::Semantic {
-            usage,
-            usage_index,
-            reg,
-        } = decl
-            && is_output_reg_kind(reg.kind)
-        {
-            let target = match usage {
-                // POSITION0 is clip space ([[position]]); POSITION1+ are
-                // interpolated user varyings (out.position1, …).
-                DeclUsage::Position if *usage_index == 0 => "out.position".to_string(),
-                DeclUsage::Position => format!("out.position{usage_index}"),
-                DeclUsage::Fog => "out.fog".to_string(),
-                DeclUsage::Color => format!("out.color{usage_index}"),
-                DeclUsage::Texcoord => format!("out.texcoord{usage_index}"),
-                // SM3 `dcl_psize oN` — point-size output. Same
-                // float4-storage indirection as SM2 `oPts` so the
-                // write_mask path stays uniform.
-                DeclUsage::PSize => "_psize_storage".to_string(),
-                other => {
-                    mtld3d_shared::log_once_warn_by!(
-                        target: super::LOG_TARGET,
-                        key: u64::from(*usage_index),
-                        "dxso: VS3 output usage {other:?}{usage_index} unmapped → write sunk"
-                    );
-                    "_rastout_discard".to_string()
-                }
-            };
-            map.insert((reg.kind, reg.index), target);
-        }
-    }
-    Some(map)
-}
-
-const fn is_output_reg_kind(kind: RegKind) -> bool {
-    matches!(
-        kind,
-        RegKind::RastOut | RegKind::AttrOut | RegKind::TexcoordOut | RegKind::Output
-    )
-}
-
 /// Whether any instruction (main body or subroutine) writes the fog output.
 ///
-/// `oFog` (`RastOut` index 1) in SM1/SM2, or an output register `dcl`-ed with
-/// `DeclUsage::Fog` in SM3. Mirrors `register_write_target`'s resolution: an
-/// SM3 output write without a matching dcl is sunk, so it does not count.
-fn vs_writes_fog(vs: &DxsoProgram, output_map: Option<&BTreeMap<(RegKind, u16), String>>) -> bool {
+/// `oFog` (`RastOut` index 1) in SM1/SM2, or the lane of the output register
+/// `dcl`-ed with `FOG0` in SM3. An SM3 output write without a matching dcl is
+/// sunk, so it does not count.
+fn vs_writes_fog(vs: &DxsoProgram, outputs: Option<&VsOutputs>) -> bool {
     vs.instructions
         .iter()
         .chain(vs.subroutines.values().flatten())
         .filter_map(|inst| inst.dst.as_ref())
         .any(|dst| {
-            let reg = &dst.reg;
-            if let Some(map) = output_map {
-                return map
-                    .get(&(reg.kind, reg.index))
-                    .is_some_and(|target| target == "out.fog");
+            if let Some(outputs) = outputs {
+                return outputs.writes_fog(*dst);
             }
-            reg.kind == RegKind::RastOut && reg.index == 1
+            dst.reg.kind == RegKind::RastOut && dst.reg.index == 1
         })
 }
 
@@ -1032,6 +1034,26 @@ pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
     samplers
 }
 
+/// Sampler slots a `texldl` names, bit `i` for `s<i>`.
+///
+/// Metal ignores a sampler's LOD clamps for a sample at an explicit level, so
+/// these are the slots whose stage state the shader applies itself: through
+/// the pixel `lod_bias` rows `.z` and `.w`, or for a `vs_3_0` the vertex
+/// `vs_lod` rows (`VsSamplerKinds::lod_table`). The encoder keys either table
+/// on them, so a stage clamp the shader cannot observe mints no variant.
+/// Subroutine bodies count, since the emitter inlines them.
+#[must_use]
+pub fn explicit_lod_samplers(program: &DxsoProgram) -> u16 {
+    program
+        .instructions
+        .iter()
+        .chain(program.subroutines.values().flatten())
+        .filter(|inst| inst.opcode == Opcode::TexLdL)
+        .filter_map(|inst| inst.srcs.get(1))
+        .filter(|sampler| sampler.reg.index < 16)
+        .fold(0, |mask, sampler| mask | (1u16 << sampler.reg.index))
+}
+
 /// The texture kind sampler slot `idx` reads, taken from the live bindings.
 ///
 /// D3D9 samples the texture the application bound rather than the kind the
@@ -1086,56 +1108,14 @@ fn emit_ps_function(
     ps: &DxsoProgram,
     variant: VariantKey,
     entry: &str,
+    inputs: &PsInputs,
 ) -> Result<(), EmitError> {
     // PS 2.0 DCL usage is structural only — the register kind fixes the
     // semantic: `RegKind::Input` is v0..vN (COLOR0..COLORN per D3D9 SM2),
     // `RegKind::Addr` is t0..tN (read via `in.texcoord{index}` in
-    // `register_read_expr`, no map entry needed).
-    //
-    // PS 3.0 unifies inputs under `RegKind::Input` and the semantic comes
-    // from the matching `dcl_<usage><index> vN` — the varying slot is the
-    // declared `usage_index`, not `reg.index`. Walk the dcls and pick
-    // color/texcoord based on the declared usage when major == 3.
-    let mut ps_input_map: BTreeMap<u16, String> = BTreeMap::new();
-    for decl in &ps.declarations {
-        if let Declaration::Semantic {
-            reg,
-            usage,
-            usage_index,
-        } = decl
-            && reg.kind == RegKind::Input
-        {
-            let mapped = if ps.major == 3 {
-                match usage {
-                    DeclUsage::Color => format!("color{usage_index}"),
-                    DeclUsage::Texcoord => format!("texcoord{usage_index}"),
-                    // Fog gets its own varying that mirrors VS3
-                    // `dcl_fog oN` writes; the FF PS expects the
-                    // same `in.fog.x` channel so links stay clean.
-                    DeclUsage::Fog => "fog".to_string(),
-                    // PS3 `dcl_position0 vN` is the varying-syntax form
-                    // of vPos — clip-space position from VS post-
-                    // rasterizer becomes screen-space pixel coords on
-                    // read via the [[position]] field. POSITION1+ read
-                    // the matching interpolated user varying instead.
-                    DeclUsage::Position if *usage_index == 0 => "position".to_string(),
-                    DeclUsage::Position => format!("position{usage_index}"),
-                    other => {
-                        mtld3d_shared::log_once_warn_by!(
-                            target: super::LOG_TARGET,
-                            key: u64::from(*usage_index),
-                            "dxso: PS3 input usage {other:?}{usage_index} unmapped → reads return color{usage_index}"
-                        );
-                        format!("color{usage_index}")
-                    }
-                }
-            } else {
-                format!("color{}", reg.index)
-            };
-            ps_input_map.insert(reg.index, mapped);
-        }
-    }
-
+    // `register_read_expr`, no map entry needed). PS 3.0 unifies inputs under
+    // `RegKind::Input` and links each by its `dcl_<usage><index> vN.mask`
+    // semantic; `inputs` holds the read expression of every input register.
     // The declared sampler set drives the fragment-function signature, typed
     // by the texture each slot is bound to. Shared with the encoder's
     // unbound-slot fallback so the MSL and the bind side cannot disagree on
@@ -1170,8 +1150,9 @@ fn emit_ps_function(
     // SM2/SM3 oDepth: the PS function must return a struct binding
     // both `oC0 [[color(0)]]` and `oDepth [[depth(any)]]` instead of
     // a bare float4. Pre-scan so we only pay the struct cost when the
-    // shader actually writes oDepth — most don't.
-    let has_depth_out = ps.instructions.iter().any(|i| {
+    // shader actually writes oDepth (most don't). A write inside a
+    // subroutine counts: `call` inline-expands it into this function.
+    let has_depth_out = ps.all_instructions().any(|i| {
         // Explicit `oDepth` write, or an SM1 op that writes fragment depth
         // as a side effect (`texdepth`, `texm3x2depth`) — both route through
         // the `_depth_storage` / `PsOut` path below.
@@ -1318,7 +1299,11 @@ fn emit_ps_function(
     if point_sprite {
         write_point_sprite_prologue(out);
     }
-    w(out, "    float4 r[32];\n");
+    // Input registers several semantics share, assembled after the point
+    // sprite substitution so their texture-coordinate lanes see it.
+    inputs.write_prologue(out);
+    // Zeroed for the same reason as in `emit_vs_function`.
+    w(out, "    float4 r[32] = {};\n");
     // SM1 pixel shaders: `tN` (RegKind::Addr) is a read-write register that
     // holds the iterated texture coordinate AND receives `tex`/`texcoord`/
     // `texbem`/… results. Back it with a mutable array seeded from the
@@ -1401,7 +1386,7 @@ fn emit_ps_function(
     let ctx = EmitContext::ps(&PsInit {
         major: ps.major,
         minor: ps.minor,
-        map: &ps_input_map,
+        map: inputs.reads(),
         samplers: &samplers,
         depth_sampler_mask: variant.depth_sampler_mask,
         depth_fetch_mask: variant.depth_fetch_mask,
@@ -1605,6 +1590,12 @@ bitflags::bitflags! {
         /// Set → the register is `floor(position.xy * vpos_scale.xy)` and the
         /// `ps_draw` argument exists to read. Clear → the identity form.
         const PS_VPOS_SCALE = 1 << 5;
+        /// VS only: the per-slot `vs_lod` uniform is declared and readable.
+        ///
+        /// Set → a `texldl` samples `level(max(lod + vs_lod[N].x, vs_lod[N].y))`.
+        /// Clear → it samples the level it names, and no `vs_lod` argument
+        /// exists to read.
+        const VS_LOD_TABLE = 1 << 6;
     }
 }
 
@@ -1617,6 +1608,7 @@ struct EmitContext<'a> {
     /// texcoord input by index.
     shader_major: u8,
     shader_minor: u8,
+    /// PS only: the read expression of each input register `vN`, by index.
     ps_input_map: Option<&'a BTreeMap<u16, String>>,
     /// Per-sampler texture type of the texture bound to each declared slot.
     ///
@@ -1672,13 +1664,12 @@ struct EmitContext<'a> {
     /// call (label already on the stack) emits a once-per-label warn and skips
     /// the expansion rather than blowing the host stack.
     expansion_stack: RefCell<Vec<u32>>,
-    /// SM3 VS only: maps `(reg.kind, reg.index)` → `out.<semantic>` MSL field.
+    /// SM3 VS only: maps `(reg.kind, reg.index)` to the register's write target.
     ///
-    /// Populated from the `dcl_*` declarations. SM2 VS uses register-kind
-    /// dispatch in `register_write_target` and leaves this `None`. Keying on
-    /// the kind too is load-bearing — different HLSL backends emit SM3 outputs
-    /// as `TexcoordOut`, `AttrOut`, `RastOut`, or Output, sometimes with
-    /// overlapping indices.
+    /// Populated from the `dcl_*` declarations (see `link::VsOutputs`): an
+    /// `out.<semantic>` member, or the staging local of a register several
+    /// semantics share. SM2 VS uses register-kind dispatch in
+    /// `register_write_target` and leaves this `None`.
     vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
     /// Const-register indices defined by a `def` instruction.
     ///
@@ -1744,12 +1735,18 @@ struct VsInit<'a> {
     vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
     subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
     vs_provided_mask: u16,
+    /// The `vs_lod` table is declared, so `texldl` reads its slot's row.
+    lod_table: bool,
 }
 
 impl<'a> EmitContext<'a> {
     const fn vs(init: &VsInit<'a>) -> Self {
         Self {
-            flags: EmitContextFlags::IS_VERTEX,
+            flags: if init.lod_table {
+                EmitContextFlags::IS_VERTEX.union(EmitContextFlags::VS_LOD_TABLE)
+            } else {
+                EmitContextFlags::IS_VERTEX
+            },
             shader_major: init.major,
             shader_minor: init.minor,
             ps_input_map: None,
@@ -1804,12 +1801,17 @@ impl<'a> EmitContext<'a> {
 
     /// Whether sample sites may read the per-slot LOD-bias uniform.
     ///
-    /// False for every vertex shader: `vs_3_0` allows only `texldl`, whose
-    /// explicit LOD carries no bias, so no vertex function declares the
-    /// argument.
+    /// False for every vertex shader, whose `texldl` reads the vertex LOD
+    /// table instead (see [`Self::has_vs_lod_table`]).
     #[inline]
     const fn has_lod_bias(&self) -> bool {
         self.flags.contains(EmitContextFlags::PS_LOD_BIAS)
+    }
+
+    /// Whether a vertex `texldl` may read the per-slot `vs_lod` uniform.
+    #[inline]
+    const fn has_vs_lod_table(&self) -> bool {
+        self.flags.contains(EmitContextFlags::VS_LOD_TABLE)
     }
 
     /// Whether VS input register `v{reg}` is backed by the vertex declaration.
@@ -1891,11 +1893,12 @@ fn translate_instruction(
     let srcs: Vec<String> = inst
         .srcs
         .iter()
-        .map(|s| {
-            if s.reg.kind == RegKind::Sampler {
-                Ok(String::new())
-            } else {
+        .enumerate()
+        .map(|(index, s)| {
+            if loads_source(inst, index) {
                 load_src(s, ctx)
+            } else {
+                Ok(String::new())
             }
         })
         .collect::<Result<_, _>>()?;
@@ -1909,9 +1912,9 @@ fn translate_instruction(
         // Plain MSL `dot()` — Apple Silicon has hardware dot-product;
         // let the compiler use it. Cross-shader bit-invariance is not
         // achievable in general (per-shader matrices and vertex inputs
-        // genuinely differ between FF and programmable paths), so the
-        // implicit decal depth bias in `windows/d3d9/src/draw.rs`
-        // handles the visible symptom. `[[position, invariant]]` +
+        // genuinely differ between FF and programmable paths), so z
+        // parity between different shaders is not guaranteed and the only
+        // depth bias is the application's own. `[[position, invariant]]` +
         // `setPreserveInvariance(true)` + `setMathMode(Safe)` on VS
         // remain in place as cheap defense — they keep clip-position
         // bit-stable WITHIN a single shader across frames, which
@@ -1928,7 +1931,13 @@ fn translate_instruction(
         // D3D9 `nrm` scales EVERY written component (incl. w) by
         // 1/length(src.xyz): dst = src * rsqrt(dot(src.xyz, src.xyz)). The
         // write-mask is applied by store_dst (so `nrm r.xyz` leaves w intact).
-        Opcode::Nrm => format!("(({s}) * rsqrt(dot(({s}).xyz, ({s}).xyz)))", s = srcs[0]),
+        // A zero-length source comes back unchanged instead of as the NaN of
+        // 0 * inf: D3D9 hardware never produces a NaN or inf from `nrm`.
+        Opcode::Nrm => format!(
+            "((dot(({s}).xyz, ({s}).xyz) == 0.0) ? ({s}) \
+             : (({s}) * rsqrt(dot(({s}).xyz, ({s}).xyz))))",
+            s = srcs[0]
+        ),
         Opcode::Abs => format!("abs({})", srcs[0]),
         // D3D9: pow(base, exp) = base <= 0 ? 0 : pow(base, exp); uses abs(base).
         Opcode::Pow => format!("float4(pow(abs(({}).x), ({}).x))", srcs[0], srcs[1]),
@@ -1964,15 +1973,15 @@ fn translate_instruction(
         // D3D9 lit src — fixed-function lighting coefficients:
         //   dst.x = 1
         //   dst.y = max(src.x, 0)
-        //   dst.z = src.x > 0 ? pow(max(src.y, 0), src.w) : 0
+        //   dst.z = (src.x > 0 && src.y > 0) ? pow(src.y, power) : 0
         //   dst.w = 1
-        // The src.x > 0 gate avoids `pow(0, w)` blowing up when the
-        // diffuse term is zero. `clamp` mirrors the D3D9 exponent
-        // range — Metal's pow has the same well-behavedness so the
-        // gate alone is enough.
+        // where power is src.w clamped to +-127.9961, the D3D9 exponent
+        // range. Gating on src.y keeps `pow(0, w)` out of the result: it is
+        // 1 for w = 0 and +inf for a negative w, where D3D9 gives 0.
         Opcode::Lit => format!(
             "float4(1.0, max(({s}).x, 0.0), \
-             (({s}).x > 0.0) ? pow(max(({s}).y, 0.0), ({s}).w) : 0.0, \
+             ((({s}).x > 0.0) && (({s}).y > 0.0)) \
+             ? pow(({s}).y, clamp(({s}).w, -127.9961, 127.9961)) : 0.0, \
              1.0)",
             s = srcs[0]
         ),
@@ -2035,8 +2044,9 @@ fn translate_instruction(
         // That's exactly `step(s1, s0)`.
         Opcode::Sge => format!("step({}, {})", srcs[1], srcs[0]),
         // ps_1_0..1_3 `texcoord tN`: copy iterated texcoord set N into the
-        // register as colour data, clamped to [0,1]. The set index is the dst
-        // register number (no source operand).
+        // register as colour data, (u, v, w, 1) with u, v and w clamped to
+        // [0,1]. The set index is the dst register number (no source
+        // operand).
         // ps_1_4 `texcrd rN, tM`: copy texcoord set M into rN, NOT clamped.
         Opcode::TexCoord => {
             let dst = inst.dst.as_ref().ok_or_else(|| {
@@ -2045,7 +2055,7 @@ fn translate_instruction(
             if ctx.shader_minor >= 4 {
                 srcs[0].clone()
             } else {
-                format!("saturate(in.texcoord{})", dst.reg.index)
+                format!("float4(saturate(in.texcoord{}).xyz, 1.0)", dst.reg.index)
             }
         }
         Opcode::TexLd if ctx.is_sm1() => {
@@ -2106,10 +2116,27 @@ fn translate_instruction(
             sample_with_result_swizzle(ctx, sampler, &coord, None, instruction_bias.as_deref())
         }
         // SM3 texldl — sample with explicit LOD in coord.w.
-        // `s.sample(samp, coord, level(lod))` is the MSL form.
+        // `s.sample(samp, coord, level(lod))` is the MSL form. Under the LOD
+        // table (the pixel `lod_bias` or the vertex `vs_lod`) the level counts
+        // from the texture's LOD, carries the game's bias, and is clamped by
+        // the stage's finest level, all in the slot's row because Metal
+        // applies no sampler clamp to an explicit level.
         Opcode::TexLdL => {
             let sampler = &inst.srcs[1];
-            let suffix = format!(", level(({coord}).w)", coord = srcs[0]);
+            let idx = sampler.reg.index;
+            let suffix = if ctx.has_lod_bias() {
+                format!(
+                    ", level(max(({coord}).w + lod_bias[{idx}].z, lod_bias[{idx}].w))",
+                    coord = srcs[0]
+                )
+            } else if ctx.has_vs_lod_table() {
+                format!(
+                    ", level(max(({coord}).w + vs_lod[{idx}].x, vs_lod[{idx}].y))",
+                    coord = srcs[0]
+                )
+            } else {
+                format!(", level(({coord}).w)", coord = srcs[0])
+            };
             sample_with_result_swizzle(ctx, sampler, &srcs[0], Some(&suffix), None)
         }
         // SM3 texldd — sample with explicit gradients in srcs[2]/srcs[3].
@@ -2300,7 +2327,8 @@ fn translate_instruction(
             sample_or_compare(ctx, m, &coord4, None, None)
         }
         // `texm3x2depth tM, src` (ps_1_3) — z = pad result (t[M-1].x),
-        // w = dot(coord_m, src); write fragment depth = z / w.
+        // w = dot(coord_m, src); write fragment depth = z / w, and 1.0 (the
+        // far plane) when w is zero.
         Opcode::TexM3x2Depth => {
             let dst = inst.dst.as_ref().ok_or_else(|| {
                 EmitError::UnsupportedInstruction("texm3x2depth missing dst".into())
@@ -2311,7 +2339,7 @@ fn translate_instruction(
             let z = format!("t[{}].x", m.saturating_sub(1));
             let _ = writeln!(
                 out,
-                "    _depth_storage = float4(({w}) != 0.0 ? saturate(({z}) / ({w})) : 0.0);"
+                "    _depth_storage = float4(({w}) != 0.0 ? saturate(({z}) / ({w})) : 1.0);"
             );
             return Ok(());
         }
@@ -2340,9 +2368,11 @@ fn translate_instruction(
                     let eye = if matches!(inst.opcode, Opcode::TexM3x3Spec) {
                         format!("({e}).xyz", e = srcs[1])
                     } else {
-                        // vspec: eye vector from the .w of the three coord regs.
+                        // vspec: eye vector from the .w of the three iterated
+                        // texture coordinates. The two pad registers already
+                        // hold their dot products, so read the interpolants.
                         format!(
-                            "float3(t[{a}].w, t[{b}].w, ({coord}).w)",
+                            "float3(in.texcoord{a}.w, in.texcoord{b}.w, in.texcoord{m}.w)",
                             a = m.saturating_sub(2),
                             b = m.saturating_sub(1)
                         )
@@ -2509,11 +2539,29 @@ fn translate_instruction(
         }
         // SM3 `setp_<cmp> p0, s0, s1` — componentwise predicate set.
         // Bypass `store_dst`: p0 is bool4, the standard write-mask
-        // path expects float4 lvalues. `inst.cmp_func` is decoded by
-        // the parser; default to `==` if absent.
+        // path expects float4 lvalues. The destination write mask and an
+        // instruction predicate narrow the write the same way they do for
+        // a float destination. `inst.cmp_func` is decoded by the parser;
+        // default to `==` if absent.
         Opcode::SetP => {
             let op_str = inst.cmp_func.map_or("==", super::ir::CmpFunc::op);
-            let _ = writeln!(out, "    p0 = ({} {} {});", srcs[0], op_str, srcs[1]);
+            let cmp = format!("({} {} {})", srcs[0], op_str, srcs[1]);
+            let mask = inst.dst.map_or(WriteMask::ALL, |d| d.write_mask);
+            let (target, value) = if mask == WriteMask::ALL {
+                ("p0".to_string(), cmp)
+            } else {
+                let chars = write_mask_chars(mask);
+                (format!("p0.{chars}"), format!("{cmp}.{chars}"))
+            };
+            if let Some(pred) = inst.predicate.as_ref() {
+                let predicate = predicate_mask_expr(pred, mask);
+                let _ = writeln!(
+                    out,
+                    "    {target} = select({target}, {value}, {predicate});"
+                );
+            } else {
+                let _ = writeln!(out, "    {target} = {value};");
+            }
             return Ok(());
         }
         // `breakp p0.comp` consumes a regular predicate source. The generic
@@ -2673,6 +2721,16 @@ fn current_loop_al(ctx: &EmitContext) -> Option<usize> {
     ctx.loop_stack.borrow().iter().rev().find_map(|f| *f)
 }
 
+/// Whether source operand `index` of `inst` has a value to load before the opcode's arm runs.
+///
+/// A sampler names a binding, not a value. The `aL` operand of `loop aL,
+/// iN` names the counter that the `Loop` arm itself declares, so no loop
+/// frame holds it yet.
+fn loads_source(inst: &Instruction, index: usize) -> bool {
+    let operand = &inst.srcs[index];
+    !(operand.reg.kind == RegKind::Sampler || (inst.opcode == Opcode::Loop && index == 0))
+}
+
 fn load_src(src: &SrcOperand, ctx: &EmitContext) -> Result<String, EmitError> {
     let base = if let Some(rel) = src.rel_addr {
         // Relative addressing: `c[<index> + N]`. D3D9 allows this only on the
@@ -2752,12 +2810,10 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
                     "float4(0.0)".to_owned()
                 }
             } else {
-                let name = ctx
-                    .ps_input_map
+                ctx.ps_input_map
                     .and_then(|m| m.get(&reg.index))
                     .cloned()
-                    .unwrap_or_else(|| format!("color{}", reg.index));
-                format!("in.{name}")
+                    .unwrap_or_else(|| format!("in.color{}", reg.index))
             }
         }
         // Direct named constants we allow reading back (rare — mostly for
@@ -3033,7 +3089,7 @@ fn register_write_target(reg: Register, ctx: &EmitContext) -> String {
     // to SM2 register-kind defaults only when the map is absent (SM2)
     // or has no entry (a missing-dcl bug — sink-and-warn).
     if let Some(map) = ctx.vs_output_map
-        && is_output_reg_kind(reg.kind)
+        && link::is_output_kind(reg.kind)
     {
         return map.get(&(reg.kind, reg.index)).map_or_else(
             || {
@@ -3183,8 +3239,8 @@ fn bump_lum_exprs(stage: u16) -> (String, String) {
 ///
 /// `suffix` is the trailing `, level(...)` (texldl) or `, gradientNN(...)`
 /// (texldd) text; `instruction_bias` is the `texldb` coordinate `.w`.
-/// `sample_compare` accepts the explicit-LOD suffixes unchanged, while depth
-/// textures have no mip chain and ignore the instruction bias.
+/// `sample_compare` accepts the explicit-LOD suffixes unchanged; depth
+/// samples ignore the instruction bias and pin the stage's finest level.
 fn sample_or_compare(
     ctx: &EmitContext,
     sampler_idx: u16,
@@ -3206,11 +3262,13 @@ fn sample_or_compare(
         // INTZ/DF24/DF16 read normalized depth through `.sample()` instead of
         // a shadow comparison. INTZ broadcasts it; DF formats fill GBA as 0,0,1.
         // The projective `.q` divide, if any,
-        // was already folded into `coord_expr` by the texldp caller. Pin
-        // `level(0)` for the same no-mip / discard-derivative
-        // reason as the compare path; texldl/texldd override via their suffix.
+        // was already folded into `coord_expr` by the texldp caller. Pin the
+        // stage's finest level (`pinned_depth_level`) for the same
+        // discard-derivative reason as the compare path; texldl/texldd
+        // override via their suffix.
+        let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
-            ", level(0)"
+            default_level.as_str()
         } else {
             suffix_str
         };
@@ -3230,11 +3288,13 @@ fn sample_or_compare(
         // gradients in a 2×2 quad where a neighbour ran
         // `discard_fragment` are *undefined* per the Metal spec —
         // exactly the case for alpha-cut foliage shadow receivers.
-        // Force `level(0)` to pin the mip and eliminate the
-        // discard-driven derivative dependency. `texldl` / `texldd`
-        // already pass their own suffix and override this default.
+        // Pin the stage's finest level (`pinned_depth_level`, level 0
+        // unless the stage clamps) to eliminate the discard-driven
+        // derivative dependency. `texldl` / `texldd` already pass their own
+        // suffix and override this default.
+        let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
-            ", level(0)"
+            default_level.as_str()
         } else {
             suffix_str
         };
@@ -3242,10 +3302,9 @@ fn sample_or_compare(
             "float4(s{sampler_idx}.sample_compare(samp{sampler_idx}, ({coord_expr}).xy, saturate(({coord_expr}).z){lod_suffix}))"
         )
     } else {
-        // `D3DSAMP_MIPMAPLODBIAS` shifts the mip the hardware selects, so it
-        // applies to implicit-LOD samples only. An explicit `level(...)`
-        // supplies the LOD outright (D3D9 leaves it unbiased) and MSL accepts
-        // exactly one LOD option per call, so a suffixed sample keeps its own;
+        // `D3DSAMP_MIPMAPLODBIAS` shifts the mip the hardware selects. MSL
+        // accepts exactly one LOD option per call, so a suffixed sample keeps
+        // its own: `texldl` carries the bias in its level expression and
         // `texldd` folds the shift into its gradients at the call site.
         let bias = if suffix_str.is_empty() {
             match (instruction_bias, ctx.has_lod_bias()) {
@@ -3262,6 +3321,20 @@ fn sample_or_compare(
         format!(
             "s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).{coord_swizzle}{suffix_str}{bias})"
         )
+    }
+}
+
+/// The `level(...)` suffix of a depth sample that names no level of its own.
+///
+/// Depth samples pin a level instead of computing one (see
+/// [`sample_or_compare`]). D3D9 samples the stage's finest level there, the
+/// slot row's `.w` under the LOD table, which is below 0 for a slot with no
+/// clamp.
+fn pinned_depth_level(ctx: &EmitContext, sampler_idx: u16) -> String {
+    if ctx.has_lod_bias() {
+        format!(", level(max(lod_bias[{sampler_idx}].w, 0.0))")
+    } else {
+        ", level(0)".to_string()
     }
 }
 

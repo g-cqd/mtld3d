@@ -11,23 +11,32 @@ use core::ffi::c_void;
 
 use mtld3d_shared::{InPtr, OutPtr};
 use mtld3d_types::{
-    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl,
+    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DPRESENT_PARAMETERS, D3DPRESENTSTATS, Guid,
+    IDirect3DSwapChain9ExVtbl, IDirect3DSwapChain9Vtbl,
 };
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, device::DeviceInner};
 use crate::{com_ref::ComUnknown, surface::Direct3DSurface9};
 
-pub static DIRECT3D_SWAPCHAIN9_VTBL: IDirect3DSwapChain9Vtbl = IDirect3DSwapChain9Vtbl {
-    query_interface: swapchain_query_interface,
-    add_ref: swapchain_add_ref,
-    release: swapchain_release,
-    present: swapchain_present,
-    get_front_buffer_data: swapchain_get_front_buffer_data,
-    get_back_buffer: swapchain_get_back_buffer,
-    get_raster_status: swapchain_get_raster_status,
-    get_display_mode: swapchain_get_display_mode,
-    get_device: swapchain_get_device,
-    get_present_parameters: swapchain_get_present_parameters,
+/// The vtable every swap chain carries.
+///
+/// A swap chain answers `IID_IDirect3DSwapChain9Ex` only on an extended device.
+pub static DIRECT3D_SWAPCHAIN9_VTBL: IDirect3DSwapChain9ExVtbl = IDirect3DSwapChain9ExVtbl {
+    base: IDirect3DSwapChain9Vtbl {
+        query_interface: swapchain_query_interface,
+        add_ref: swapchain_add_ref,
+        release: swapchain_release,
+        present: swapchain_present,
+        get_front_buffer_data: swapchain_get_front_buffer_data,
+        get_back_buffer: swapchain_get_back_buffer,
+        get_raster_status: swapchain_get_raster_status,
+        get_display_mode: swapchain_get_display_mode,
+        get_device: swapchain_get_device,
+        get_present_parameters: swapchain_get_present_parameters,
+    },
+    get_last_present_count: swapchain_get_last_present_count,
+    get_present_stats: swapchain_get_present_stats,
+    get_display_mode_ex: swapchain_get_display_mode_ex,
 };
 
 #[repr(C)]
@@ -75,7 +84,7 @@ impl Direct3DSwapChain9 {
             backbuffer_surface: 0,
         }));
         Self {
-            vtbl: &raw const DIRECT3D_SWAPCHAIN9_VTBL,
+            vtbl: &raw const DIRECT3D_SWAPCHAIN9_VTBL.base,
             // Implicit (device-owned) swapchains start at refcount 0 and forward
             // to the device on the 0↔1 boundary (D3D9 implicit-object model);
             // app-owned additional swapchains start at 1 and own their create
@@ -131,6 +140,13 @@ impl Direct3DSwapChain9 {
         unsafe { (*device_inner).device_wrapper() }
     }
 
+    /// Whether the owning device is extended; `false` once the device pointer is unset.
+    fn device_is_extended(&self) -> bool {
+        // SAFETY: `device_inner` is null or the live owning device (see
+        // `SwapChainInner`), alive past its child swapchains.
+        unsafe { self.inner().device_inner.as_ref() }.is_some_and(DeviceInner::is_extended)
+    }
+
     fn inner(&self) -> &SwapChainInner {
         // SAFETY: `self.inner` was installed by a constructor as a
         // `Box::into_raw` and is dropped only in `swapchain_release` at
@@ -165,6 +181,23 @@ extern "system" fn swapchain_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
+    // A swap chain answers the extended IID when its device is extended,
+    // whichever create made the device.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
+    let extended = unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }
+        .is_some_and(|obj| obj.device_is_extended());
+    let accepted: &[Guid] = if extended {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3DSWAPCHAIN9,
+            mtld3d_types::IID_IDIRECT3DSWAPCHAIN9EX,
+        ]
+    } else {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3DSWAPCHAIN9,
+        ]
+    };
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
@@ -172,10 +205,7 @@ extern "system" fn swapchain_query_interface(
             this,
             riid,
             ppv,
-            &[
-                mtld3d_types::IID_IUNKNOWN,
-                mtld3d_types::IID_IDIRECT3DSWAPCHAIN9,
-            ],
+            accepted,
             swapchain_add_ref,
             "IDirect3DSwapChain9",
         )
@@ -201,8 +231,12 @@ extern "system" fn swapchain_release(this: *mut c_void) -> u32 {
 
 /// Destroy an app-owned `Direct3DSwapChain9` wrapper once both refcounts reach zero.
 ///
-/// The device-owned implicit swapchain is never finalized (its shell is leaked
-/// at device teardown).
+/// Its back buffer goes with it, so this runs only once the back buffer is
+/// referenced by nothing either: the back buffer's public references retain
+/// this chain publicly and its binding references retain it privately, so
+/// whichever of the two counts reaches zero last finalizes it. The
+/// device-owned implicit swapchain is never finalized (its shell is leaked at
+/// device teardown).
 ///
 /// # Safety
 /// `this` must point to a live, app-owned `Direct3DSwapChain9` wrapper at
@@ -214,7 +248,8 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     let inner = unsafe { (*this).inner };
     // Finalize the swapchain-owned cached backbuffer surface (a `Backbuffer`-kind
     // surface never freed by its own `Release` — destroyed with its owner here,
-    // mirroring how `device_release` finalizes the implicit RT/DS surfaces).
+    // mirroring how `device_release` finalizes the implicit RT/DS surfaces). Its
+    // references retain this swap chain, so nothing references it now.
     // SAFETY: `inner` is live (sole owner); read the cached pointer before the
     // box is freed.
     let backbuffer_surface = unsafe { (*inner).backbuffer_surface };
@@ -230,8 +265,9 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     drop(unsafe { Box::from_raw(this) });
 }
 
-// SAFETY: `refcount_mut` exposes this wrapper's own counter; `finalize` frees an
-// app-owned swapchain exactly once at refcount zero. The device-owned implicit
+// SAFETY: `refcount_mut` exposes this wrapper's own counter and
+// `private_refcount` the back buffer's binding references; `finalize` frees an app-owned
+// swapchain exactly once when both are zero. The device-owned implicit
 // swapchain forwards its refcount to the device and is never finalized here.
 unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
     fn refcount_mut(&mut self) -> &mut u32 {
@@ -284,7 +320,7 @@ extern "system" fn swapchain_present(
     dest_rect: *const c_void,
     dest_window_override: usize,
     dirty_region: *const c_void,
-    _flags: u32,
+    flags: u32,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
@@ -297,6 +333,7 @@ extern "system" fn swapchain_present(
         dest_window_override != 0,
         dirty_region,
     );
+    crate::device::warn_ignored_present_flags(flags);
     if !obj.inner().owned_by_device {
         // SAFETY: the live chain retains its device and owns its cached back buffer.
         let device = unsafe { InPtr::<crate::device::Direct3DDevice9>::new(obj.device_wrapper()) };
@@ -314,7 +351,8 @@ extern "system" fn swapchain_present(
     if dev.needs_reset() {
         return D3DERR_DEVICENOTRESET;
     }
-    dev.present()
+    let hr = dev.present();
+    dev.state_code(hr)
 }
 
 extern "system" fn swapchain_get_front_buffer_data(this: *mut c_void, surface: *mut c_void) -> i32 {
@@ -444,4 +482,62 @@ extern "system" fn swapchain_get_present_parameters(
     // `D3DPRESENT_PARAMETERS` per the D3D9 ABI.
     unsafe { *parameters.cast::<D3DPRESENT_PARAMETERS>() = obj.inner().present_params };
     D3D_OK
+}
+
+extern "system" fn swapchain_get_last_present_count(this: *mut c_void, count: *mut u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
+    mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+        "stub IDirect3DSwapChain9Ex::GetLastPresentCount → 0 (presents are not counted)");
+    if count.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable out-param; `count` is non-null (checked) and points to a
+    // writable UINT per the IDirect3DSwapChain9Ex ABI.
+    unsafe { OutPtr::write_opt(count, 0) };
+    D3D_OK
+}
+
+extern "system" fn swapchain_get_present_stats(
+    this: *mut c_void,
+    stats: *mut D3DPRESENTSTATS,
+) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
+    mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+        "stub IDirect3DSwapChain9Ex::GetPresentStats → zeroed statistics");
+    if stats.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable out-param; `stats` is non-null (checked) and points to a
+    // writable `D3DPRESENTSTATS` per the IDirect3DSwapChain9Ex ABI.
+    unsafe {
+        OutPtr::write_opt(
+            stats,
+            D3DPRESENTSTATS {
+                present_count: 0,
+                present_refresh_count: 0,
+                sync_refresh_count: 0,
+                pad: [0; mtld3d_types::D3DPRESENTSTATS_PAD_WORDS],
+                sync_qpc_time: [0; 2],
+                sync_gpu_time: [0; 2],
+            },
+        );
+    };
+    D3D_OK
+}
+
+extern "system" fn swapchain_get_display_mode_ex(
+    this: *mut c_void,
+    mode: *mut c_void,
+    rotation: *mut u32,
+) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
+    // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // The mode `GetDisplayMode` reports, from the same present parameters.
+    let current = crate::direct3d9::reported_display_mode(&obj.inner().present_params);
+    // SAFETY: vtable out-params; `mode` and `rotation` are null or writable per
+    // the IDirect3DSwapChain9Ex ABI.
+    unsafe { crate::direct3d9::write_display_mode_ex(mode, rotation, &current) }
 }

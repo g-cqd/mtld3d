@@ -6,8 +6,8 @@ use mtld3d_shared::{
     AttachMetalLayerParams, BlitTextureToBufferParams, CreateBackbufferParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
-    GetDeviceInfoParams, InPtr, InPtrMut, MetalHandle, OpenLogParams, SetCursorOverlayParams,
-    SetPresentWaitPolicyParams, WriteLogParams, identity,
+    GetDeviceInfoParams, InPtr, InPtrMut, LogLineKind, MetalHandle, OpenLogParams,
+    SetCursorOverlayParams, SetPresentWaitPolicyParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind},
     mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
@@ -35,29 +35,20 @@ pub extern "C" fn init_logger_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<mtld3d_shared::InitLoggerParams>::opt(args) }) else {
         return STATUS_UNSUCCESSFUL;
     };
-    let filter = if params.filter_len == 0 {
-        None
-    } else {
-        if params.filter_ptr == 0
-            || params
-                .filter_ptr
-                .checked_add(u64::from(params.filter_len))
-                .is_none()
-        {
-            return STATUS_UNSUCCESSFUL;
-        }
-        // SAFETY: the PE caller retains the byte-aligned UTF-8 buffer through this call.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(params.filter_ptr as *const u8, params.filter_len as usize)
-        };
-        let Ok(filter) = std::str::from_utf8(bytes) else {
-            return STATUS_UNSUCCESSFUL;
-        };
-        Some(filter)
+    let (Ok(filter), Ok(early_dir), Ok(early_stem)) = (
+        borrowed_utf8(params.filter_ptr, params.filter_len),
+        borrowed_utf8(params.early_dir_ptr, params.early_dir_len),
+        borrowed_utf8(params.early_stem_ptr, params.early_stem_len),
+    ) else {
+        return STATUS_UNSUCCESSFUL;
     };
     INIT.call_once(|| {
         // Every line goes to the process's log file once `OpenLog` names
-        // it; the file sink keeps the lines logged before that.
+        // it; the file sink keeps the lines logged before that, and a crash
+        // report before then opens the early location instead of waiting.
+        if let (Some(dir), Some(stem)) = (early_dir, early_stem) {
+            crate::log_file::set_early_location(dir, stem);
+        }
         mtld3d_shared::init_logger_to_filter(Box::new(crate::log_file::FileSink), filter);
         log_identity();
         // Latch the unix-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
@@ -95,7 +86,11 @@ pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
     // duration; the pointer is non-zero per the check above.
     let bytes =
         unsafe { core::slice::from_raw_parts(params.ptr as *const u8, params.len as usize) };
-    crate::log_file::write_all(bytes);
+    match params.kind {
+        LogLineKind::Ordinary => crate::log_file::write_all(bytes),
+        LogLineKind::FaultReport => crate::log_file::write_fault(bytes),
+        LogLineKind::CrashReport => crate::log_file::write_crash(bytes),
+    }
     STATUS_SUCCESS
 }
 
@@ -138,6 +133,22 @@ pub extern "C" fn open_log_handler(args: *mut c_void) -> i32 {
     let path = crate::log_file::open(dir, stem);
     info!(target: LOG_TARGET, "log file: {}", path.display());
     STATUS_SUCCESS
+}
+
+/// A UTF-8 string the PE side lends for the call, `None` when it sends none.
+///
+/// `Err` for a range that wraps or bytes that are not UTF-8.
+fn borrowed_utf8<'a>(ptr: u64, len: u32) -> Result<Option<&'a str>, ()> {
+    if len == 0 {
+        return Ok(None);
+    }
+    if ptr == 0 || ptr.checked_add(u64::from(len)).is_none() {
+        return Err(());
+    }
+    // SAFETY: the PE caller retains the byte-aligned buffer of `len` bytes at
+    // `ptr` through this call.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    std::str::from_utf8(bytes).map(Some).map_err(|_| ())
 }
 
 /// Name this build in the log, as the first line the unix side emits.
@@ -256,7 +267,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
             |path| Some(std::path::PathBuf::from(path)),
         )
     };
-    if let Some(caps) = metal::create_command_queue(gate) {
+    if let Some(caps) = metal::create_command_queue(gate, params.present_debug) {
         params.device_handle = caps.device_handle;
         params.record_handle = caps.record_handle;
         params.unified_memory = u32::from(caps.unified_memory);
@@ -266,6 +277,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
             "created Metal device + command queue (unified_memory={}, min_linear_texture_align={})",
             caps.unified_memory, caps.min_linear_texture_align,
         );
+        metal::log_metal_tools();
         STATUS_SUCCESS
     } else {
         error!(target: LOG_TARGET, "failed to create Metal device/command queue");
@@ -308,6 +320,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
             if params.display_sync_enabled != 0 { "on" } else { "off" },
             params.max_fps
         );
+        crate::hud_state::report_attached();
         STATUS_SUCCESS
     } else {
         params.view_handle = MetalHandle::NULL;
@@ -429,6 +442,49 @@ pub fn task_faults() -> mtld3d_core::perf::TaskFaults {
             0
         },
     }
+}
+
+/// The process's physical footprint in bytes, 0 when the kernel refuses the query.
+///
+/// `ri_phys_footprint` of `proc_pid_rusage`, the task ledger figure that
+/// `TASK_VM_INFO`'s `phys_footprint` also reports and the Metal HUD shows
+/// as app memory: resident and compressed private memory plus the driver and
+/// GPU allocations charged to the process.
+pub fn process_footprint() -> u64 {
+    // SAFETY: rusage_info_v2 is plain data initialized before the kernel fills it.
+    let mut info: libc::rusage_info_v2 = unsafe { core::mem::zeroed() };
+    let Ok(pid) = libc::c_int::try_from(std::process::id()) else {
+        return 0;
+    };
+    // SAFETY: info is a live writable rusage_info_v2 and RUSAGE_INFO_V2 names its layout.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc == 0 { info.ri_phys_footprint } else { 0 }
+}
+
+/// Bytes in use in every `malloc` zone of the process.
+///
+/// `malloc_zone_statistics` with a null zone sums every registered zone, so
+/// this is the whole process's `malloc`: Wine's unix side, the system
+/// frameworks and the Objective-C and Metal objects they allocate for this
+/// layer. It takes each zone's lock in turn: 10 to 25 microseconds with about
+/// 100 MB in use on the `x86_64` Wine, about 160 microseconds on the first call,
+/// so it is read once per summary window.
+pub fn malloc_in_use() -> u64 {
+    let mut stats = libc::malloc_statistics_t {
+        blocks_in_use: 0,
+        size_in_use: 0,
+        max_size_in_use: 0,
+        size_allocated: 0,
+    };
+    // SAFETY: a null zone asks libmalloc to sum every zone into stats, a live writable struct.
+    unsafe { libc::malloc_zone_statistics(core::ptr::null_mut(), &raw mut stats) };
+    u64::try_from(stats.size_in_use).unwrap_or(u64::MAX)
 }
 
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {

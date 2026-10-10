@@ -1,7 +1,10 @@
 use core::ffi::c_void;
 use std::{
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU32, Ordering, fence},
+    },
 };
 
 use log::{error, info, trace, warn};
@@ -20,22 +23,24 @@ use mtld3d_core::{
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
-    MetalHandle, OutPtr, VtableThis,
-    mtl::DeviceCapsFlags,
+    MetalHandle, OutPtr, ValueIn, VtableThis,
+    mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
-    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
-    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16,
-    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
-    IDirect3D9Vtbl,
+    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DDISPLAYMODEEX,
+    D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
+    D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9ExVtbl, IDirect3D9Vtbl,
+    LUID,
 };
 
 use super::{
@@ -43,6 +48,7 @@ use super::{
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
     fullscreen::Rect,
+    null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
 };
@@ -81,6 +87,9 @@ const ADAPTER_FORMATS: &[u32] = &[D3DFMT_X8R8G8B8, D3DFMT_R5G6B5];
 /// games whose video-menu dropdowns are D3D9-driven vs Win32-driven (Wine's
 /// `EnumDisplaySettings` → macdrv → `CGDisplayCopyAllDisplayModes`).
 const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
+
+/// The GDI name of the primary display, the one adapter 0 drives.
+const PRIMARY_DISPLAY_NAME: &str = "\\\\.\\DISPLAY1";
 
 /// The adapter display-mode format (`D3DFMT_*`) — the format `GetAdapterDisplayMode` reports.
 ///
@@ -259,24 +268,38 @@ pub fn fullscreen_mode_request(pp: &D3DPRESENT_PARAMETERS) -> Option<ModeRequest
     })
 }
 
-static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
-    query_interface: d3d9_query_interface,
-    add_ref: d3d9_add_ref,
-    release: d3d9_release,
-    register_software_device: d3d9_register_software_device,
-    get_adapter_count: d3d9_get_adapter_count,
-    get_adapter_identifier: d3d9_get_adapter_identifier,
-    get_adapter_mode_count: d3d9_get_adapter_mode_count,
-    enum_adapter_modes: d3d9_enum_adapter_modes,
-    get_adapter_display_mode: d3d9_get_adapter_display_mode,
-    check_device_type: d3d9_check_device_type,
-    check_device_format: d3d9_check_device_format,
-    check_device_multi_sample_type: d3d9_check_device_multi_sample_type,
-    check_depth_stencil_match: d3d9_check_depth_stencil_match,
-    check_device_format_conversion: d3d9_check_device_format_conversion,
-    get_device_caps: d3d9_get_device_caps,
-    get_adapter_monitor: d3d9_get_adapter_monitor,
-    create_device: d3d9_create_device,
+/// The vtable every interface carries, extended or not.
+///
+/// A plain interface hands out the same table: its base slots are the
+/// `IDirect3D9` contract, and a caller that never queried `IID_IDirect3D9Ex`
+/// has no reason to reach past them. An extended entry point called through a
+/// plain interface still runs; `CreateDeviceEx` there makes a plain device,
+/// since the device takes its kind from the interface that creates it.
+static DIRECT3D9_VTBL: IDirect3D9ExVtbl = IDirect3D9ExVtbl {
+    base: IDirect3D9Vtbl {
+        query_interface: d3d9_query_interface,
+        add_ref: d3d9_add_ref,
+        release: d3d9_release,
+        register_software_device: d3d9_register_software_device,
+        get_adapter_count: d3d9_get_adapter_count,
+        get_adapter_identifier: d3d9_get_adapter_identifier,
+        get_adapter_mode_count: d3d9_get_adapter_mode_count,
+        enum_adapter_modes: d3d9_enum_adapter_modes,
+        get_adapter_display_mode: d3d9_get_adapter_display_mode,
+        check_device_type: d3d9_check_device_type,
+        check_device_format: d3d9_check_device_format,
+        check_device_multi_sample_type: d3d9_check_device_multi_sample_type,
+        check_depth_stencil_match: d3d9_check_depth_stencil_match,
+        check_device_format_conversion: d3d9_check_device_format_conversion,
+        get_device_caps: d3d9_get_device_caps,
+        get_adapter_monitor: d3d9_get_adapter_monitor,
+        create_device: d3d9_create_device,
+    },
+    get_adapter_mode_count_ex: d3d9_get_adapter_mode_count_ex,
+    enum_adapter_modes_ex: d3d9_enum_adapter_modes_ex,
+    get_adapter_display_mode_ex: d3d9_get_adapter_display_mode_ex,
+    create_device_ex: d3d9_create_device_ex,
+    get_adapter_luid: d3d9_get_adapter_luid,
 };
 
 // ── IDirect3D9 COM object ──
@@ -284,7 +307,8 @@ static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
 #[repr(C)]
 pub struct Direct3D9 {
     vtbl: *const IDirect3D9Vtbl,
-    refcount: u32,
+    /// The public refcount, changed from any thread that holds the interface or a device it made.
+    refcount: AtomicU32,
     inner: Box<Direct3D9Inner>,
 }
 
@@ -295,6 +319,10 @@ pub struct Direct3D9 {
 /// before a device's.
 pub struct Direct3D9Inner {
     config: Arc<Mtld3dConfig>,
+    /// Made by `Direct3DCreate9Ex`: the interface answers `IID_IDirect3D9Ex`.
+    ///
+    /// Every device it creates is extended, whichever create made it.
+    extended: bool,
 }
 
 impl Drop for Direct3D9Inner {
@@ -306,13 +334,23 @@ impl Drop for Direct3D9Inner {
 }
 
 impl Direct3D9 {
-    pub fn new(config: Arc<Mtld3dConfig>) -> Self {
+    pub fn new(config: Arc<Mtld3dConfig>, extended: bool) -> Self {
         ADAPTER_MODES.get_or_init(|| build_adapter_modes(config.display_legacy_4_by_3));
         Self {
-            vtbl: &raw const DIRECT3D9_VTBL,
-            refcount: 1,
-            inner: Box::new(Direct3D9Inner { config }),
+            vtbl: &raw const DIRECT3D9_VTBL.base,
+            refcount: AtomicU32::new(1),
+            inner: Box::new(Direct3D9Inner { config, extended }),
         }
+    }
+
+    /// Whether `Direct3DCreate9Ex` made this interface.
+    pub const fn is_extended(&self) -> bool {
+        self.inner.extended
+    }
+
+    /// Take one more reference; the count after it.
+    fn add_ref(&self) -> u32 {
+        self.refcount.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// The configuration this interface resolved at `Direct3DCreate9`.
@@ -452,24 +490,18 @@ pub fn map_for_device(
     mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
 }
 
-/// Depth-stencil formats.
+/// Depth-stencil formats: the ones the capability answers offer.
 ///
-/// Includes the FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`)
-/// — created with `USAGE_DEPTHSTENCIL`, bound as the depth target during a
-/// caster pass and sampled as a depth texture in the receiver pass. Apple
-/// Silicon promotes all of them to `Depth32Float` (see
-/// `format::map_d3d_depth_format`).
+/// Read from `format::is_advertised_depth_format`, so a depth format the
+/// answers offer is one every create accepts. It includes the FOURCC
+/// sampleable-depth formats (`INTZ` / `DF24` / `DF16`), created with
+/// `USAGE_DEPTHSTENCIL`, bound as the depth target during a caster pass and
+/// sampled as a depth texture in the receiver pass, and `D24FS8`. It leaves
+/// out `D15S1` and `D24X4S4`, which nothing creates, and the two lockable
+/// formats, which the auto depth-stencil and a depth-stencil texture still
+/// take without the `LockRect` the format promises.
 pub const fn is_depth_stencil_format(fmt: u32) -> bool {
-    matches!(
-        fmt,
-        D3DFMT_D16
-            | D3DFMT_D24S8
-            | D3DFMT_D24X8
-            | D3DFMT_D32
-            | D3DFMT_INTZ
-            | D3DFMT_DF24
-            | D3DFMT_DF16
-    )
+    mtld3d_core::format::is_advertised_depth_format(fmt)
 }
 
 /// Subset of depth-stencil formats that carry a stencil plane.
@@ -484,7 +516,7 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
     // depth/stencil attachment formats desync from the bound depth texture — a
     // Metal validation failure, and heap-corrupting undefined behaviour with
     // the layer off. Deriving from the same mapping keeps them in lockstep:
-    // D15S1 and D24X4S4 are combined formats too, not just D24S8/D24FS8.
+    // D24FS8 and INTZ are combined formats too, not just D24S8.
     matches!(
         mtld3d_core::format::map_d3d_depth_format(fmt),
         Some(mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8)
@@ -544,17 +576,21 @@ extern "system" fn d3d9_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per the IDirect3D9 ABI.
+    let extended = unsafe { InPtr::<Direct3D9>::opt(this) }.is_some_and(|d3d| d3d.is_extended());
+    let accepted: &[Guid] = if extended {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3D9,
+            mtld3d_types::IID_IDIRECT3D9EX,
+        ]
+    } else {
+        &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9]
+    };
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
-        crate::com_ref::com_query_interface(
-            this,
-            riid,
-            ppv,
-            &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9],
-            d3d9_add_ref,
-            "IDirect3D9",
-        )
+        crate::com_ref::com_query_interface(this, riid, ppv, accepted, d3d9_add_ref, "IDirect3D9")
     }
 }
 
@@ -562,26 +598,37 @@ extern "system" fn d3d9_add_ref(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 AddRef — null `this` is UB per spec; we preserve the
     // crash semantic so refcount miscounts surface as a null-deref.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount += 1;
-    obj.refcount
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    wrap.add_ref()
 }
 
 extern "system" fn d3d9_release(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 Release — same contract as AddRef above.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount -= 1;
-    let rc = obj.refcount;
-    if rc == 0 {
-        // SAFETY: refcount reached zero; `this` is the original
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    // The interface is not tied to a device's lock: every device it created
+    // takes and gives back references on it from its own threads, so the
+    // count is atomic. `checked_sub` only keeps a `Release` past zero from
+    // wrapping the count; it answers 0 and frees nothing.
+    let Ok(previous) = wrap
+        .refcount
+        .try_update(Ordering::Release, Ordering::Relaxed, |count| {
+            count.checked_sub(1)
+        })
+    else {
+        return 0;
+    };
+    if previous == 1 {
+        // Every other thread's last use of the interface happened before its
+        // own decrement, which the `Release` ordering publishes; this fence
+        // makes those uses happen before the free.
+        fence(Ordering::Acquire);
+        // SAFETY: the count reached zero; `this` is the original
         // `Box::into_raw(Direct3D9)` allocation from `Direct3DCreate9`,
         // and no other reference can survive a zero refcount.
         drop(unsafe { Box::from_raw(this.cast::<Direct3D9>()) });
     }
-    rc
+    previous - 1
 }
 
 // ── IDirect3D9 methods ──
@@ -619,11 +666,14 @@ extern "system" fn d3d9_get_adapter_identifier(
 
     id.driver[..7].copy_from_slice(b"mtld3d\0");
     id.vendor_id = 0x106B; // Apple
+    // An extended interface reports level 1 without consulting the driver, as
+    // D3D9Ex does; a plain one reports 0.
+    id.whql_level = u32::from(d3d.is_extended());
 
     // GDI-style display-device name for adapter 0. D3D9 reports the adapter's
     // GDI name here; the conformance suite (and real apps enumerating adapters)
     // require it to be non-empty.
-    let device_name = b"\\\\.\\DISPLAY1\0";
+    let device_name = PRIMARY_DISPLAY_NAME.as_bytes();
     id.device_name[..device_name.len()].copy_from_slice(device_name);
 
     let info = device_info();
@@ -777,7 +827,7 @@ pub fn float32_filtering_supported(deny: bool) -> bool {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "32-bit float filtering unavailable (forced={deny}): R32F/G32R32F/A32B32G32R32F \
-             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER"
+             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER and are sampled point-filtered"
         );
     }
     supported
@@ -870,6 +920,223 @@ extern "system" fn d3d9_get_adapter_display_mode(
     D3D_OK
 }
 
+/// The modes an extended enumeration keeps under `filter`, `None` for a filter that keeps none.
+///
+/// Every listed mode is progressive, so a filter asking for interlaced modes
+/// keeps none, as does a format the adapter lists no mode in.
+fn filtered_modes(filter: &D3DDISPLAYMODEFILTER) -> Option<impl Iterator<Item = &D3DDISPLAYMODE>> {
+    if filter.scan_line_ordering == D3DSCANLINEORDERING_INTERLACED
+        || !is_display_format(filter.format)
+    {
+        return None;
+    }
+    let format = filter.format;
+    Some(
+        adapter_modes()
+            .served
+            .iter()
+            .filter(move |m| m.format == format),
+    )
+}
+
+extern "system" fn d3d9_get_adapter_mode_count_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    filter: *const D3DDISPLAYMODEFILTER,
+) -> u32 {
+    // SAFETY: vtable in-param; `filter` is null or a readable
+    // `D3DDISPLAYMODEFILTER` per the IDirect3D9Ex ABI.
+    let filter = unsafe { ValueIn::<D3DDISPLAYMODEFILTER>::read_opt(filter.cast()) };
+    let Some(modes) = filter
+        .as_ref()
+        .filter(|_| adapter == 0)
+        .and_then(filtered_modes)
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetAdapterModeCountEx(adapter={adapter}): no filter, another adapter, an interlaced \
+             filter or a format with no modes → 0"
+        );
+        return 0;
+    };
+    u32::try_from(modes.count()).expect("ADAPTER_MODES is a small static table")
+}
+
+extern "system" fn d3d9_enum_adapter_modes_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    filter: *const D3DDISPLAYMODEFILTER,
+    mode_index: u32,
+    mode: *mut D3DDISPLAYMODEEX,
+) -> i32 {
+    // SAFETY: vtable in-param; `filter` is null or a readable
+    // `D3DDISPLAYMODEFILTER` per the IDirect3D9Ex ABI.
+    let filter = unsafe { ValueIn::<D3DDISPLAYMODEFILTER>::read_opt(filter.cast()) };
+    let entry = filter
+        .as_ref()
+        .filter(|_| adapter == 0)
+        .and_then(filtered_modes)
+        .and_then(|mut modes| modes.nth(usize::try_from(mode_index).ok()?));
+    let Some(entry) = entry.filter(|_| !mode.is_null()) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject EnumAdapterModesEx(adapter={adapter}, mode={mode_index}): no filter or out \
+             slot, another adapter, an interlaced filter, or past the list → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: vtable out-param; `mode` is non-null (checked) and points to a
+    // writable `D3DDISPLAYMODEEX` per the IDirect3D9Ex ABI.
+    unsafe { OutPtr::write_opt(mode, display_mode_ex(entry)) };
+    D3D_OK
+}
+
+extern "system" fn d3d9_get_adapter_display_mode_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    mode: *mut D3DDISPLAYMODEEX,
+    rotation: *mut u32,
+) -> i32 {
+    if adapter != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetAdapterDisplayModeEx(adapter={adapter}) → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable out-params; `mode` and `rotation` are null or writable
+    // per the IDirect3D9Ex ABI.
+    unsafe { write_display_mode_ex(mode.cast(), rotation, &current_adapter_display_mode()) }
+}
+
+extern "system" fn d3d9_get_adapter_luid(_this: *mut c_void, adapter: u32, luid: *mut LUID) -> i32 {
+    /// The adapter's LUID as `(LowPart, HighPart)`, read once for the process.
+    ///
+    /// A machine fact latched once and immutable after: the LUID the display
+    /// driver gives the primary display's adapter, or, where the driver hands
+    /// none back, one the system allocates for the process, which stays the
+    /// same for every later call.
+    static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(read_adapter_luid);
+    if adapter != 0 || luid.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetAdapterLUID(adapter={adapter}): another adapter or a null out slot → \
+             INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let (low_part, high_part) = *ADAPTER_LUID;
+    // SAFETY: vtable out-param; `luid` is non-null (checked) and points to a
+    // writable `LUID` per the IDirect3D9Ex ABI.
+    unsafe {
+        OutPtr::write_opt(
+            luid,
+            LUID {
+                low_part,
+                high_part,
+            },
+        );
+    };
+    D3D_OK
+}
+
+/// `mode` as an extended display mode: progressive, its size field filled in.
+const fn display_mode_ex(mode: &D3DDISPLAYMODE) -> D3DDISPLAYMODEEX {
+    D3DDISPLAYMODEEX {
+        size: D3DDISPLAYMODEEX_SIZE,
+        width: mode.width,
+        height: mode.height,
+        refresh_rate: mode.refresh_rate,
+        format: mode.format,
+        scan_line_ordering: D3DSCANLINEORDERING_PROGRESSIVE,
+    }
+}
+
+/// Answer a `GetDisplayModeEx`-shaped call with `current` and the identity rotation.
+///
+/// Shared by the adapter, the device and the swap chain. The caller sets the
+/// mode's `size` field; a null mode or one whose size is not this layout's is
+/// `D3DERR_INVALIDCALL`. A null rotation is allowed and left alone.
+///
+/// # Safety
+/// `mode` is null or points to a writable `D3DDISPLAYMODEEX`, and `rotation`
+/// is null or points to a writable `D3DDISPLAYROTATION`.
+pub unsafe fn write_display_mode_ex(
+    mode: *mut c_void,
+    rotation: *mut u32,
+    current: &D3DDISPLAYMODE,
+) -> i32 {
+    // SAFETY: the caller's contract: `mode` is null or a writable `D3DDISPLAYMODEEX`.
+    let Some(mut out) = (unsafe { InPtrMut::<D3DDISPLAYMODEEX>::opt(mode) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetDisplayModeEx: null mode → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    if out.size != D3DDISPLAYMODEEX_SIZE {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {} is not {D3DDISPLAYMODEEX_SIZE} → \
+             INVALIDCALL",
+            out.size
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    *out = display_mode_ex(current);
+    // SAFETY: the caller's contract: `rotation` is null or a writable
+    // `D3DDISPLAYROTATION`, which `write_opt` skips when null.
+    unsafe { OutPtr::write_opt(rotation, D3DDISPLAYROTATION_IDENTITY) };
+    D3D_OK
+}
+
+/// Read the adapter LUID the driver reports, or allocate one when it reports none.
+fn read_adapter_luid() -> (u32, i32) {
+    let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
+        device_name: [0; 32],
+        adapter: 0,
+        adapter_luid: LUID {
+            low_part: 0,
+            high_part: 0,
+        },
+        vid_pn_source_id: 0,
+    };
+    for (slot, unit) in open
+        .device_name
+        .iter_mut()
+        .zip(PRIMARY_DISPLAY_NAME.encode_utf16())
+    {
+        *slot = unit;
+    }
+    // SAFETY: gdi32 export; `open` is a live, initialised struct of the
+    // documented layout whose name is NUL-terminated (the array is zeroed past it).
+    let status = unsafe { D3DKMTOpenAdapterFromGdiDisplayName(&raw mut open) };
+    if status == 0 {
+        let close = D3dkmtCloseAdapter {
+            adapter: open.adapter,
+        };
+        // SAFETY: gdi32 export; `close` names the adapter handle just opened.
+        unsafe { D3DKMTCloseAdapter(&raw const close) };
+        if open.adapter_luid.low_part != 0 || open.adapter_luid.high_part != 0 {
+            return (open.adapter_luid.low_part, open.adapter_luid.high_part);
+        }
+    }
+    let mut allocated = LUID {
+        low_part: 0,
+        high_part: 0,
+    };
+    // SAFETY: advapi32 export; `allocated` is a writable `LUID`.
+    let ok = unsafe { AllocateLocallyUniqueId(&raw mut allocated) };
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "GetAdapterLUID: the display driver reports no LUID for {PRIMARY_DISPLAY_NAME} \
+         (status {status:#x}); the adapter is named by a LUID allocated for the process \
+         (allocated={})",
+        ok != 0
+    );
+    (allocated.low_part, allocated.high_part)
+}
+
 extern "system" fn d3d9_check_device_type(
     this: *mut c_void,
     adapter: u32,
@@ -905,10 +1172,14 @@ extern "system" fn d3d9_check_device_type(
     // the device-restricted answer: where the packed 16-bit formats are
     // expansion-backed, a 16-bit back buffer is refused here as well, and an
     // engine picks X8R8G8B8 the way hardware without 16-bit render targets
-    // made it. `CreateDevice` stays lenient and substitutes the BGRA8 layer
-    // format for a 16-bit request (`warn_unsupported_backbuffer_format`).
+    // made it. Only a D3D9 back-buffer format is offered at all, so a title
+    // probing for its back buffer lands on one even where the device would
+    // render into a wider format. `CreateDevice` and `Reset` stay lenient and
+    // substitute the BGRA8 layer format for any format they are handed
+    // (`warn_unsupported_backbuffer_format`).
     let expand_packed16 = d3d.config().expand_packed16;
-    let presentable = is_render_target_format_on_device(effective_bb, expand_packed16)
+    let presentable = mtld3d_core::format::is_back_buffer_format(effective_bb, windowed != 0)
+        && is_render_target_format_on_device(effective_bb, expand_packed16)
         && if windowed != 0 {
             is_format_conversion_supported(effective_bb, adapter_format, expand_packed16)
         } else {
@@ -954,6 +1225,12 @@ extern "system" fn d3d9_check_device_format(
     // rejects it with INVALIDCALL ahead of any availability check, for every
     // device type.
     if adapter_format == 0 {
+        return D3DERR_INVALIDCALL;
+    }
+    // Vertex and index buffers carry no format a query could weigh, so a
+    // buffer resource type is rejected as a malformed call rather than
+    // answered unavailable, with or without a usage.
+    if matches!(rtype, D3DRTYPE_VERTEXBUFFER | D3DRTYPE_INDEXBUFFER) {
         return D3DERR_INVALIDCALL;
     }
     if adapter != 0 || dev_type != D3DDEVTYPE_HAL || !is_display_format(adapter_format) {
@@ -1155,6 +1432,15 @@ extern "system" fn d3d9_check_device_multi_sample_type(
         );
         return D3DERR_INVALIDCALL;
     }
+    // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here,
+    // at every count the single-sampled `D3DMULTISAMPLE_NONE` answer aside,
+    // which any format gets.
+    if matches!(surface_format, D3DFMT_DF24 | D3DFMT_DF16)
+        && !d3d.config().df_formats
+        && multi_sample_type != D3DMULTISAMPLE_NONE
+    {
+        return D3DERR_NOTAVAILABLE;
+    }
     let caps = device_caps_flags();
     // A format the device cannot render into at all cannot be multisampled
     // either, whatever count is asked for.
@@ -1272,6 +1558,32 @@ extern "system" fn d3d9_get_adapter_monitor(_this: *mut c_void, _adapter: u32) -
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn D3DKMTOpenAdapterFromGdiDisplayName(desc: *mut D3dkmtOpenAdapterFromGdiDisplayName) -> u32;
+    fn D3DKMTCloseAdapter(desc: *const D3dkmtCloseAdapter) -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn AllocateLocallyUniqueId(luid: *mut LUID) -> i32;
+}
+
+/// Win32 `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME`: a GDI display name in, its adapter out.
+#[repr(C)]
+struct D3dkmtOpenAdapterFromGdiDisplayName {
+    device_name: [u16; 32],
+    adapter: u32,
+    adapter_luid: LUID,
+    vid_pn_source_id: u32,
+}
+
+/// Win32 `D3DKMT_CLOSEADAPTER`: the adapter handle an open handed out.
+#[repr(C)]
+struct D3dkmtCloseAdapter {
+    adapter: u32,
 }
 
 /// Client-area pixel dimensions of `hwnd`, or `None` when the call fails or the rect is empty.
@@ -1437,7 +1749,90 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
-    if !crate::USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    create_device_impl(&CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    })
+}
+
+/// `IDirect3D9Ex::CreateDeviceEx`: `CreateDevice` with a fullscreen display mode.
+///
+/// The mode is not used: a fullscreen device sets the mode its back buffer
+/// names, so the two only disagree for a malformed request, which is logged
+/// once and created from the present parameters as `CreateDevice` would.
+extern "system" fn d3d9_create_device_ex(
+    this: *mut c_void,
+    adapter: u32,
+    dev_type: u32,
+    focus_window: *mut c_void,
+    behavior_flags: u32,
+    present_params: *mut c_void,
+    mode: *mut D3DDISPLAYMODEEX,
+    device: *mut *mut c_void,
+) -> i32 {
+    null_out(device);
+    // SAFETY: vtable in-param; `present_params` is null or a readable
+    // `D3DPRESENT_PARAMETERS` per the IDirect3D9Ex ABI.
+    let windowed_and_size =
+        unsafe { InPtr::<D3DPRESENT_PARAMETERS>::opt(present_params) }.map(|pp| {
+            (
+                pp.windowed != 0,
+                (pp.back_buffer_width, pp.back_buffer_height),
+            )
+        });
+    // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
+    // per the IDirect3D9Ex ABI.
+    let mode_size = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode.cast()) }
+        .map(|mode| (mode.width, mode.height));
+    if let Some((windowed, size)) = windowed_and_size
+        && !mtld3d_core::extended::reset_ex_mode_valid(windowed, mode_size, size)
+    {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "CreateDeviceEx: display mode {mode_size:?} disagrees with the present parameters \
+             (windowed={windowed}, back buffer {size:?}); the device follows the present \
+             parameters"
+        );
+    }
+    create_device_impl(&CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    })
+}
+
+/// The arguments `CreateDevice` and `CreateDeviceEx` share.
+struct CreateDeviceArgs {
+    this: *mut c_void,
+    adapter: u32,
+    dev_type: u32,
+    focus_window: *mut c_void,
+    behavior_flags: u32,
+    present_params: *mut c_void,
+    device: *mut *mut c_void,
+}
+
+/// The body both device creates share; the device is extended when the interface is.
+fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
+    let &CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    } = args;
+    if !crate::USED.swap(true, Ordering::Relaxed) {
         crate::pin_image();
     }
 
@@ -1461,9 +1856,10 @@ extern "system" fn d3d9_create_device(
     // flows uniformly to the layer, backbuffer, and depth/stencil creates.
     let mut pp = *pp_in;
 
+    let extended = d3d.is_extended();
     // Reject invalid swap-effect / back-buffer-count / presentation-interval
     // combinations up front, before any Metal resource is created.
-    if !crate::device::present_params_are_valid(&pp) {
+    if !mtld3d_core::present::present_params_are_valid(&pp, extended) {
         warn!(
             target: LOG_TARGET,
             "reject CreateDevice — invalid present params (swap_effect={}, bb_count={}, interval={:#x})",
@@ -1471,9 +1867,31 @@ extern "system" fn d3d9_create_device(
         );
         return D3DERR_INVALIDCALL;
     }
+    // An auto depth-stencil the depth answers refuse is refused here too,
+    // before the window or the display mode moves. A format of 0 keeps
+    // standing for no depth-stencil.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice: AutoDepthStencilFormat {} at MultiSampleType {} is no \
+             depth-stencil the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return D3DERR_INVALIDCALL;
+    }
 
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
+    let mut present_debug = PresentDebugFlags::empty();
+    present_debug.set(PresentDebugFlags::PRESENT_OCCLUDED, cfg.present_occluded);
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
@@ -1483,7 +1901,7 @@ extern "system" fn d3d9_create_device(
         gate_file_len: gate.as_ref().map_or(0, |path| {
             u32::try_from(path.len()).expect("a gate path fits u32")
         }),
-        pad0: 0,
+        present_debug,
     };
     let status = unix_call(&mut cq_params);
     if status != 0 {
@@ -1742,6 +2160,11 @@ extern "system" fn d3d9_create_device(
         display_sinks,
         fullscreen,
         config: Arc::clone(cfg),
+        initial_flags: if extended {
+            crate::device::DeviceFlags::EXTENDED
+        } else {
+            crate::device::DeviceFlags::empty()
+        },
     });
 
     // Install the cursor wndproc subclass. Must happen after `DeviceInner` is
@@ -1750,7 +2173,7 @@ extern "system" fn d3d9_create_device(
     // SAFETY: `inner_ptr` was just derived from a live `DeviceInner` we
     // own via `dev`; the borrow is local to this expression and `dev`
     // outlives it.
-    unsafe { (*inner_ptr).cursor_mut().install_subclass(inner_ptr) };
+    unsafe { (*inner_ptr).cursor().install_subclass(inner_ptr) };
 
     let dev_ptr = Box::into_raw(Box::new(dev));
     // Stamp the wrapper pointer so resource `GetDevice` thunks can hand it back
@@ -1775,7 +2198,7 @@ extern "system" fn d3d9_create_device(
             "CreateDevice: D3DCREATE_MULTITHREADED, device entry points serialised"
         );
     }
-    info!(target: LOG_TARGET, "CreateDevice succeeded");
+    info!(target: LOG_TARGET, "CreateDevice succeeded (extended={extended})");
     D3D_OK
 }
 
@@ -1835,9 +2258,8 @@ pub const fn attached_pacing(layer_params: &AttachMetalLayerParams) -> LayerPaci
 fn addref_parent_direct3d9(this: *mut c_void) {
     if !this.is_null() {
         // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-        let mut parent_wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-        let parent: &mut Direct3D9 = &mut parent_wrap;
-        parent.refcount += 1;
+        let parent = unsafe { VtableThis::<Direct3D9>::new(this) };
+        parent.add_ref();
     }
 }
 
@@ -1859,16 +2281,19 @@ fn spawn_native_encoder(
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
 ///
 /// That matches `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, which is
-/// all `WoW` requests. Windowed `CheckDeviceType` advertises the 16-bit and
-/// float backbuffer formats too (it answers with the `StretchRect` conversion
-/// predicate, as the runtime requires), and such a request is substituted by
-/// decision rather than plumbed: a real 16-bit backbuffer would need a
-/// conversion pass on every present, and a float one would need the whole
-/// present path to carry a format (a second drawable format, a present
-/// pipeline per format, and format-derived read-back pitches). Games that
-/// render HDR internally do it in their own off-screen float targets and
-/// tone-map into an 8-bit backbuffer, so nothing has needed it. Warn once so a
-/// game that asked shows up.
+/// all `WoW` requests. `CheckDeviceType` advertises the 16-bit back-buffer
+/// formats the device renders into too (it answers with the `StretchRect`
+/// conversion predicate, as the runtime requires), and offers no format
+/// outside the D3D9 back-buffer set. Any other request, a 16-bit one or a
+/// format no query offers, is substituted by decision rather than plumbed or
+/// refused: a real 16-bit backbuffer would need a conversion pass on every
+/// present, and a float one would need the whole present path to carry a
+/// format (a second drawable format, a present pipeline per format, and
+/// format-derived read-back pitches), while refusing would end a title that
+/// creates its device without probing. Games that render HDR internally do it
+/// in their own off-screen float targets and tone-map into an 8-bit
+/// backbuffer, so nothing has needed it. Warn once so a game that asked shows
+/// up.
 pub fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -1966,8 +2391,14 @@ fn resolve_render_scale(
 /// device leaves the game's window stripped of its decoration and pinned over
 /// the monitor.
 fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
+    // A create that fails puts the window back where it was, whatever kind of
+    // device it was creating: nothing it did should outlive it.
     if let Some(saved) = saved {
-        crate::fullscreen::leave(saved);
+        crate::fullscreen::leave(
+            saved,
+            crate::fullscreen::LeaveKind::Plain,
+            &mtld3d_core::fullscreen_log::LeaveReason::FailedCreate,
+        );
     }
 }
 

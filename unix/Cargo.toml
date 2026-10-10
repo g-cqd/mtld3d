@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.99"
-version = "0.11.0"
+version = "0.12.0"
 license = "Zlib"
 description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
 authors = ["Alexander Theissen <alex.theissen@me.com>"]
@@ -55,6 +55,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-foundation = { version = "0.3", features = [
+    "NSDictionary",
     "NSException",
     "NSString",
     "NSURL",
@@ -85,7 +86,7 @@ objc2-metal = { version = "0.3", features = [
     "MTLVertexDescriptor",
 ] }
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
-objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CATransaction", "objc2-metal"] }
 rustc-hash = "2"
 # The global allocator of the native dylib, the same pinned revision and `build_cc`
 # configuration the PE side ships (windows/Cargo.toml).

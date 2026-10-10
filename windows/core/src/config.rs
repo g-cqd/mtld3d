@@ -50,6 +50,14 @@ pub struct Mtld3dConfig {
     /// a game never needs it. Default: `false`. File key:
     /// `debug.mainThreadChecker`.
     pub main_thread_checker: bool,
+    /// Refuse the device's first frame submission as if the native runtime had rejected it.
+    ///
+    /// A seam for the test suite: it latches the device failure a Metal
+    /// error would, so the suite can drive what a device does once it can no
+    /// longer submit frames. A game never needs it; it only breaks the
+    /// device. Each submission pays one relaxed load of the armed flag.
+    /// Default: `false`. File key: `debug.failNextSubmit`.
+    pub fail_next_submit: bool,
     /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
     ///
     /// Treats the device as lacking the native packed 16-bit pixel
@@ -67,7 +75,8 @@ pub struct Mtld3dConfig {
     /// Combined with the device's own `MTLDevice.supports32BitFloatFiltering`
     /// answer, so `true` makes `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
     /// report NOTAVAILABLE for R32F / G32R32F / A32B32G32R32F on any
-    /// device, and `false` leaves the device's answer alone; it never
+    /// device and point-sample those formats whatever a stage's filters
+    /// say, and `false` leaves the device's answer alone; it never
     /// claims filtering the device lacks. Exists so the Intel/AMD path
     /// can be exercised on a device that does filter them. Default:
     /// `false`. File key: `intel.denyFloat32Filtering`.
@@ -166,6 +175,14 @@ pub struct Mtld3dConfig {
     /// stands; resolved to a unix path once per device at queue creation.
     /// Empty = no gate. Default: `""`. File key: `debug.presentGateFile`.
     pub present_gate_file: String,
+    /// Acquire and present drawables for a window that reads as occluded.
+    ///
+    /// A seam for the test suite: its windows stay hidden, and a present
+    /// into a hidden window otherwise skips the drawable, so without this
+    /// nothing that `nextDrawable` reaches runs under the Main Thread
+    /// Checker. A game never needs it: an occluded window shows nothing.
+    /// Default: `false`. File key: `debug.presentOccluded`.
+    pub present_occluded: bool,
     /// Answer a pending occlusion FLUSH poll immediately.
     ///
     /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted` and
@@ -370,6 +387,7 @@ impl Default for Mtld3dConfig {
         Self {
             caps_all: false,
             main_thread_checker: false,
+            fail_next_submit: false,
             expand_packed16: false,
             deny_float32_filtering: false,
             managed_memory: false,
@@ -385,6 +403,7 @@ impl Default for Mtld3dConfig {
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
             present_gate_file: String::new(),
+            present_occluded: false,
             query_flush_immediate: false,
             query_event_immediate: false,
             depth_alias_same_size: false,
@@ -490,6 +509,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: debug.failNextSubmit = {}", cfg.fail_next_submit
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: intel.expandPacked16 = {}", cfg.expand_packed16
     );
     info!(
@@ -544,6 +567,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(
         target: crate::LOG_TARGET,
         "config: debug.presentGateFile = {:?}", cfg.present_gate_file
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: debug.presentOccluded = {}", cfg.present_occluded
     );
     info!(
         target: crate::LOG_TARGET,
@@ -629,6 +656,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.mainThreadChecker" => {
             assign_bool(source, key, value, &mut cfg.main_thread_checker);
         }
+        "debug.failNextSubmit" => assign_bool(source, key, value, &mut cfg.fail_next_submit),
         "intel.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
         "intel.denyFloat32Filtering" => {
             assign_bool(source, key, value, &mut cfg.deny_float32_filtering);
@@ -646,6 +674,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "debug.presentGateFile" => value.clone_into(&mut cfg.present_gate_file),
+        "debug.presentOccluded" => assign_bool(source, key, value, &mut cfg.present_occluded),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "query.eventImmediate" => assign_bool(source, key, value, &mut cfg.query_event_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),

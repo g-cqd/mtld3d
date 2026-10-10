@@ -373,12 +373,14 @@ DENY_WARNINGS := --config 'build.warnings="deny"'
 # name the same clone, and the install loops must write it once.
 INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 
-# Both overridable, unlike the rest of these: the HUD and the validation layer
-# are here to catch Metal misuse on a real GPU, and a caller running against a
-# paravirtual one (a CI runner) has reason to turn them off, since neither has
-# anything useful to say about a device that does not implement the counters they
-# read.
-export MTL_HUD_ENABLED ?= 1
+# Both overridable, unlike the rest of these. The validation layer is on: it
+# is here to catch Metal misuse on a real GPU. The Metal HUD is off: no test
+# reads it, and it hooks every drawable present and reads the view's safe-area
+# insets, an AppKit call, from the dispatch thread on which Metal runs the
+# scheduled present. That read races AppKit's own work on the main thread and
+# can abort a test process inside AppKit. MTL_HUD_ENABLED=1 on the command line
+# or in the environment turns it back on to watch a run.
+export MTL_HUD_ENABLED ?= 0
 export MTL_DEBUG_LAYER ?= 1
 # Apple's variable, read by the Main Thread Checker that the test config below
 # loads into every test process (`debug.mainThreadChecker=true`): with it set,
@@ -434,7 +436,9 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 #                    from each workspace, so no workspace name would fit it.
 #
 # The arch suffix is the target's own spelling, i686 / x86_64 for PE and
-# x64 / arm64 for the unix `.so`, matching the OUT_* variables above.
+# x64 / arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
+# suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
+# `test-unit-perf`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
@@ -444,7 +448,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	bundle version-check production-assert-gate mem-routine-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
-	test test-unit test-unit-perf test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
+	test test-unit test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
 	test-e2e-arm64x bench bench-ab bench-variants bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 conformance-i686-arm64 conformance-x86_64-arm64 \
 	conformance-arm64x \
@@ -454,7 +458,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
-	clippy-native audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
+	clippy-native clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -682,8 +686,7 @@ for f in $(1); do \
 	esac ; \
 	if [ -n "$$hits" ]; then echo "production-assert-gate: $$f imports the C assertion handler $$hits: a C or C++ object was built without NDEBUG" >&2; exit 1; fi ; \
 	if LC_ALL=C grep -a -q -F 'assert fail: {} in {} on {} ' $$f; then echo "production-assert-gate: $$f carries snmalloc's assertion message: snmalloc was built without NDEBUG" >&2; exit 1; fi ; \
-done ; \
-echo "production-assert-gate: no C or C++ assertion path in $(1)"
+done
 endef
 PRODUCTION_ASSERT_CHECK = $(if $(filter production,$(PROFILE)),$(call PRODUCTION_ASSERT_GATE,$(1)))
 
@@ -732,8 +735,7 @@ printf '%s\n' "$$funcs" | while read -r rva size name; do \
 			printf '%s\n' "$$code" | grep -E "(call[a-z]*|j[a-z]+)[[:space:]]+$$target" >&2 ; exit 1 ;; \
 		esac ; \
 	done ; \
-done || exit 1 ; \
-echo "mem-routine-gate: $$(printf '%s\n' "$$funcs" | wc -l | tr -d ' ') functions of the memory routines in $$dll, none branches to one of the four"
+done || exit 1
 endef
 
 mem-routine-gate:
@@ -1066,7 +1068,8 @@ stage: all
 #     it is made (MTC_CRASH_ON_REPORT, exported above) instead of surfacing as
 #     a rare death later in Wine's own code.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
-# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
+# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests;
+# MTL_HUD_ENABLED stays off (inherited), for the reason given beside it.
 #
 # SCALE=<n> additionally reruns the whole e2e suite at `render.scale = <n>`,
 # i.e. rasterizing the back buffer smaller than the resolution D3D9 reports and
@@ -1233,17 +1236,6 @@ test: test-unit test-e2e-i686 test-e2e-x86_64 $(ARM64_ARCHS:%=test-e2e-%-arm64) 
 test-unit:
 	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
 	cd unix && cargo +$(RUST_STABLE) nextest run
-
-# The perf telemetry's own unit tests. They are compiled only when `MTLD3D_PERF`
-# turns on `cfg(perf_tracking)` (`mod tests` in `windows/core/src/perf.rs` and
-# the timer tests in `unix/shared`), so `test-unit` never sees them. Set here
-# rather than through `PERF=1` so the target means the same under any `PERF`.
-# Not part of `test`: flipping the cfg rebuilds `mtld3d-core` and everything
-# above it, which would make every `make test` pay for it twice. CI runs it as
-# a step of the `check` job.
-test-unit-perf:
-	cd windows && MTLD3D_PERF=1 cargo +$(RUST_STABLE) nextest run -p mtld3d-core --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
-	cd unix && MTLD3D_PERF=1 cargo +$(RUST_STABLE) nextest run -p mtld3d-shared
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
@@ -1594,11 +1586,14 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # checks cost the encoder more than the frame does; PROD=0 measures `release`
 # instead, and each report states the profile and whether debug assertions
 # were on. The Metal validation layer and HUD are off: both cost frame time
-# and neither is under test. The configuration is the suite's without the
-# Main Thread Checker, then BENCH_CONFIG='key=value;key=value', appended last
-# the way SCALE is, so its entries win over the ones before it (the stutter
-# benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
-# builds the layer with its perf summary. Each benchmark writes
+# and neither is under test. MTL_CAPTURE_ENABLED is unset for the same
+# reason, here and in `bench-ab` and `bench-variants`: Metal's capture layer
+# sits under every Metal call (docs/ARCHITECTURE.md gives its measured cost
+# beside the Ctrl+Shift+P capture). The configuration is the suite's
+# without the Main Thread Checker, then BENCH_CONFIG='key=value;key=value',
+# appended last the way SCALE is, so its entries win over the ones before it
+# (the stutter benchmark's own `shaderCache.enable=false` still wins over
+# them). PERF=1 builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
 # the layer's log that a PERF=1 build's summary rows are copied from, and
 # `bench-<name>.metrics` next to it, the same numbers plus the build's
@@ -1697,7 +1692,7 @@ bench: $(if $(BENCH_LEG),$(call arm64_builds,$(BENCH_LEG)),install-windows-$(ARC
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
-	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		RUST_LOG=info __CX_UNIX_RUST_LOG=info \
 		$(E2E_RUNNER) --wine $(if $(BENCH_LEG),'$(call arm64_sdk,$(BENCH_LEG))/bin/wine',$(WINE)) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite$(if $(BENCH_LEG),; $(call ARM64_LEG_STOP,$(BENCH_LEG)))
@@ -1907,7 +1902,7 @@ bench-ab:
 	$(if $(BENCH_CORPUS),$(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
-	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
 		--wait-idle $(BENCH_WAIT_IDLE) \
 		--base-wine '$(call bench_tree,$(BENCH_BASE_ISO))/sdk/bin/wine' \
@@ -1994,7 +1989,7 @@ bench-variants:
 	$(BENCH_VARIANTS_STOP); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	$(ARM64_BENCH_SUITE_COPY) && \
-	cd $(E2E_RUNNER_DIR) && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
+	cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
 	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/$(BENCH_VARIANTS_ARCH)-sdk-vs-arm64,$(ISOLATED_ROOT),$(call arm64_root,$(BENCH_VARIANTS_ARCH)),sdk,arm64,$(BENCH_VARIANTS_ARCH),$(BENCH_VARIANTS_ARCH)); \
 	status=$$?; \
 	$(if $(BENCH_VARIANTS_EC),$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/x86_64-vs-arm64x,$(call arm64_root,x86_64),$(call arm64_root,arm64x),arm64,arm64,x86_64,arm64x); \
@@ -2008,14 +2003,19 @@ bench-compare:
 
 # `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
 # calibrates a benchmark's scene against a game: it reads the last complete
-# frame the game dumped with F12 into passes and prints them beside the
+# frame the game dumped with Ctrl+Shift+P into passes and prints them beside the
 # benchmark's `shape` lines, flagging draw counts off by more than 10 %,
 # fixed-function shares off by more than 10 points, textures per draw off by
-# more than 1.0, and a different pass count. Exit 1 when anything is flagged.
+# more than 1.0, and a different pass count. Where the `shape` lines carry a
+# state mix, it also flags blend, alpha-test, depth-write-off, cull-none and
+# colour-mask-0 shares off by more than 10 points, and shader, texture and
+# state switch counts and distinct shader and texture counts off by more than
+# 15 % of the game's count or 5, whichever is larger. Exit 1 when anything is
+# flagged.
 # It runs nothing under Wine and judges no build; it is run by hand.
 bench-shape:
 	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
-		{ echo "make bench-shape needs GAME_LOG=<a layer log with an F12 dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
+		{ echo "make bench-shape needs GAME_LOG=<a layer log with a Ctrl+Shift+P dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-shape --game-log '$(abspath $(GAME_LOG))' \
 		--metrics '$(abspath $(BENCH_METRICS))'
 
@@ -2108,6 +2108,29 @@ clippy-native:
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-core --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
 	cd unix && cargo +$(RUST_STABLE) clippy --all-targets $(DENY_WARNINGS)
 
+# The legs above and `test-unit` build without `cfg(perf_tracking)`, so the code
+# a PERF=1 build adds (the perf telemetry in mtld3d-core, mtld3d-d3d9,
+# mtld3d-shared and mtld3d-unix) and the tests gated on it would otherwise be
+# compiled by nothing until a benchmark builds them. These two run the same legs
+# again with MTLD3D_PERF=1, which the build scripts of those four crates read:
+# `clippy-perf` the native leg and the i686 PE one (mtld3d-d3d9's perf code
+# builds only for a PE target, and none of it differs by PE arch),
+# `test-unit-perf` the host unit tests. `make check` runs both.
+#
+# Each workspace builds them into its `target/perf` (a relative
+# CARGO_TARGET_DIR resolves against the recipe's `cd`), not into the default
+# target directory. A crate whose build script reads MTLD3D_PERF rebuilds, with
+# everything that depends on it, whenever the value changes, and a target
+# directory keeps one build of each crate, so sharing it would rebuild both
+# workspaces twice on every `make check` and once more on the `make test` after
+# it. `PERF=` on the nested make overrides a PERF given to this one and keeps the
+# `==> PERF=1` line out of a passing gate.
+clippy-perf:
+	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= clippy-native clippy-pe-i686
+
+test-unit-perf:
+	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= test-unit
+
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
 # set of files. See docs/CONVENTIONS.md § Mechanical audit.
@@ -2141,16 +2164,19 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# conventions audit, the Makefile regressions, and the doc build. fmt-check first
-# (fast, fails early on drift); clippy reuses the target above; audit and the
-# Makefile regressions are fast; doc stays last. Each leg is also its own target,
-# so CI runs them as parallel jobs instead of this sequence.
+# PERF=1 clippy legs and unit tests, the conventions audit, the Makefile
+# regressions, and the doc build. fmt-check first (fast, fails early on drift);
+# clippy reuses the targets above; audit and the Makefile regressions are fast;
+# doc stays last. Each leg is also its own target, so CI's check job runs each
+# as a step of its own instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
+	$(MAKE) clippy-perf
 	$(MAKE) audit
 	$(MAKE) test-isolation
 	$(MAKE) test-e2e-discovery
+	$(MAKE) test-unit-perf
 	$(MAKE) doc
 
 clean:

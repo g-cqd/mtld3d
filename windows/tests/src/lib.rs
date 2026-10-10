@@ -23,24 +23,26 @@ mod win32;
 pub use d3d8::resources;
 pub use d3d8::{D3D8Harness, D3D8Surface, D3D8SwapChain, D3D8Texture};
 pub use harness::{
-    DrawIndexedUpParams, Harness, HarnessConfig, UNWRITTEN, config_value, config_var,
-    render_scale_is_identity, run_child,
+    DrawIndexedUpParams, Factory, Harness, HarnessConfig, UNWRITTEN, config_value, config_var,
+    extended::SharedHandle, render_scale_is_identity, run_child,
 };
 pub use in_flight::spawn_scoped;
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
 pub use reread::{Reading, assert_or_reread};
 pub use resource::{
-    BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
-    SurfaceDc, SwapChain, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume,
-    VolumeTexture,
+    BufferLock, CubeTexture, IndexBuffer, LockedRect, PRESENT_STATS_GUARD,
+    PRESENT_STATS_PROBE_BYTES, PixelShader, Query, StateBlock, Surface, SurfaceDc, SwapChain,
+    Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
 };
-pub use shared::{SharedDevice, SharedQuery, SharedVertexBuffer};
+pub use shared::{SharedDevice, SharedQuery, SharedTexture, SharedVertexBuffer};
 pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
     VolumeVertex,
 };
 pub use win32::{
-    MemorySample, Rect, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-    WindowStyle, create_window, cursor_is_live, cursor_mask_bits, destroy_window,
-    enumerate_display_sizes, post_quit_message, send_message, set_window_pos, window_rect,
+    GuardedSlice, HARNESS_PROBE_REPLY, MemorySample, Rect, WM_ACTIVATEAPP, WM_HARNESS_PROBE,
+    WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, create_window, cursor_is_live,
+    cursor_mask_bits, destroy_window, enumerate_display_sizes, harness_window_proc,
+    move_window_on_next_display_change, post_quit_message, send_message, set_window_pos,
+    window_proc, window_rect,
 };

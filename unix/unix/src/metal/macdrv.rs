@@ -1,9 +1,10 @@
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 use std::sync::{Arc, LazyLock, Mutex};
 
+use block2::{Block, RcBlock};
 use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
@@ -22,6 +23,7 @@ use objc2_core_graphics::{CGColor, CGColorSpace};
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 pub mod attachment;
+mod client_surface;
 mod cursor_overlay;
 mod delegate_forward;
 
@@ -45,13 +47,27 @@ pub use cursor_overlay::{poll_from_present, set_cursor_overlay};
 ///
 /// Only the record of this view is retired, and it is handed back so the
 /// view's retirement knows the window it served. A device that never
-/// attached finds no record, and another device's record is untouched.
+/// attached finds no record, and another device's record is untouched,
+/// except that Wine is told to show the client surface of the newest device
+/// still attached to the same window. Runs on the API thread, a Wine thread,
+/// which win32u's client surface calls need.
 pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<Attachment>> {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
     let att = attachment::unregister(view_addr)?;
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
+    // Another device still presenting into this window gets its surface
+    // shown again, rather than the window keeping this view's last frame.
+    if let Some(calls) = client_surface::SurfaceCalls::load() {
+        if let Some(sibling) =
+            attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
+        {
+            calls.present(sibling);
+            calls.release(sibling);
+        }
+        calls.release(att.client_surface());
+    }
     debug!(
         target: LOG_TARGET,
         "present: detached view {:#x} (layer {:#x}); its display state is retired",
@@ -776,10 +792,24 @@ unsafe extern "C" {
 /// process lifetime).
 static MACDRV_LIB: LazyLock<Library> = LazyLock::new(Library::this);
 
-/// Run a closure synchronously on `AppKit`'s main thread (libdispatch's main queue).
+/// Run a closure synchronously on `AppKit`'s main thread.
 ///
-/// Waits for completion. Apple documents compositor-impacting `CALayer`
-/// setters — `wantsExtendedDynamicRangeContent`, `colorspace`, `pixelFormat` —
+/// Waits for completion, through Wine's own `OnMainThread` (the
+/// `on_main_thread` entry of the `macdrv_functions` table) where the table
+/// has it, and through libdispatch's main queue otherwise. Wine's door is the
+/// one to take: winemac's main thread, while it waits for a Wine thread to
+/// answer a query (a resize, the min/max info, the pasteboard), runs only a
+/// private run-loop mode that never drains the main queue, so a bare
+/// `dispatch_sync` from that Wine thread stalls both until the query times
+/// out and fails. `OnMainThread` queues the work on Wine's request source,
+/// which that mode does run, and while the calling thread waits it answers
+/// the queries addressed to it, as every synchronous request Wine itself
+/// makes does. A Wine whose entry returns without running the work
+/// (`CrossOver`'s arm64 build publishes it as a stub) gets the main queue
+/// instead, for that hop and every later one.
+///
+/// Apple documents compositor-impacting `CALayer` setters
+/// (`wantsExtendedDynamicRangeContent`, `colorspace`, `pixelFormat`)
 /// as needing to take effect inside a `CATransaction` commit, which by
 /// convention runs on the main thread's run loop. Setting these properties
 /// from a non-main thread sets the model layer but leaves the *rendered*
@@ -804,21 +834,104 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
     }
     extern "C" fn thunk<F: FnOnce()>(ctx: *mut c_void) {
         // SAFETY: `ctx` is the `&mut CallCtx<F>` we just handed to
-        // `dispatch_sync_f`; libdispatch passes it through to the
-        // worker function unchanged.
+        // `run_through_wine` or `dispatch_sync_f`, which pass it through to
+        // the worker function unchanged while the caller waits.
         let ctx = unsafe { &mut *(ctx.cast::<CallCtx<F>>()) };
         if let Some(f) = ctx.f.take() {
             autoreleasepool(|_| f());
         }
     }
+    /// Whether this Wine's `OnMainThread` returned without running a hop's work.
+    ///
+    /// A machine fact about the loaded Wine, latched by the first hop that
+    /// sees it and never cleared: `CrossOver`'s arm64 build publishes the entry
+    /// as a stub that logs and drops the block, and every later hop goes
+    /// straight to the main queue rather than ask it again.
+    static WINE_HOP_DROPS_WORK: AtomicBool = AtomicBool::new(false);
     let mut ctx = CallCtx { f: Some(f) };
+    let ctx_ptr = (&raw mut ctx).cast::<c_void>();
+    if !WINE_HOP_DROPS_WORK.load(Ordering::Relaxed)
+        && let Some(on_main_thread) = wine_on_main_thread()
+    {
+        if run_through_wine(on_main_thread, thunk::<F>, ctx_ptr) {
+            return;
+        }
+        WINE_HOP_DROPS_WORK.store(true, Ordering::Relaxed);
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "main-thread hop: this Wine's OnMainThread returned without running the work → \
+             libdispatch's main queue, which winemac does not drain while it waits for a query",
+        );
+    }
     // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton —
     // a valid `dispatch_queue_t` for the process lifetime. `&mut ctx`
     // is valid until this function returns, and `dispatch_sync_f` is
     // synchronous, so the thunk runs before we drop `ctx`.
     unsafe {
         let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
-        dispatch_sync_f(main_q, (&raw mut ctx).cast::<c_void>(), thunk::<F>);
+        dispatch_sync_f(main_q, ctx_ptr, thunk::<F>);
+    }
+}
+
+/// Wine's `OnMainThread`, read from the `macdrv_functions` table; `None` without one.
+fn wine_on_main_thread() -> Option<unsafe extern "C" fn(&Block<dyn Fn()>)> {
+    let table = macdrv_functions()?;
+    // SAFETY: the entry is Wine's `void (*)(dispatch_block_t)` stored as
+    // `*mut c_void` per its C ABI, and a `dispatch_block_t` is a pointer to a
+    // block; a null entry reads as `None`.
+    unsafe {
+        core::mem::transmute::<*mut c_void, Option<unsafe extern "C" fn(&Block<dyn Fn()>)>>(
+            table.on_main_thread,
+        )
+    }
+}
+
+/// Run `work(ctx)` on the main thread through Wine's `OnMainThread`; whether it ran.
+///
+/// Wine's own entry runs the block on the main thread before it returns. A
+/// stub entry returns without running it, and then the answer is `false`
+/// and the work is the caller's to run another way. The block claims the run
+/// on a state it shares with this call before it reaches `ctx`, and this call
+/// claims it the other way before it answers `false`, so a block an entry
+/// kept and runs later finds the run taken and touches nothing of the
+/// caller's. The block carries `ctx` as an address rather than a borrow for
+/// the same reason: Wine keeps a copy of the block until its request loop
+/// lets it go, which can be after this returns.
+fn run_through_wine(
+    on_main_thread: unsafe extern "C" fn(&Block<dyn Fn()>),
+    work: extern "C" fn(*mut c_void),
+    ctx: *mut c_void,
+) -> bool {
+    const PENDING: u8 = 0;
+    const RUNNING: u8 = 1;
+    const DONE: u8 = 2;
+    const ABANDONED: u8 = 3;
+    let state = Arc::new(AtomicU8::new(PENDING));
+    let block_state = Arc::clone(&state);
+    let ctx_addr = ctx.expose_provenance();
+    let block = RcBlock::new(move || {
+        if block_state
+            .compare_exchange(PENDING, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            work(core::ptr::with_exposed_provenance_mut(ctx_addr));
+            block_state.store(DONE, Ordering::Release);
+        }
+    });
+    // SAFETY: the entry takes a block and returns; `ctx` is live until this
+    // call returns, and the block reaches it only while this call waits
+    // below. The caller does not call this from the main thread, where a
+    // synchronous wait could never end, as it does not for `dispatch_sync_f`
+    // either.
+    unsafe { on_main_thread(&block) };
+    loop {
+        match state.compare_exchange(PENDING, ABANDONED, Ordering::Acquire, Ordering::Acquire) {
+            Ok(_) => return false,
+            Err(DONE) => return true,
+            // An entry that runs the block on its own schedule is running it
+            // now; `ctx` stays live until it is done.
+            Err(_) => std::thread::yield_now(),
+        }
     }
 }
 
@@ -898,23 +1011,58 @@ pub fn attach_metal_layer(
     // neither gets a view from Wine.
     let kept = kept_metal_view(&funcs, hwnd);
     let hosted = matches!(kept, Some(KeptView::Hosted { .. }));
-    let (view, layer) = match kept {
-        Some(KeptView::Hosted { view, layer }) => (view as *mut c_void, layer as *mut c_void),
+    let surface_calls = client_surface::SurfaceCalls::load();
+    // A view that went through `get_win_data` comes back with its client
+    // surface already retained, under the window data lock that keeps the
+    // surface alive; a hosted view's is read and retained below.
+    let (view, layer, retained) = match kept {
+        Some(KeptView::Hosted { view, layer }) => (view as *mut c_void, layer as *mut c_void, None),
         Some(KeptView::Orphan {
             view,
             layer,
             from_hwnd,
-        }) => adopt_metal_view(&funcs, hwnd, device_handle, view, layer, from_hwnd)?,
-        None => create_metal_view(&funcs, hwnd, device_handle)?,
+        }) => adopt_metal_view(
+            &funcs,
+            hwnd,
+            device_handle,
+            &KeptLayer {
+                view,
+                layer,
+                from_hwnd,
+            },
+            surface_calls.as_ref(),
+        )?,
+        None => create_metal_view(&funcs, hwnd, device_handle, surface_calls.as_ref())?,
     };
     // AppKit owns the view's window and screen relationships on the main
-    // thread; the view is retained for as long as the device holds it.
+    // thread; the view is retained for as long as the device holds it. The
+    // same hop takes the layer off winemac's `nextDrawable` override, which
+    // walks the view from the presenter thread, and reads a hosted view's
+    // client surface, which the override would have presented.
     let mut hint = None;
+    let mut layer_class = client_surface::LayerClass::Plain;
+    let mut surface = 0;
     run_on_main_thread_sync(|| {
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
+        layer_class = client_surface::bypass_present_hook(layer, mtm);
+        if retained.is_none() {
+            surface = client_surface::client_surface_of(view, mtm);
+        }
     });
     let hint = hint.expect("synchronous display lookup completed");
+    let surface = retained.unwrap_or_else(|| {
+        surface_calls
+            .as_ref()
+            .map_or(0, |calls| calls.retain(surface))
+    });
+    info!(
+        target: LOG_TARGET,
+        "present: layer {:#x} of view {:#x} presents through CAMetalLayer ({layer_class:?}); \
+         client surface {surface:#x}",
+        layer as usize,
+        view as usize,
+    );
     if hosted {
         info!(
             target: LOG_TARGET,
@@ -948,6 +1096,20 @@ pub fn attach_metal_layer(
     let mut flags = AttachFlags::empty();
     flags.set(AttachFlags::HDR_ENABLE_REQUESTED, hdr_enable);
     flags.set(AttachFlags::HDR_ACTIVE, mode == LayerMode::Hdr);
+    // A record still registered for this view is one whose teardown never
+    // ran; the new record replaces it, and the reference it held on its
+    // client surface goes with it.
+    if let Some(stale) = attachment::unregister(view as usize) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: view {:#x} attached again without a teardown between; the earlier \
+             record is dropped",
+            view as usize,
+        );
+        if let Some(calls) = &surface_calls {
+            calls.release(stale.client_surface());
+        }
+    }
     let att = attachment::register(
         view as usize,
         layer as usize,
@@ -961,8 +1123,14 @@ pub fn attach_metal_layer(
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            client_surface: surface,
         },
     );
+    // A new view's surface is the one Wine shows already; a kept view's may
+    // have been hidden for a later surface of the same window since.
+    if let Some(calls) = &surface_calls {
+        calls.present(surface);
+    }
     attachment::publish_backing_scale(&att, backing_scale);
     // The software cursor rides the same decision: the overlay window
     // is a compositing cost an EDR layer already pays.
@@ -1015,14 +1183,44 @@ fn create_metal_view(
     funcs: &MacdrvFuncs,
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
-) -> Option<(*mut c_void, *mut c_void)> {
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> Option<(*mut c_void, *mut c_void, Option<usize>)> {
     let win_data = get_win_data(funcs, hwnd)?;
     // SAFETY: `win_data` is the live record `get_win_data` handed back,
     // valid until `release_win_data`.
     let client_view = unsafe { (*win_data).client_cocoa_view };
-    let result = wine_metal_view(funcs, client_view, device_handle);
+    let result = wine_metal_view(funcs, client_view, device_handle)
+        .map(|(view, layer)| (view, layer, Some(retain_client_surface(client_view, calls))));
     release_win_data(funcs, win_data);
     result
+}
+
+/// Read and retain the client surface `client_view` shows, `0` when there is none.
+///
+/// Called while the caller holds the window data `get_win_data` locked: the
+/// window's data holds Wine's own reference on the surface, and the one
+/// place that drops it, the driver's `DestroyWindow`, takes that lock first,
+/// so the surface stays alive from the read to the reference taken here.
+/// The reference is taken on the calling thread, a Wine thread; the surface
+/// is presented only after the lock is released, since presenting takes
+/// win32u's surface lock and then the window data, the order a concurrent
+/// `detach_client_surfaces` already holds the first of.
+fn retain_client_surface(
+    client_view: *mut c_void,
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> usize {
+    let Some(calls) = calls else {
+        return 0;
+    };
+    if client_view.is_null() {
+        return 0;
+    }
+    let mut surface = 0;
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("the client surface is read on the main thread");
+        surface = client_surface::client_view_surface(client_view, mtm);
+    });
+    calls.retain(surface)
 }
 
 /// Move a kept view, `layer` and all, into `hwnd`'s window for the device attaching there.
@@ -1042,10 +1240,14 @@ fn adopt_metal_view(
     funcs: &MacdrvFuncs,
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
-    view: usize,
-    layer: usize,
-    from_hwnd: u64,
-) -> Option<(*mut c_void, *mut c_void)> {
+    kept: &KeptLayer,
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> Option<(*mut c_void, *mut c_void, Option<usize>)> {
+    let &KeptLayer {
+        view,
+        layer,
+        from_hwnd,
+    } = kept;
     let Some(win_data) = get_win_data(funcs, hwnd) else {
         release_metal_view(view);
         return None;
@@ -1097,7 +1299,8 @@ fn adopt_metal_view(
         } else {
             wine_metal_view(funcs, client_view, device_handle)
         }
-    };
+    }
+    .map(|(view, layer)| (view, layer, Some(retain_client_surface(client_view, calls))));
     release_win_data(funcs, win_data);
     result
 }
@@ -1232,10 +1435,21 @@ fn wine_metal_view(
     // load; `view` is non-null per the check above.
     let layer = unsafe { (funcs.macdrv_view_get_metal_layer)(view) };
     if layer.is_null() {
-        error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
+        error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null; view released");
+        // SAFETY: extern "C" Wine entry point; `view` is the retained view
+        // `macdrv_view_create_metal_view` handed out above, which nothing else
+        // holds, so this gives back its only reference.
+        unsafe { (funcs.macdrv_view_release_metal_view)(view) };
         return None;
     }
     Some((view, layer))
+}
+
+/// A kept view and its layer moving from the window `from_hwnd` into another.
+struct KeptLayer {
+    view: usize,
+    layer: usize,
+    from_hwnd: u64,
 }
 
 /// What the park holds for a device attaching to a window, owned by the caller from here on.
@@ -1256,9 +1470,9 @@ enum KeptView {
 /// window it is reused, and taking it goes through none of Wine's calls, so
 /// the client surface it sits in stays the one Wine shows for the window
 /// (one Wine hid for a later surface of the same window is shown again by
-/// the first `nextDrawable` of the kept layer, which Wine reports as that
-/// surface's present). No longer hosted (the handle reused by a new window,
-/// or its window gone) it is moved into the window the handle has now. With
+/// the attach, which presents the surface the view sits in). No longer
+/// hosted (the handle reused by a new window, or its window gone) it is
+/// moved into the window the handle has now. With
 /// none kept for `hwnd`, the newest kept view whose own handle has no window
 /// any more is moved in; a kept view whose handle still has a window is that
 /// window's, on screen or not, and stays.
@@ -2336,6 +2550,7 @@ fn configure_metal_layer_inner(
     // Present re-syncs this before every `nextDrawable`; the push here is
     // so the first frame does not have to.
     sync_drawable_size(&layer);
+    crate::hud_state::show_row(&layer);
     //
     // Confirm the install. `colorspace` is the label the SDR/HDR
     // applier picked at install time — distinguishes "screen profile
@@ -2415,11 +2630,20 @@ fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u32) 
 /// drawable pool), hence the compare first. Degenerate geometry is left
 /// alone rather than written as a zero size Metal would reject.
 ///
-/// Reading `bounds`/`contentsScale` off the main thread races an in-flight
-/// `AppKit` resize; the cost of losing that race is one frame at the previous
-/// size, corrected on the next present.
+/// The presenter calls this on its own thread. It touches the layer alone,
+/// never the view it backs: `drawableSize` is `CAMetalLayer`'s own and asks
+/// the view for no action, unlike an animatable property, so the write needs
+/// no main-thread hop. A layer write off the main thread would open an
+/// implicit transaction there, and the presenter thread has no run loop to
+/// commit one, so the write rides an explicit transaction of its own,
+/// committed at once with actions off; only a resize pays for it, since the
+/// compare before it returns first on every other present. Reading
+/// `bounds`/`contentsScale` off the main thread races an in-flight `AppKit`
+/// resize; the cost of losing that race is one frame at the previous size,
+/// corrected on the next present.
 pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     use objc2_core_foundation::CGSize;
+    use objc2_quartz_core::CATransaction;
 
     let (native_w, native_h) = natural_drawable_size(layer);
     if native_w == 0 || native_h == 0 {
@@ -2431,7 +2655,16 @@ pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     if (current.width - width).abs() <= 0.0 && (current.height - height).abs() <= 0.0 {
         return;
     }
+    debug!(
+        target: super::command::PRESENT_LOG_TARGET,
+        "present: drawable resized {:.0}x{:.0} -> {native_w}x{native_h}",
+        current.width,
+        current.height,
+    );
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
     layer.setDrawableSize(CGSize { width, height });
+    CATransaction::commit();
 }
 
 /// Apply the layer's colour configuration, and report the colorspace label it picked.

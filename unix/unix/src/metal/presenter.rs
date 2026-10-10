@@ -42,7 +42,7 @@ use std::{
 
 use block2::RcBlock;
 use mtld3d_shared::{
-    mtl::{PRESENT_PIPELINE_DEPTH, PresentWaitPolicy, SnapshotFlags},
+    mtl::{PRESENT_PIPELINE_DEPTH, PresentDebugFlags, PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
     perf::{CommandBufferRole, NanosSetTimer},
 };
@@ -121,6 +121,11 @@ pub struct PresentState {
     /// the record it lives on is shared. Per device so two presenters do not
     /// clear each other's edge and swallow the dump.
     stalled: AtomicBool,
+    /// `debug.presentOccluded`: acquire a drawable for a window that reads as occluded.
+    ///
+    /// Fixed at creation. Read only on the occluded branch of a present, so a
+    /// present into a visible window never looks at it.
+    present_occluded: bool,
 }
 
 struct Inner {
@@ -138,8 +143,11 @@ struct Inner {
     presented_seq: u64,
     flags: PresenterFlags,
     slots: [Option<Slot>; SNAPSHOT_SLOTS],
-    /// The last present's `nextDrawable` wait, handed back to the next submit.
-    last_drawable_wait_ns: u64,
+    /// The `nextDrawable` waits of the presents committed since the last push.
+    ///
+    /// Each push takes the sum, so every wait reaches exactly one submit's
+    /// outcome, however the presents and the pushes interleave.
+    unreported_drawable_wait_ns: u64,
     /// The gate file `debug.presentGateFile` named, `None` = no gate.
     gate: Option<PathBuf>,
 }
@@ -244,6 +252,13 @@ enum SlotChoice {
     Busy(usize),
 }
 
+impl Inner {
+    /// Keep a committed present's `nextDrawable` wait for the next push to report.
+    const fn note_drawable_wait(&mut self, ns: u64) {
+        self.unreported_drawable_wait_ns = self.unreported_drawable_wait_ns.saturating_add(ns);
+    }
+}
+
 impl PresentState {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -257,12 +272,19 @@ impl PresentState {
     ///
     /// The thread starts separately, once the record that owns this state
     /// exists, since the thread holds a reference to it.
-    pub fn new(gate: Option<PathBuf>) -> Self {
+    pub fn new(gate: Option<PathBuf>, debug: PresentDebugFlags) -> Self {
         if let Some(path) = &gate {
             log::info!(
                 target: LOG_TARGET,
                 "presenter: gated at {} (parks before each drawable while it exists)",
                 path.display(),
+            );
+        }
+        let present_occluded = debug.contains(PresentDebugFlags::PRESENT_OCCLUDED);
+        if present_occluded {
+            log::info!(
+                target: LOG_TARGET,
+                "presenter: presents into occluded windows too (debug.presentOccluded)",
             );
         }
         Self {
@@ -272,7 +294,7 @@ impl PresentState {
                 presented_seq: 0,
                 flags: PresenterFlags::empty(),
                 slots: [const { None }; SNAPSHOT_SLOTS],
-                last_drawable_wait_ns: 0,
+                unreported_drawable_wait_ns: 0,
                 gate,
             }),
             submit_cv: Condvar::new(),
@@ -280,6 +302,7 @@ impl PresentState {
             present_retired: AtomicU64::new(0),
             thread: Mutex::new(None),
             stalled: AtomicBool::new(false),
+            present_occluded,
         }
     }
 
@@ -441,7 +464,15 @@ pub fn stop_and_join(state: &PresentState) {
 }
 
 /// Set or clear the hurry level for `queue`.
+///
+/// Each change is logged at debug level on the present target, so a test can
+/// read which policy a barrier left behind.
 pub fn set_wait_policy(state: &PresentState, policy: PresentWaitPolicy) {
+    log::debug!(
+        target: super::command::PRESENT_LOG_TARGET,
+        "presenter {:p}: wait policy {policy:?}",
+        core::ptr::from_ref(state)
+    );
     {
         let mut inner = state.lock();
         match policy {
@@ -484,23 +515,26 @@ pub fn wait_for_present_idle(record: &DeviceRecord) {
     );
 }
 
-/// Hand a frame's presentation to the presenter; returns the last drawable wait.
+/// Hand a frame's presentation to the presenter; returns the drawable waits not yet reported.
 ///
-/// The wait is the previous present's, which is what the perf grid reports
-/// for the submit that hands the next one over.
+/// Those are the waits of the presents committed since the previous push,
+/// which is what the perf grid reports for the submit that hands the next
+/// one over. Taking them here reports each wait once.
 pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
     let mut inner = state.lock();
+    let waits = core::mem::take(&mut inner.unreported_drawable_wait_ns);
     if inner.flags.contains(PresenterFlags::STOP) {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "presenter: a frame was pushed after the queue's presenter stopped; it is not presented",
         );
         drop_packet(&mut inner, packet);
-        return inner.last_drawable_wait_ns;
+        return waits;
     }
     inner.pending.push_back(packet);
+    drop(inner);
     state.presenter_cv.notify_one();
-    inner.last_drawable_wait_ns
+    waits
 }
 
 /// Make the pending present and this submit's render work compatible.
@@ -789,11 +823,12 @@ fn present_frame(
              occluded, headroom 1.0, unthrottled, stretch route",
         );
     }
-    if attachment.as_ref().is_some_and(|att| att.window_occluded()) {
+    if attachment.as_ref().is_some_and(|att| att.window_occluded()) && !state.present_occluded {
         // Window fully occluded: the compositor is not recycling drawables,
         // so `nextDrawable` would block its full timeout for nothing that
         // reaches the screen. The render work committed already; the frame
-        // is simply not shown.
+        // is simply not shown. `debug.presentOccluded` presents anyway, so
+        // the test suite, whose windows stay hidden, runs this path.
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
         drop_front(state, seq);
         return true;
@@ -912,7 +947,7 @@ fn present_frame(
     let packet = inner.pending.pop_front();
     inner.committed_present_seq = inner.committed_present_seq.max(seq);
     inner.presented_seq = seq;
-    inner.last_drawable_wait_ns = drawable_wait_ns;
+    inner.note_drawable_wait(drawable_wait_ns);
     drop(inner);
     state.submit_cv.notify_all();
     drop(packet);

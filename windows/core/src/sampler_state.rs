@@ -7,11 +7,13 @@
 //! different key, so the pipeline-style silent-drop bug (state classified
 //! Consumed but value never reaches the sampler) is unrepresentable.
 //!
-//! Translation is 1:1 with no implicit promotes. Promoting
+//! Translation adds no implicit promotes. Promoting
 //! `MIPFILTER NONE → LINEAR` or `MINFILTER LINEAR → ANISOTROPIC` would layer
 //! aniso onto box-filter-generated mip chains on textures the game intended
-//! to be sampled bilinearly, producing distance shimmer that the 1:1 mapping
-//! does not.
+//! to be sampled bilinearly, producing distance shimmer that D3D9 does not.
+//! The filters D3D9 names beyond what a sampler offers (the quad filters,
+//! `D3DTEXF_CONVOLUTIONMONO`) read as LINEAR, and a min or mag filter of
+//! NONE as POINT.
 
 use std::fmt;
 
@@ -20,8 +22,8 @@ use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_DMAPOFFSET,
     D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE,
-    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT,
-    SAMPLER_STATE_COUNT, sampler_state_defaults,
+    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, SAMPLER_STATE_COUNT, sampler_state_defaults,
 };
 
 use crate::{
@@ -38,14 +40,41 @@ use crate::{
 /// Metal naturally capping selection at the texture's actual mip count.
 const LOD_MAX_CLAMP: f32 = 1000.0;
 
-/// Fragment sampler slots the LOD-bias uniform carries, one `float4` row each.
+/// Fragment sampler slots the LOD uniform carries, one `float4` row each.
 ///
 /// Matches the pixel-shader sampler slot count (`s0`..`s15`). The d3d9 side
 /// static-asserts its own stage count against this so the two cannot drift.
 pub const LOD_BIAS_SLOTS: usize = 16;
 
-/// Byte length of the fragment LOD-bias uniform.
+/// Byte length of the fragment LOD uniform.
 pub const LOD_BIAS_BYTES: usize = LOD_BIAS_SLOTS * 16;
+
+/// Index of the sampler-state array that carries the bound texture's `SetLOD`.
+///
+/// D3D9 numbers sampler states from `D3DSAMP_ADDRESSU` = 1, so index 0 names
+/// no state the sampler reads. The draw snapshot's per-stage copy stores the
+/// bound texture's LOD there, which is how the texture's most detailed level
+/// reaches the sampler translation and the explicit-LOD rows without widening
+/// the per-draw stage record. A copy that has no texture LOD to give carries 0.
+pub const TEXTURE_LOD_SLOT: usize = 0;
+
+/// The explicit-LOD row of a stage that needs no adjustment.
+///
+/// `max(lod + 0, -f32::MAX)` is `lod`, so a sample through this row lands
+/// where its shader asked. See [`explicit_lod_row`].
+pub const EXPLICIT_LOD_OPEN: [f32; 2] = [0.0, -f32::MAX];
+
+/// A whole table of [`EXPLICIT_LOD_OPEN`] rows, for a draw no stage of which needs one.
+pub const EXPLICIT_LOD_OPEN_ROWS: [[f32; 2]; LOD_BIAS_SLOTS] = [EXPLICIT_LOD_OPEN; LOD_BIAS_SLOTS];
+
+/// Vertex sampler slots the vertex LOD uniform carries, one `float2` row each.
+///
+/// The four `D3DVERTEXTEXTURESAMPLER0..3` slots a `vs_3_0` samples as
+/// `s0`..`s3`.
+pub const VS_LOD_SLOTS: usize = crate::passes::VERTEX_SAMPLER_SLOTS;
+
+/// Byte length of the vertex LOD uniform.
+pub const VS_LOD_BYTES: usize = VS_LOD_SLOTS * 8;
 
 /// Fine-mip clamp `D3DSAMP_MAXMIPLEVEL` is limited to on decode.
 ///
@@ -66,20 +95,21 @@ const LOD_BIAS_LIMIT: f32 = 32.0;
 /// The D3D9 sampler enum bounds at the byte width the snapshot carries.
 ///
 /// Narrow copies of the ABI constants, each pinned to its `mtld3d-types`
-/// definition by the asserts below, so [`enum_value`] can name a bound in `u8`
-/// without a truncating cast.
-const TEXF_LAST: u8 = 8;
+/// definition by the asserts below, so [`filter_value`] and [`address_value`]
+/// can name a bound in `u8` without a truncating cast.
 const TEXF_NONE: u8 = 0;
 const TEXF_POINT: u8 = 1;
+const TEXF_LINEAR: u8 = 2;
 const TADDRESS_FIRST: u8 = 1;
 const TADDRESS_LAST: u8 = 5;
 
 const _: () = assert!(TEXF_NONE as u32 == D3DTEXF_NONE);
 const _: () = assert!(TEXF_POINT as u32 == D3DTEXF_POINT);
-const _: () = assert!(TEXF_LAST as u32 == D3DTEXF_CONVOLUTIONMONO);
+const _: () = assert!(TEXF_LINEAR as u32 == D3DTEXF_LINEAR);
 const _: () = assert!(TADDRESS_FIRST as u32 == D3DTADDRESS_WRAP);
 const _: () = assert!(TADDRESS_LAST as u32 == D3DTADDRESS_MIRRORONCE);
 const _: () = assert!(MAX_ANISOTROPY <= u8::MAX as u32);
+const _: () = assert!(TEXTURE_LOD_SLOT < D3DSAMP_ADDRESSU as usize);
 
 bitflags::bitflags! {
     /// Sampler cache-key booleans that aren't sourced from a D3DSAMP slot.
@@ -141,7 +171,8 @@ pub const fn samp_classify(type_: u32) -> SampClass {
         | D3DSAMP_MIPFILTER
         | D3DSAMP_MAXANISOTROPY
         // MAXMIPLEVEL: `snapshot_from_state`, plumbed to `setLodMinClamp`
-        // on the unix side.
+        // on the unix side, and `explicit_lod_row` for the samples that
+        // name their level.
         | D3DSAMP_MAXMIPLEVEL
         // SRGBTEXTURE is consumed at the draw-time bind: the stage's texture
         // handle resolves to the eager sRGB twin view so the hardware
@@ -177,17 +208,18 @@ pub const fn samp_classify(type_: u32) -> SampClass {
 
 /// Input view of the D3DSAMP state that participates in pipeline/cache decisions.
 ///
-/// [`snapshot_from_state`] narrows each state once on the way in: the enum
-/// ones to their D3D9 value space, the numeric ones to the range the sampler
-/// accepts. `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
+/// [`snapshot_from_state`] narrows each state once on the way in: the filters
+/// to the point and linear filtering a sampler applies, the address modes to
+/// their D3D9 value space, the numeric ones to the range the sampler accepts.
+/// `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
 /// translates, so a state can never be keyed as one thing and built as
 /// another, and the key's four-bit fields are exact without a mask.
 pub struct SamplerSnapshot {
-    /// `D3DSAMP_MINFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MINFILTER`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub min_filter: u8,
-    /// `D3DSAMP_MAGFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MAGFILTER`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub mag_filter: u8,
-    /// `D3DSAMP_MIPFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MIPFILTER`, `D3DTEXF_NONE`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub mip_filter: u8,
     /// `D3DSAMP_ADDRESSU`, inside the `D3DTADDRESS_*` space.
     pub address_u: u8,
@@ -195,13 +227,19 @@ pub struct SamplerSnapshot {
     pub address_v: u8,
     /// `D3DSAMP_ADDRESSW`, inside the `D3DTADDRESS_*` space.
     pub address_w: u8,
-    /// `D3DSAMP_MAXANISOTROPY`, limited to the ceiling the caps advertise.
-    pub max_anisotropy: u8,
-    /// `D3DSAMP_MAXMIPLEVEL`, limited to the deepest level a D3D9 texture has.
+    /// `D3DSAMP_MAXANISOTROPY` as the sampler applies it.
     ///
-    /// D3D9 spec: the *minimum* fine mip level the sampler may select
-    /// (counterintuitive name). Maps to Metal's `setLodMinClamp`.
-    /// Zero = default (no clamp).
+    /// Limited to the ceiling the caps advertise, and 1 unless one of the
+    /// stage's filters is `D3DTEXF_ANISOTROPIC`.
+    pub max_anisotropy: u8,
+    /// The most detailed level the stage may sample, at most the deepest level of a D3D9 texture.
+    ///
+    /// With mipmapping on it is `D3DSAMP_MAXMIPLEVEL` (D3D9's name for the
+    /// *finest* level the sampler may select) or the texture's `SetLOD`,
+    /// whichever is coarser, and maps to Metal's `setLodMinClamp`. With
+    /// `D3DSAMP_MIPFILTER` NONE D3D9 ignores `MAXMIPLEVEL` and samples the
+    /// texture's LOD level alone, so it is that LOD, and a non-zero value
+    /// pins the sampler to the level from both sides. Zero = default.
     pub max_mip_level: u8,
     /// `D3DSAMP_BORDERCOLOR` as the game set it (a D3DCOLOR).
     ///
@@ -223,6 +261,13 @@ impl SamplerSnapshot {
     /// point and the shader reads exact stored depths, which is what position
     /// reconstruction wants anyway. Comparison samplers are left as
     /// configured: linear there is hardware PCF, which Apple GPUs do support.
+    ///
+    /// Mipmapping goes off with the filters, so a stage with a non-zero
+    /// [`Self::max_mip_level`] becomes a pinned sampler
+    /// (`lodMinClamp = lodMaxClamp` = that level, see
+    /// [`description_from_snapshot`]), and a raw-depth `texldl` at a coarser
+    /// LOD is held at that level, while one with no finest level reads level 0
+    /// whatever its LOD.
     pub const fn force_point_filter(&mut self) {
         self.min_filter = TEXF_POINT;
         self.mag_filter = TEXF_POINT;
@@ -231,14 +276,30 @@ impl SamplerSnapshot {
     }
 }
 
-/// Cached fragment LOD-bias uniform derived from effective per-slot inputs.
+/// Turn a stage's filtering into point sampling, for a texture the device cannot filter.
+///
+/// The single-precision float formats filter only on a device with 32-bit
+/// float filtering; elsewhere `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
+/// answers no for them and Metal does not filter them. The min and mag
+/// filters read POINT, and a mip filter other than NONE reads POINT too, which
+/// keeps the level selection and blends no texels. The PE side applies it to
+/// the stored state on its way to the draw, as it folds a texture's LOD.
+pub const fn sample_unfiltered(ss: &mut [u32; SAMPLER_STATE_COUNT]) {
+    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
+    ss[D3DSAMP_MAGFILTER as usize] = D3DTEXF_POINT;
+    if ss[D3DSAMP_MIPFILTER as usize] != D3DTEXF_NONE {
+        ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
+    }
+}
+
+/// Cached fragment LOD uniform derived from effective per-slot inputs.
 ///
 /// Input identity uses raw `f32` bits so signed zero and NaN payload changes
 /// are not hidden by float equality. This cache describes only the derived
 /// bytes; the render encoder's last-bound cache independently decides whether
 /// those bytes need binding in the current pass.
 pub struct LodBiasTableCache {
-    input_bits: Option<[u32; LOD_BIAS_SLOTS]>,
+    input_bits: Option<([u32; LOD_BIAS_SLOTS], [[u32; 2]; LOD_BIAS_SLOTS])>,
     bytes: [u8; LOD_BIAS_BYTES],
 }
 
@@ -255,12 +316,19 @@ impl LodBiasTableCache {
     ///
     /// Returns whether the cached bytes were rebuilt.
     #[must_use]
-    pub fn update(&mut self, biases: &[f32; LOD_BIAS_SLOTS]) -> bool {
-        let input_bits = biases.map(f32::to_bits);
+    pub fn update(
+        &mut self,
+        biases: &[f32; LOD_BIAS_SLOTS],
+        explicit: &[[f32; 2]; LOD_BIAS_SLOTS],
+    ) -> bool {
+        let input_bits = (
+            biases.map(f32::to_bits),
+            explicit.map(|row| row.map(f32::to_bits)),
+        );
         if self.input_bits == Some(input_bits) {
             return false;
         }
-        self.bytes = build_lod_bias_bytes(biases);
+        self.bytes = build_lod_bias_bytes(biases, explicit);
         self.input_bits = Some(input_bits);
         true
     }
@@ -273,6 +341,77 @@ impl LodBiasTableCache {
 }
 
 impl Default for LodBiasTableCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The vertex samplers' explicit-LOD rows, kept as the vertex LOD uniform's bytes.
+///
+/// Every vertex sample names its level (`texldl`), and Metal applies no
+/// sampler LOD clamp to an explicit level, so each slot's [`explicit_lod_row`]
+/// reaches the vertex function through this uniform. The encoder updates a
+/// slot when its sampler state arrives, which is far rarer than a draw, so a
+/// draw reads [`Self::mask`] to decide whether its shader needs the table and
+/// binds [`Self::bytes`] as they stand.
+pub struct VertexLodTable {
+    /// Bit `i` set when slot `i`'s row is not [`EXPLICIT_LOD_OPEN`].
+    mask: u8,
+    bytes: [u8; VS_LOD_BYTES],
+}
+
+impl VertexLodTable {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut table = Self {
+            mask: 0,
+            bytes: [0; VS_LOD_BYTES],
+        };
+        for slot in 0..VS_LOD_SLOTS {
+            table.write_row(slot, EXPLICIT_LOD_OPEN);
+        }
+        table
+    }
+
+    /// Record vertex slot `slot`'s sampler state, the texture LOD included.
+    ///
+    /// Slots at or past [`VS_LOD_SLOTS`] are ignored (D3D9 defines four).
+    pub fn set_slot(&mut self, slot: usize, ss: &[u32; SAMPLER_STATE_COUNT]) {
+        if slot >= VS_LOD_SLOTS {
+            return;
+        }
+        let bit = 1u8 << slot;
+        let row = explicit_lod_row(ss);
+        if row.is_some() {
+            self.mask |= bit;
+        } else {
+            self.mask &= !bit;
+        }
+        self.write_row(slot, row.unwrap_or(EXPLICIT_LOD_OPEN));
+    }
+
+    /// Bit `i` set when vertex slot `i` needs its row.
+    ///
+    /// A sample at such a slot lands elsewhere than the level its shader names.
+    #[must_use]
+    pub const fn mask(&self) -> u8 {
+        self.mask
+    }
+
+    /// The uniform's bytes: row `i` is `(offset, floor)` for vertex slot `i`.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; VS_LOD_BYTES] {
+        &self.bytes
+    }
+
+    fn write_row(&mut self, slot: usize, [offset, floor]: [f32; 2]) {
+        let base = slot * 8;
+        self.bytes[base..base + 4].copy_from_slice(&offset.to_le_bytes());
+        self.bytes[base + 4..base + 8].copy_from_slice(&floor.to_le_bytes());
+    }
+}
+
+impl Default for VertexLodTable {
     fn default() -> Self {
         Self::new()
     }
@@ -356,19 +495,64 @@ pub fn lod_bias_active(bias: f32) -> bool {
     bias.abs() > 0.0
 }
 
-/// Serialise a per-slot LOD-bias table into the fragment uniform's bytes.
+/// Where a sample that names its own level lands, as `(offset, floor)`.
 ///
-/// Row `i` is `(bias, exp2(bias), 0, 0)`. An implicit-LOD sample adds `.x`
-/// through MSL's `bias()`; an explicit-gradient sample multiplies its
-/// derivatives by `.y` instead, which shifts the computed LOD by the same
-/// amount, because MSL accepts only one LOD option per sample call.
+/// Metal ignores a sampler's LOD clamps for a sample with an explicit
+/// `level()`, so `texldl` and the depth samples pinned to a level apply the
+/// stage's state in the shader instead: `texldl` samples
+/// `level(max(lod + offset, floor))`, and a depth sample with no level of its
+/// own samples `level(max(floor, 0))`.
+///
+/// The texture's `SetLOD` is a base level, so the shader's LOD counts from it
+/// and `offset` carries it, together with `D3DSAMP_MIPMAPLODBIAS`, which D3D9
+/// adds to an explicit LOD as it does to a computed one. `floor` is the finest
+/// level the stage may sample ([`SamplerSnapshot::max_mip_level`]), so
+/// `D3DSAMP_MAXMIPLEVEL` clamps the result rather than shifting it. With
+/// `D3DSAMP_MIPFILTER` NONE D3D9 samples the LOD level whatever the shader
+/// asks: the offset is `-f32::MAX`, so the sum never wins over the floor.
+///
+/// `None` when the stage needs nothing, the [`EXPLICIT_LOD_OPEN`] row.
 #[must_use]
-pub fn build_lod_bias_bytes(biases: &[f32; LOD_BIAS_SLOTS]) -> [u8; LOD_BIAS_BYTES] {
+pub fn explicit_lod_row(ss: &[u32; SAMPLER_STATE_COUNT]) -> Option<[f32; 2]> {
+    let lod = clamped_max_mip_level(ss[TEXTURE_LOD_SLOT]);
+    let floor = finest_level(ss);
+    if ss[D3DSAMP_MIPFILTER as usize] == D3DTEXF_NONE {
+        // Level 0 of a sampler with no mipmapping is the only level Metal
+        // reads, which is what D3D9 reads at LOD 0.
+        return (floor > 0).then(|| [-f32::MAX, f32::from(floor)]);
+    }
+    let offset = f32::from(lod) + lod_bias(ss);
+    if floor == 0 && !lod_bias_active(offset) {
+        return None;
+    }
+    let floor = if floor == 0 {
+        EXPLICIT_LOD_OPEN[1]
+    } else {
+        f32::from(floor)
+    };
+    Some([offset, floor])
+}
+
+/// Serialise the per-slot LOD inputs into the fragment uniform's bytes.
+///
+/// Row `i` is `(bias, exp2(bias), offset, floor)`. An implicit-LOD sample
+/// adds `.x` through MSL's `bias()`; an explicit-gradient sample multiplies
+/// its derivatives by `.y` instead, which shifts the computed LOD by the same
+/// amount, because MSL accepts only one LOD option per sample call. A sample
+/// with an explicit level reads `.z` and `.w`, the [`explicit_lod_row`] of the
+/// stage.
+#[must_use]
+pub fn build_lod_bias_bytes(
+    biases: &[f32; LOD_BIAS_SLOTS],
+    explicit: &[[f32; 2]; LOD_BIAS_SLOTS],
+) -> [u8; LOD_BIAS_BYTES] {
     let mut out = [0u8; LOD_BIAS_BYTES];
-    for (row, &bias) in biases.iter().enumerate() {
+    for (row, (&bias, &[offset, floor])) in biases.iter().zip(explicit).enumerate() {
         let base = row * 16;
         out[base..base + 4].copy_from_slice(&bias.to_le_bytes());
         out[base + 4..base + 8].copy_from_slice(&bias.exp2().to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&offset.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&floor.to_le_bytes());
     }
     out
 }
@@ -385,45 +569,62 @@ pub fn snapshot_from_state(ss: &[u32; SAMPLER_STATE_COUNT], is_compare: bool) ->
     flags.set(SamplerFlags::IS_COMPARE, is_compare);
     flags.set(SamplerFlags::SRGB_TEXTURE, srgb_texture_enabled(ss));
     SamplerSnapshot {
-        min_filter: enum_value(ss, D3DSAMP_MINFILTER),
-        mag_filter: enum_value(ss, D3DSAMP_MAGFILTER),
-        mip_filter: enum_value(ss, D3DSAMP_MIPFILTER),
-        address_u: enum_value(ss, D3DSAMP_ADDRESSU),
-        address_v: enum_value(ss, D3DSAMP_ADDRESSV),
-        address_w: enum_value(ss, D3DSAMP_ADDRESSW),
-        max_anisotropy: clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize]),
-        max_mip_level: clamped_max_mip_level(ss[D3DSAMP_MAXMIPLEVEL as usize]),
+        min_filter: filter_value(ss, D3DSAMP_MINFILTER, TEXF_POINT),
+        mag_filter: filter_value(ss, D3DSAMP_MAGFILTER, TEXF_POINT),
+        mip_filter: filter_value(ss, D3DSAMP_MIPFILTER, TEXF_NONE),
+        address_u: address_value(ss, D3DSAMP_ADDRESSU),
+        address_v: address_value(ss, D3DSAMP_ADDRESSV),
+        address_w: address_value(ss, D3DSAMP_ADDRESSW),
+        max_anisotropy: effective_max_anisotropy(ss),
+        max_mip_level: finest_level(ss),
         border_color: ss[D3DSAMP_BORDERCOLOR as usize],
         flags,
     }
 }
 
-/// An enum-valued D3DSAMP state, narrowed to the byte a snapshot carries.
+/// A filter state, narrowed to the filtering a sampler applies.
+///
+/// A sampler filters by point or linearly, and a mip filter may also turn
+/// mipmapping off. `SetSamplerState` stores whatever DWORD the game passed,
+/// so the value is clamped into `floor..=LINEAR`: a min or mag filter of
+/// `D3DTEXF_NONE` (`floor` POINT) samples as POINT, and every value above
+/// LINEAR filters linearly. That covers `D3DTEXF_ANISOTROPIC`, whose
+/// anisotropy [`effective_max_anisotropy`] reads from the raw state, the two
+/// quad filters and `D3DTEXF_CONVOLUTIONMONO`, which no sampler offers, and
+/// any DWORD no `D3DTEXF_*` names. Each value read as another filter than it
+/// names surfaces once.
+fn filter_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32, floor: u8) -> u8 {
+    let value = ss[state as usize];
+    if value == D3DTEXF_ANISOTROPIC {
+        return TEXF_LINEAR;
+    }
+    let read = if value < u32::from(floor) {
+        floor
+    } else if value > u32::from(TEXF_LINEAR) {
+        TEXF_LINEAR
+    } else {
+        // Exact: the branches above leave POINT..=LINEAR or NONE.
+        return value.to_le_bytes()[0];
+    };
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: (u64::from(state) << 32) | u64::from(value),
+        "D3DSAMP_{state} = {value:#x} has no sampler filter of its own → reading D3DTEXF {read}"
+    );
+    read
+}
+
+/// An address-mode state, narrowed to the byte a snapshot carries.
 ///
 /// `SetSamplerState` stores whatever DWORD the game passed, so these are game
-/// input. A value outside the state's D3D9 enum space reads as that state's
-/// default from `sampler_state_defaults`, which is what a driver settles on
-/// for an enum it does not recognise, and surfaces once. Values the space
-/// names but `convert` does not map (`D3DTEXF_NONE` on a min/mag filter, the
-/// quad filters) still reach that translator's own logged fallback arm, so
-/// every in-space value produces exactly what it did before.
-fn enum_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
+/// input. A value outside the `D3DTADDRESS_*` space reads as the D3D9 default
+/// WRAP from `sampler_state_defaults`, which is what a driver settles on for
+/// a mode it does not recognise, and surfaces once.
+fn address_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
     let value = ss[state as usize];
-    // Exact for every value the spaces below accept: both fit in a byte.
+    // Exact for every value the space accepts: it fits in a byte.
     let byte = value.to_le_bytes()[0];
-    let (first, last) = match state {
-        D3DSAMP_MINFILTER | D3DSAMP_MAGFILTER | D3DSAMP_MIPFILTER => (TEXF_NONE, TEXF_LAST),
-        D3DSAMP_ADDRESSU | D3DSAMP_ADDRESSV | D3DSAMP_ADDRESSW => (TADDRESS_FIRST, TADDRESS_LAST),
-        other => {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: u64::from(other),
-                "D3DSAMP_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
-            );
-            return byte;
-        }
-    };
-    if u32::from(byte) == value && first <= byte && byte <= last {
+    if u32::from(byte) == value && (TADDRESS_FIRST..=TADDRESS_LAST).contains(&byte) {
         return byte;
     }
     // Exact: no sampler-state default is wider than a byte.
@@ -431,7 +632,7 @@ fn enum_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
     mtld3d_shared::log_once_warn_by!(
         target: crate::LOG_TARGET,
         key: u64::from(state),
-        "D3DSAMP_{state} = {value:#x} outside its {first}..={last} value space → reading the D3D9 default {default:#x}"
+        "D3DSAMP_{state} = {value:#x} outside its {TADDRESS_FIRST}..={TADDRESS_LAST} value space → reading the D3D9 default {default:#x}"
     );
     default
 }
@@ -453,17 +654,46 @@ pub const fn key_from_snapshot(s: &SamplerSnapshot) -> SamplerKey {
     )
 }
 
-/// `D3DSAMP_MAXMIPLEVEL` at the width the key packs and the sampler takes.
+/// The most detailed level a stage may sample, see [`SamplerSnapshot::max_mip_level`].
+fn finest_level(ss: &[u32; SAMPLER_STATE_COUNT]) -> u8 {
+    let lod = clamped_max_mip_level(ss[TEXTURE_LOD_SLOT]);
+    if ss[D3DSAMP_MIPFILTER as usize] == D3DTEXF_NONE {
+        lod
+    } else {
+        lod.max(clamped_max_mip_level(ss[D3DSAMP_MAXMIPLEVEL as usize]))
+    }
+}
+
+/// A level-valued state at the width the key packs and the sampler takes.
 ///
-/// `SetSamplerState` stores whatever DWORD the game passed, so the state is
-/// game input, and a value past the deepest level any D3D9 texture has reads
-/// as [`MAX_MIP_LEVEL`].
+/// `D3DSAMP_MAXMIPLEVEL` and the texture LOD. `SetSamplerState` stores
+/// whatever DWORD the game passed, so the state is game input, and a value
+/// past the deepest level any D3D9 texture has reads as [`MAX_MIP_LEVEL`].
 const fn clamped_max_mip_level(level: u32) -> u8 {
     if level > MAX_MIP_LEVEL as u32 {
         MAX_MIP_LEVEL
     } else {
         // Exact: the branch above leaves nothing wider than a byte.
         level.to_le_bytes()[0]
+    }
+}
+
+/// `D3DSAMP_MAXANISOTROPY` as the stage's filters apply it.
+///
+/// D3D9 filters anisotropically only through `D3DTEXF_ANISOTROPIC`, so a stage
+/// whose min, mag and mip filters all name another filter samples
+/// isotropically whatever `D3DSAMP_MAXANISOTROPY` holds, and reads 1 here.
+/// Any of the three naming it turns anisotropy on, the min filter being the
+/// one that decides a minified sample and the mag filter the one the caps
+/// also advertise.
+fn effective_max_anisotropy(ss: &[u32; SAMPLER_STATE_COUNT]) -> u8 {
+    let anisotropic = [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER]
+        .iter()
+        .any(|&state| ss[state as usize] == D3DTEXF_ANISOTROPIC);
+    if anisotropic {
+        clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize])
+    } else {
+        1
     }
 }
 
@@ -513,19 +743,29 @@ pub struct SamplerDescription {
 }
 
 /// Translate a snapshot into native sampler inputs.
+///
+/// A stage with mipmapping off and a non-zero [`SamplerSnapshot::max_mip_level`]
+/// samples that one level: the sampler selects the nearest level with both
+/// LOD clamps on it, since a sampler without mipmapping reads level 0 alone.
 #[must_use]
 pub fn description_from_snapshot(s: &SamplerSnapshot, key: SamplerKey) -> SamplerDescription {
+    let pinned = s.mip_filter == TEXF_NONE && s.max_mip_level > 0;
+    let mip_filter = if pinned { TEXF_POINT } else { s.mip_filter };
     SamplerDescription {
         id: key.raw(),
         min_filter: d3d_to_metal_min_mag_filter(u32::from(s.min_filter)),
         mag_filter: d3d_to_metal_min_mag_filter(u32::from(s.mag_filter)),
-        mip_filter: d3d_to_metal_mip_filter(u32::from(s.mip_filter)),
+        mip_filter: d3d_to_metal_mip_filter(u32::from(mip_filter)),
         address_u: d3d_to_metal_address_mode(u32::from(s.address_u)),
         address_v: d3d_to_metal_address_mode(u32::from(s.address_v)),
         address_w: d3d_to_metal_address_mode(u32::from(s.address_w)),
         max_anisotropy: u32::from(s.max_anisotropy),
         lod_min_clamp: f32::from(s.max_mip_level),
-        lod_max_clamp: LOD_MAX_CLAMP,
+        lod_max_clamp: if pinned {
+            f32::from(s.max_mip_level)
+        } else {
+            LOD_MAX_CLAMP
+        },
         flags: s.flags & SamplerFlags::IS_COMPARE,
         border_color: d3d_border_color_to_metal(s.border_color),
     }

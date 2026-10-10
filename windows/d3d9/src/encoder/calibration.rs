@@ -51,16 +51,26 @@ impl SourceClock {
         Arc::as_ptr(&self.clock) as u64
     }
 
-    pub(super) fn join(&mut self) {
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::warn!(target: LOG_TARGET, "source clock calibration failed; timing invalid");
-            if matches!(self.clock.get(), Ok(None)) {
-                // SAFETY: the failed worker is joined and never published; this
-                // is now the only publisher and SourceClock retains the mailbox.
-                unsafe { self.clock.publish_failed() };
-            }
+    /// The calibrated frequency once the worker has published it; `None` while pending or failed.
+    pub(super) fn hz(&self) -> Option<u64> {
+        self.clock.get().ok().flatten()
+    }
+
+    /// Wait for the calibration worker to end, then let its handle go.
+    ///
+    /// Waits through `mtld3d_core::thread_wait::wait_until_finished`, never
+    /// `JoinHandle::join`, which can panic at device release under Wine. The
+    /// worker's publication is visible to the check below once it returns.
+    pub(super) fn wait(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        mtld3d_core::thread_wait::wait_until_finished(worker);
+        if matches!(self.clock.get(), Ok(None)) {
+            log::warn!(target: LOG_TARGET, "source clock calibration ended without a result; timing invalid");
+            // SAFETY: the worker has ended without publishing; this is now
+            // the only publisher and SourceClock retains the mailbox.
+            unsafe { self.clock.publish_failed() };
         }
     }
 
@@ -73,6 +83,6 @@ impl SourceClock {
 
 impl Drop for SourceClock {
     fn drop(&mut self) {
-        self.join();
+        self.wait();
     }
 }

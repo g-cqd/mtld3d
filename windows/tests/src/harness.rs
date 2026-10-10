@@ -5,10 +5,15 @@
 //! call only safe methods and assert on the returned `HRESULT`s / pixels.
 
 use core::{cell::Cell, ffi::c_void};
-use std::sync::{Condvar, Mutex, PoisonError, RwLock};
+use std::{
+    fs::{File, OpenOptions, TryLockError},
+    path::PathBuf,
+    sync::{self, Mutex, MutexGuard, PoisonError, RwLock},
+    time::{Duration, Instant},
+};
 
 use mtld3d_types::{
-    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
+    D3D_OK, D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
     D3DDEVTYPE_HAL, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT,
     D3DSDK_VERSION, D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl,
@@ -17,7 +22,7 @@ use mtld3d_types::{
 
 use crate::{
     check::expect_ok,
-    ffi::Direct3DCreate9,
+    ffi::{Direct3DCreate9, direct3d_create9_ex},
     resource::{
         CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, SwapChain, Texture,
         VertexBuffer, VertexDeclaration, VertexShader, VolumeTexture,
@@ -27,6 +32,7 @@ use crate::{
 };
 
 mod cursor_bitmap;
+pub mod extended;
 
 /// The process environment, which every `Direct3DCreate9` reads.
 ///
@@ -50,7 +56,7 @@ pub const UNWRITTEN: u32 = 0xDEAD_BEEF;
 /// The environment variable the layer reads its configuration overrides from.
 const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
-/// The display mode of the wineserver session, held by one harness at a time.
+/// The display mode, held by one harness of the machine at a time.
 ///
 /// A fullscreen device sets a mode the whole session sees, so two of them
 /// live at once would each read the other's, and a test that reads the
@@ -64,27 +70,168 @@ const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 /// holding the mode per test at a time: a second one on the same thread
 /// would wait for the first forever.
 ///
-/// A flag under a mutex plus a condvar rather than a held `MutexGuard`,
+/// The mode is not this process's alone, nor its wineserver's: every Wine
+/// process of the macOS session reads and sets the same one, including the
+/// test processes of another checkout's isolated run under a wineserver of
+/// their own. So the harness that holds it here also holds the exclusive lock
+/// of [`lock_machine_display_mode`], taken after this process's turn and given
+/// back with it, which makes the take one per machine rather than one per
+/// process. It is a static because the resource is machine-wide: the open
+/// lock file is the hold, and no single harness outlives the others to own
+/// it.
+///
+/// The hold is a field under the mutex rather than a held `MutexGuard`,
 /// because the holder is a harness field and a guard there would put a
-/// significant drop into every test's `Harness`.
-static MODESET_HELD: Mutex<bool> = Mutex::new(false);
-static MODESET_RELEASED: Condvar = Condvar::new();
+/// significant drop into every test's `Harness`. A thread waiting for its
+/// turn never blocks on the mutex or on the file lock: it owns the window of
+/// its harness, so it answers the messages sent to it between looks
+/// ([`MODESET_POLL`]).
+static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet {
+    lock: None,
+    released: None,
+});
 
-/// Take the session's display mode, waiting for the harness that holds it.
-fn take_display_mode() {
-    let mut held = MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner);
-    while *held {
-        held = MODESET_RELEASED
-            .wait(held)
-            .unwrap_or_else(PoisonError::into_inner);
-    }
-    *held = true;
+/// Whether a harness of this process holds the display mode, and when it was last given back.
+struct ModeSet {
+    /// The locked machine-wide file while a harness holds the mode.
+    lock: Option<File>,
+    /// When this process last gave the mode back.
+    released: Option<Instant>,
 }
 
-/// Give the session's display mode back and wake one harness waiting for it.
+/// How long a process waits after giving the display mode back before it asks again.
+///
+/// A process waiting for the mode asks again every [`MODESET_POLL`], and one
+/// whose harness takes the machine-wide lock through Wine's blocking wait
+/// every 100 ms, which is how often Wine retries a lock another wineserver
+/// holds. The process that just gave the mode back would ask again within
+/// the same millisecond, so without a pause one process would keep the mode
+/// for its whole run of display-mode tests and another run's tests would
+/// wait for all of them. A pause longer than either interval lets a waiting
+/// process in first, so concurrent runs alternate test by test.
+/// Uncontended, it costs one pause per back-to-back take.
+const MODESET_HANDOFF_PAUSE: Duration = Duration::from_millis(150);
+
+/// How long a thread waiting for the display mode waits for a sent message before it looks again.
+///
+/// A mode change sends `WM_DISPLAYCHANGE` to every top-level window of the
+/// wineserver and waits up to two seconds for each to answer, and the thread
+/// waiting for its turn owns a window when its test asks for the mode after
+/// creating its device. So it waits on its message queue, answering what other
+/// threads send it, and looks at the mode after each message and at least
+/// this often. Each look is one `try_lock`, of the mutex or of the file.
+const MODESET_POLL: Duration = Duration::from_millis(10);
+
+/// The directory of the machine-wide display-mode lock, relative to the user's home.
+const MODESET_LOCK_DIR: &str = r"Library\Caches\mtld3d";
+/// The lock file's name in [`MODESET_LOCK_DIR`].
+const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
+
+/// Take the session's display mode, waiting for the harness or process that holds it.
+///
+/// The machine-wide lock is taken under the mutex, so this process asks for
+/// it on one thread at a time and never holds it twice. Every wait here
+/// answers the messages other threads send to this thread's windows. A panic
+/// between this take and the harness that owns it ends the process through
+/// the failure hook every harness installs first, and the exit gives the lock
+/// back.
+fn take_display_mode() {
+    let mut mode = wait_for_this_process_turn();
+    if let Some(released) = mode.released {
+        win32::answer_sent_messages_for(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
+    }
+    mode.lock = Some(lock_machine_display_mode());
+}
+
+/// This process's display-mode record, once no other thread uses it and no harness holds the mode.
+///
+/// Looks with `try_lock` and waits between looks answering sent messages,
+/// so a thread that owns a window never sits in the mutex while another
+/// thread of the process waits for the machine-wide lock under it.
+fn wait_for_this_process_turn() -> MutexGuard<'static, ModeSet> {
+    loop {
+        let mode = match MODESET.try_lock() {
+            Ok(mode) => Some(mode),
+            Err(sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mode) = mode.filter(|mode| mode.lock.is_none()) {
+            return mode;
+        }
+        win32::wait_answering_sent_messages(MODESET_POLL);
+    }
+}
+
+/// Give the session's display mode back.
+///
+/// Dropping the lock file closes it, which releases the machine-wide lock.
+/// The threads waiting for the mode see it free at their next look.
 fn release_display_mode() {
-    *MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner) = false;
-    MODESET_RELEASED.notify_one();
+    let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
+    mode.lock = None;
+    mode.released = Some(Instant::now());
+}
+
+/// Lock the machine-wide display-mode file exclusively, waiting for the process that holds it.
+///
+/// The file sits in the user's cache directory, which every test process of
+/// the user reaches at the same path whatever its prefix, so test processes
+/// of all checkouts and both architectures meet on it. `LockFileEx` is the
+/// lock: Wine's server mirrors it as a POSIX record lock on the host file, so
+/// it excludes the processes of another wineserver too. It ends with the
+/// handle: when the harness gives the mode back, and when the process exits
+/// or is killed, since the wineserver closes a dead process's handles and the
+/// kernel drops a dead server's locks. The wait for another process tries the
+/// lock every [`MODESET_POLL`] and answers sent messages between tries,
+/// since Wine's own blocking wait answers none. A wait for another process is
+/// announced on stderr, which the runner keeps only for a process that ends
+/// with tests unaccounted for, so a timed-out test's kept stderr says whether
+/// it was waiting for the mode.
+///
+/// # Panics
+///
+/// Panics when Wine names no home directory or the file cannot be opened or
+/// locked, since a test that cannot take the mode cannot trust what it reads.
+fn lock_machine_display_mode() -> File {
+    let home = std::env::var("WINEHOMEDIR").expect("Wine names the home directory in WINEHOMEDIR");
+    // Wine gives the directory as an NT path, `\??\` and then a drive or its
+    // `unix` namespace, and its own shell32 opens files under it the same
+    // way, through the Win32 spelling of that prefix, `\\?\`.
+    let home = home
+        .strip_prefix(r"\??\")
+        .unwrap_or_else(|| panic!("WINEHOMEDIR is not an NT path: {home}"));
+    let dir = PathBuf::from(format!(r"\\?\{home}")).join(MODESET_LOCK_DIR);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "create the display-mode lock's directory {}: {e}",
+            dir.display()
+        )
+    });
+    let path = dir.join(MODESET_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open the display-mode lock {}: {e}", path.display()));
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(TryLockError::WouldBlock) => {
+                if !announced {
+                    eprintln!(
+                        "[e2e] display mode held by another process; waiting on {}",
+                        path.display()
+                    );
+                    announced = true;
+                }
+                win32::wait_answering_sent_messages(MODESET_POLL);
+            }
+            Err(TryLockError::Error(e)) => panic!("lock the display mode {}: {e}", path.display()),
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -98,6 +245,17 @@ bitflags::bitflags! {
         /// The device window is another harness's, which destroys it.
         const BORROWED_WINDOW = 1 << 2;
     }
+}
+
+/// Which factory export a [`Harness`] creates its interface with, and how it creates the device.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Factory {
+    /// `Direct3DCreate9`, then `CreateDevice`.
+    Plain,
+    /// `Direct3DCreate9Ex`, then the base `CreateDevice`, which still makes an extended device.
+    Extended,
+    /// `Direct3DCreate9Ex`, then `CreateDeviceEx` with no display mode.
+    ExtendedDeviceEx,
 }
 
 /// How a [`Harness`] device is created.
@@ -144,6 +302,8 @@ pub struct HarnessConfig {
     /// display; a benchmark that times frames asks for
     /// `D3DPRESENT_INTERVAL_IMMEDIATE` so the refresh rate does not bound them.
     pub presentation_interval: u32,
+    /// The factory export and device create; [`Factory::Plain`] by default.
+    pub factory: Factory,
 }
 
 impl Default for HarnessConfig {
@@ -163,6 +323,7 @@ impl Default for HarnessConfig {
             multi_sample_quality: 0,
             device_window: 0,
             presentation_interval: 0,
+            factory: Factory::Plain,
         }
     }
 }
@@ -298,9 +459,11 @@ pub struct Harness {
     multi_sample_type: u32,
     /// The entries the interface was created with on top of the suite-wide configuration.
     config_entries: String,
+    /// The factory export the interface came from: whether it and its device are extended.
+    factory: Factory,
 }
 
-/// `Direct3DCreate9` under the environment lock.
+/// The factory export `factory` names, called under the environment lock.
 ///
 /// Shared for the suite-wide configuration; exclusive, with `entries`
 /// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
@@ -312,12 +475,11 @@ pub struct Harness {
 ///
 /// # Panics
 /// Panics if the factory cannot be created.
-fn create_factory(entries: &str) -> *mut c_void {
+fn create_factory(entries: &str, factory: Factory) -> *mut c_void {
     crate::in_flight::announce();
     let d3d9 = if entries.is_empty() {
         let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        unsafe { Direct3DCreate9(D3DSDK_VERSION) }
+        call_factory(factory)
     } else {
         let exclusive = ENVIRONMENT.write().unwrap_or_else(PoisonError::into_inner);
         let previous = std::env::var(CONFIG_VAR).ok();
@@ -328,8 +490,7 @@ fn create_factory(entries: &str) -> *mut c_void {
         // other reader, the environment block a child spawn copies, takes the
         // shared lock across the spawn in `run_child`.
         unsafe { std::env::set_var(CONFIG_VAR, merged) };
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+        let d3d9 = call_factory(factory);
         match previous {
             // SAFETY: as above, still under the exclusive lock.
             Some(value) => unsafe { std::env::set_var(CONFIG_VAR, value) },
@@ -339,8 +500,25 @@ fn create_factory(entries: &str) -> *mut c_void {
         drop(exclusive);
         d3d9
     };
-    assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
+    assert!(!d3d9.is_null(), "the factory export returned null");
     d3d9
+}
+
+/// Call the factory export `factory` names; the caller holds the environment lock.
+///
+/// # Panics
+/// Panics if `d3d9.dll` does not export `Direct3DCreate9Ex` or it fails.
+fn call_factory(factory: Factory) -> *mut c_void {
+    if factory == Factory::Plain {
+        // SAFETY: Win32-style factory entrypoint with no preconditions.
+        return unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+    }
+    let create_ex = direct3d_create9_ex().expect("d3d9.dll exports Direct3DCreate9Ex");
+    let mut out: *mut c_void = core::ptr::null_mut();
+    // SAFETY: factory entrypoint with a writable out slot.
+    let hr = unsafe { create_ex(D3DSDK_VERSION, &raw mut out) };
+    assert_eq!(hr, 0, "Direct3DCreate9Ex failed: 0x{hr:08X}");
+    out
 }
 
 impl Harness {
@@ -409,7 +587,21 @@ impl Harness {
     /// Panics if the factory cannot be created.
     #[must_use]
     pub fn factory_only_with_config(entries: &str) -> Self {
-        let d3d9 = create_factory(entries);
+        Self::factory_only_from(entries, Factory::Plain)
+    }
+
+    /// A factory only, made by `Direct3DCreate9Ex`: an `IDirect3D9Ex` and no device.
+    ///
+    /// # Panics
+    /// Panics if `Direct3DCreate9Ex` fails.
+    #[must_use]
+    pub fn factory_only_extended() -> Self {
+        Self::factory_only_from("", Factory::Extended)
+    }
+
+    fn factory_only_from(entries: &str, factory: Factory) -> Self {
+        win32::install_failure_exit_hook();
+        let d3d9 = create_factory(entries, factory);
         Self {
             d3d9,
             device: core::ptr::null_mut(),
@@ -423,6 +615,7 @@ impl Harness {
             present_flags: 0,
             multi_sample_type: 0,
             config_entries: entries.to_owned(),
+            factory,
         }
     }
 
@@ -448,7 +641,7 @@ impl Harness {
     #[must_use]
     pub fn create(cfg: &HarnessConfig) -> Self {
         win32::install_failure_exit_hook();
-        let d3d9 = create_factory(cfg.config_entries);
+        let d3d9 = create_factory(cfg.config_entries, cfg.factory);
         let mut state = HarnessState::empty();
         if cfg.windowed == 0 {
             take_display_mode();
@@ -466,20 +659,28 @@ impl Harness {
 
         let mut pp = present_params(cfg, hwnd);
         let mut device: *mut c_void = core::ptr::null_mut();
-        // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
-        // `&mut device` are writable, focus window null is permitted.
-        let vtbl = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d9) };
-        // SAFETY: D3D9 vtable thunk; all pointers above are valid for the call.
-        let hr = unsafe {
-            (vtbl.create_device)(
-                d3d9,
-                0,
-                D3DDEVTYPE_HAL,
-                core::ptr::null_mut(),
-                cfg.behavior_flags,
-                (&raw mut pp).cast::<c_void>(),
-                &raw mut device,
-            )
+        let hr = if cfg.factory == Factory::ExtendedDeviceEx {
+            // SAFETY: `d3d9` came from `Direct3DCreate9Ex` and `device` is a
+            // writable local.
+            unsafe {
+                extended::create_device_ex(d3d9, cfg.behavior_flags, &mut pp, &raw mut device)
+            }
+        } else {
+            // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
+            // `&mut device` are writable, focus window null is permitted.
+            let vtbl = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d9) };
+            // SAFETY: D3D9 vtable thunk; all pointers above are valid for the call.
+            unsafe {
+                (vtbl.create_device)(
+                    d3d9,
+                    0,
+                    D3DDEVTYPE_HAL,
+                    core::ptr::null_mut(),
+                    cfg.behavior_flags,
+                    (&raw mut pp).cast::<c_void>(),
+                    &raw mut device,
+                )
+            }
         };
         assert_eq!(hr, 0, "CreateDevice failed: 0x{hr:08X}");
         assert!(!device.is_null(), "CreateDevice returned null device");
@@ -497,6 +698,7 @@ impl Harness {
             present_flags: cfg.present_flags,
             multi_sample_type: cfg.multi_sample_type,
             config_entries: cfg.config_entries.to_owned(),
+            factory: cfg.factory,
         }
     }
 
@@ -1702,6 +1904,56 @@ impl Harness {
         (hr, texture)
     }
 
+    /// `CreateVertexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_vertex_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        fvf: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_buffer)(
+                self.device,
+                length,
+                usage,
+                fvf,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateIndexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_index_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_index_buffer)(
+                self.device,
+                length,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
     /// `CreateVertexBuffer`, asserting success.
     ///
     /// # Panics
@@ -2800,8 +3052,18 @@ impl Harness {
     /// # Panics
     /// Panics if `CreateAdditionalSwapChain` fails.
     pub fn additional_swapchain_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> SwapChain<'_> {
+        let (hr, chain) = self.try_additional_swapchain(pp);
+        expect_ok(hr, "CreateAdditionalSwapChain");
+        chain.expect("a created swap chain")
+    }
+
+    /// `CreateAdditionalSwapChain` with `pp`: the hr, and the chain when one was made.
+    pub fn try_additional_swapchain(
+        &self,
+        pp: &mut D3DPRESENT_PARAMETERS,
+    ) -> (i32, Option<SwapChain<'_>>) {
         let mut chain = core::ptr::null_mut();
-        // SAFETY: live device, valid presentation parameters and writable output.
+        // SAFETY: live device, readable presentation parameters and writable output.
         let hr = unsafe {
             (self.dev_vtbl().create_additional_swap_chain)(
                 self.device,
@@ -2809,9 +3071,33 @@ impl Harness {
                 &raw mut chain,
             )
         };
-        expect_ok(hr, "CreateAdditionalSwapChain");
+        if hr != D3D_OK || chain.is_null() {
+            return (hr, None);
+        }
         // SAFETY: successful creation returned one owned reference, tied to self.
-        unsafe { SwapChain::from_raw(chain) }
+        (hr, Some(unsafe { SwapChain::from_raw(chain) }))
+    }
+
+    /// `CreateAdditionalSwapChain` with a window-sized request and a null `ppSwapChain`.
+    ///
+    /// Returns the hr: a call that has nowhere to hand the chain must make none.
+    #[must_use]
+    pub fn additional_swapchain_null_output_hr(&self) -> i32 {
+        let cfg = HarnessConfig {
+            width: self.width.get(),
+            height: self.height.get(),
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        // SAFETY: live device and valid presentation parameters; the output
+        // is deliberately null, which the call has to refuse before writing.
+        unsafe {
+            (self.dev_vtbl().create_additional_swap_chain)(
+                self.device,
+                core::ptr::from_mut(&mut pp).cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        }
     }
 
     /// `CreateOffscreenPlainSurface` returning the raw hr, for the rejection paths.
@@ -3166,6 +3452,65 @@ impl Harness {
                 check_format,
             )
         }
+    }
+
+    /// `IDirect3D9::CheckDepthStencilMatch`.
+    pub fn check_depth_stencil_match(
+        &self,
+        adapter_format: u32,
+        render_target_format: u32,
+        depth_stencil_format: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_depth_stencil_match)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                adapter_format,
+                render_target_format,
+                depth_stencil_format,
+            )
+        }
+    }
+
+    /// `IDirect3D9::CreateDevice` on this factory, into a hidden window of its own.
+    ///
+    /// For the creation answers themselves: `pp` goes to the call as given,
+    /// with its device window replaced by the new window, and is read back
+    /// resolved. A device the call creates is released at once, and the
+    /// window is destroyed after it. Returns the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
+        let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
+        let hwnd =
+            win32::create_styled_window(width, height, false, &win32::WindowStyle::Borderless);
+        pp.device_window = hwnd;
+        let mut device: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device` are
+        // writable for the call and a null focus window is permitted.
+        let hr = unsafe {
+            (self.factory_vtbl().create_device)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                core::ptr::null_mut(),
+                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                core::ptr::from_mut(pp).cast::<c_void>(),
+                &raw mut device,
+            )
+        };
+        if !device.is_null() {
+            // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
+            let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+            // SAFETY: vtable thunk; `device` is live and released exactly once.
+            unsafe { (vtbl.release)(device) };
+        }
+        win32::destroy_window(hwnd);
+        hr
     }
 
     /// `IDirect3D9::CheckDeviceFormatConversion`.

@@ -8,18 +8,25 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPRESENT_PARAMETERS,
-    D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
-    IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
-    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DSwapChain9Vtbl,
-    IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl,
-    IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    D3D_OK, D3DBOX, D3DDISPLAYMODEEX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT,
+    D3DPRESENT_PARAMETERS, D3DPRESENTSTATS, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC,
+    Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl,
+    IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl,
+    IDirect3DSwapChain9ExVtbl, IDirect3DSwapChain9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DSWAPCHAIN9EX,
 };
 
 use crate::{
     check::{expect_created, expect_ok},
     vtbl::deref_vtbl,
 };
+
+/// The byte a guarded `GetPresentStats` buffer starts filled with.
+pub const PRESENT_STATS_GUARD: u8 = 0xAA;
+
+/// The bytes a guarded `GetPresentStats` buffer holds, more than any `D3DPRESENTSTATS` layout.
+pub const PRESENT_STATS_PROBE_BYTES: usize = 40;
 
 #[repr(C)]
 struct IUnknownHeadVtbl {
@@ -151,6 +158,108 @@ impl SwapChain<'_> {
     pub fn front_buffer_data_null_this(&self, dst: &Surface<'_>) -> i32 {
         // SAFETY: the thunk accepts null this as a rejected API call; dst is live.
         unsafe { (self.vtbl().get_front_buffer_data)(core::ptr::null_mut(), dst.as_ptr()) }
+    }
+
+    /// `QueryInterface` for `iid`: the hr and whether it handed back this swap chain.
+    ///
+    /// The reference a successful query takes is released again.
+    #[must_use]
+    pub fn query_interface(&self, iid: &Guid) -> (i32, bool) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: live swapchain; `iid` and `out` are valid for the call.
+        let hr = unsafe { (self.vtbl().query_interface)(self.ptr, iid, &raw mut out) };
+        if out.is_null() {
+            return (hr, false);
+        }
+        let same = out == self.ptr;
+        // SAFETY: releases the reference the query handed out; the wrapper's own keeps it live.
+        unsafe { (self.vtbl().release)(out) };
+        (hr, same)
+    }
+
+    /// The swap chain's `IDirect3DSwapChain9Ex` table.
+    ///
+    /// # Panics
+    /// Panics unless the swap chain answers `IID_IDirect3DSwapChain9Ex` as
+    /// itself, which only an extended device's swap chain does.
+    fn ex_vtbl(&self) -> &'static IDirect3DSwapChain9ExVtbl {
+        assert_eq!(
+            self.query_interface(&IID_IDIRECT3DSWAPCHAIN9EX),
+            (D3D_OK, true),
+            "the extended swap chain calls need an extended swap chain"
+        );
+        // SAFETY: checked above: the object answers `IID_IDirect3DSwapChain9Ex`
+        // as itself, so its vtable is the extended one.
+        unsafe { deref_vtbl::<IDirect3DSwapChain9ExVtbl>(self.ptr) }
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetLastPresentCount`: hr and the count written.
+    #[must_use]
+    pub fn last_present_count(&self) -> (i32, u32) {
+        let mut count = u32::MAX;
+        // SAFETY: extended vtable thunk; `count` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_last_present_count)(self.ptr, &raw mut count) };
+        (hr, count)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats`: hr and the statistics written.
+    #[must_use]
+    pub fn present_stats(&self) -> (i32, D3DPRESENTSTATS) {
+        let mut stats = D3DPRESENTSTATS {
+            present_count: u32::MAX,
+            present_refresh_count: u32::MAX,
+            sync_refresh_count: u32::MAX,
+            pad: [u32::MAX; mtld3d_types::D3DPRESENTSTATS_PAD_WORDS],
+            sync_qpc_time: [u32::MAX; 2],
+            sync_gpu_time: [u32::MAX; 2],
+        };
+        // SAFETY: extended vtable thunk; `stats` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_present_stats)(self.ptr, &raw mut stats) };
+        (hr, stats)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats` into a guarded buffer: hr and every byte of it.
+    ///
+    /// The buffer is wider than any layout of `D3DPRESENTSTATS` and starts
+    /// filled with [`PRESENT_STATS_GUARD`], so the bytes show both what the
+    /// call wrote and whether it wrote past the caller's struct.
+    #[must_use]
+    pub fn present_stats_guarded(&self) -> (i32, [u8; PRESENT_STATS_PROBE_BYTES]) {
+        let mut buffer = GuardedPresentStats {
+            bytes: [PRESENT_STATS_GUARD; PRESENT_STATS_PROBE_BYTES],
+        };
+        // SAFETY: extended vtable thunk; `buffer` is writable for more bytes
+        // than any `D3DPRESENTSTATS` layout and aligned for one.
+        let hr = unsafe {
+            (self.ex_vtbl().get_present_stats)(
+                self.ptr,
+                (&raw mut buffer).cast::<D3DPRESENTSTATS>(),
+            )
+        };
+        (hr, buffer.bytes)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetDisplayModeEx` with `mode.Size = size`.
+    #[must_use]
+    pub fn display_mode_ex(&self, size: u32) -> (i32, D3DDISPLAYMODEEX, u32) {
+        let mut mode = D3DDISPLAYMODEEX {
+            size,
+            width: 0,
+            height: 0,
+            refresh_rate: 0,
+            format: 0,
+            scan_line_ordering: 0,
+        };
+        let mut rotation = 0u32;
+        // SAFETY: extended vtable thunk; `mode` and `rotation` are writable.
+        let hr = unsafe {
+            (self.ex_vtbl().get_display_mode_ex)(
+                self.ptr,
+                (&raw mut mode).cast::<c_void>(),
+                &raw mut rotation,
+            )
+        };
+        (hr, mode, rotation)
     }
 }
 
@@ -1101,6 +1210,16 @@ impl CubeTexture<'_> {
         }
     }
 
+    /// `UnlockRect` of one cube face and mip level, returning the hr.
+    ///
+    /// For a lock taken through another object that maps the same
+    /// subresource, such as the face's own surface.
+    #[must_use]
+    pub fn unlock_rect(&self, face: u32, level: u32) -> i32 {
+        // SAFETY: live cube texture; face and level are forwarded as given.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, face, level) }
+    }
+
     /// Get a parent-backed face surface.
     ///
     /// # Panics
@@ -1322,6 +1441,17 @@ impl Surface<'_> {
         (hr, out)
     }
 
+    /// `ReleaseDC` on this surface with the `HDC` another surface's `GetDC` returned.
+    ///
+    /// Returns the hr. The guard keeps its DC: a refused call leaves it held
+    /// for its own surface's `ReleaseDC`.
+    #[must_use]
+    pub fn release_dc_of(&self, dc: &SurfaceDc<'_>) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and the handle is one a
+        // live guard holds, passed through for the implementation to check.
+        unsafe { (self.vtbl().release_dc)(self.ptr, dc.hdc) }
+    }
+
     /// `GetDC`, asserting success and returning a guard over the memory DC.
     ///
     /// The guard reads and writes pixels through GDI and releases the DC on
@@ -1371,6 +1501,34 @@ impl Surface<'_> {
     pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the surface dies; for an implicit surface that is the
+    /// device's destruction.
+    ///
+    /// # Safety
+    /// `punk` is a live COM object that stays live until the runtime releases
+    /// the reference it takes here.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub unsafe fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, live per the contract above.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
     }
 }
 
@@ -2295,4 +2453,10 @@ const fn zeroed_surface_desc() -> D3DSURFACE_DESC {
         width: 0,
         height: 0,
     }
+}
+
+/// A `GetPresentStats` destination with room past the struct, aligned as the struct is.
+#[repr(C, align(8))]
+struct GuardedPresentStats {
+    bytes: [u8; PRESENT_STATS_PROBE_BYTES],
 }

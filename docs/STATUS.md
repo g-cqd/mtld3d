@@ -123,6 +123,30 @@ unimplemented. Earlier Direct3D and DirectDraw APIs remain future work.
   per-device lock, and a device created without the flag pays nothing.
 - Several devices alive at once, each on its own window, each owning its
   display state on the unix side.
+- D3D9Ex. `Direct3DCreate9Ex` hands out an `IDirect3D9Ex`, and every device
+  it creates, through `CreateDeviceEx` or the base `CreateDevice`, is an
+  `IDirect3DDevice9Ex` whose swap chain is an `IDirect3DSwapChain9Ex`. An
+  extended device refuses `D3DPOOL_MANAGED`, takes a `pSharedHandle` on a
+  single-level system-memory texture or offscreen plain surface as user
+  memory, reports `WHQLLevel` 1 and a `GetAvailableTextureMem` that does not
+  shrink, and accepts the FLIPEX and OVERLAY swap effects and up to 30 back
+  buffers: they pass validation, and the device presents through one back
+  buffer as it does for the other swap effects. Its `Reset` and `ResetEx`
+  keep the device state, the default-pool resources and an open scene,
+  rebind only the targets and the viewport extent, leave a back buffer or
+  depth surface the application holds on the old surface, and change nothing
+  when they refuse a request. `StretchRect` copies between two whole
+  default-pool surfaces of one format and size, and `SetPriority` takes the
+  default pool. The adapter reports its modes, its display mode and its LUID
+  through the extended calls. `ComposeRects`, `WaitForVBlank`,
+  `CheckResourceResidency`, the GPU thread priority pair,
+  `GetLastPresentCount` and `GetPresentStats` succeed without doing
+  anything, each logged once, `GetPresentStats` filling the 28 bytes the
+  structure has in a 32-bit process and the 32 it has in a 64-bit one, and
+  `SetConvolutionMonoKernel` answers `D3DERR_INVALIDCALL`. Both kinds of
+  device take `D3DPOOL_MANAGED_EX` (pool 6) as `D3DPOOL_MANAGED`, and an
+  extended device, which refuses `D3DPOOL_MANAGED`, accepts it; such a
+  resource reports `D3DPOOL_MANAGED`.
 
 ## Not implemented yet
 
@@ -143,17 +167,38 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
-- Additional swap chains with a window of their own: an additional chain
-  owns its back buffer, but the device has one window and one drawable, so
-  its `Present` shows that back buffer in the device window, and a title
-  that presents a second chain into another window sees it in the first.
+- Additional swap chains with a window of their own:
+  `CreateAdditionalSwapChain` checks the swap effect, the back-buffer count
+  and the presentation interval as `CreateDevice` and `Reset` do, for the
+  kind of device it is called on. An additional chain owns its back buffer,
+  but the device has one window and one drawable, so its `Present` shows
+  that back buffer in the device window, and a title that presents a second
+  chain into another window sees it in the first. Within any one swap chain,
+  the implicit one included, every back-buffer index hands back the same
+  surface object over one texture, so a `StretchRect` that stretches between
+  two of them is refused as a stretch inside one surface (see the kept
+  divergences below).
 - `Present` arguments: a source rect, a destination rect, a destination
   window override and a dirty region are accepted on
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
   each warned once; the whole back buffer is presented across the device
   window.
+- SM3 linkage limits. A `ps_3_0` links at most `MAX_LINKED_INPUTS` (eight)
+  input semantics outside the fixed-function varyings (NORMAL, TANGENT,
+  COLOR2 and the like); a ninth and later read zero, warned once. A
+  pretransformed (XYZRHW, POSITIONT) draw feeds a `ps_3_0` the declaration's
+  elements by semantic, at most eight of them besides the position, colours,
+  texture coordinates and point size, the rest reading zero, warned once.
+  Two of its inputs keep the fixed-function value instead, both unverified
+  against Windows: TEXCOORDn is the set stage n's `D3DTSS_TEXCOORDINDEX`
+  routes, which is the declaration's TEXCOORDn unless the index was changed,
+  and FOG reads the specular alpha while fog is enabled with both fog modes
+  NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- The fixed-function texture operation `D3DTOP_PREMODULATE`: absent from
+  `TextureOpCaps`, and a stage that names it is warned once and runs as
+  `D3DTOP_SELECTARG1`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
   `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
   `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
@@ -178,21 +223,18 @@ unless its entry says otherwise.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
-- D3D9Ex: `Direct3DCreate9Ex` resolves and answers `D3DERR_NOTAVAILABLE`, so
-  a runtime probe sees a d3d9 without 9Ex rather than a broken DLL. There is
-  no `IDirect3D9Ex` and no `IDirect3DDevice9Ex`, every create rejects a
-  non-null `pSharedHandle` with `E_NOTIMPL`, and `Caps2` leaves
-  `CANSHARERESOURCE` off. 9Ex is the same device created with an extended
-  flag rather than a separate contract: the flag refuses `D3DPOOL_MANAGED`,
-  changes which pools a caller may lock, reports `WHQLLevel` 1 on the adapter
-  identifier, and puts the extended entry points on the objects that already
-  exist, `CreateDeviceEx`, `PresentEx`, `ResetEx`, `CheckDeviceState`,
-  `GetDisplayModeEx`, `ComposeRects`, the frame-latency pair, the SYSTEMMEM
-  user-memory create that the same `pSharedHandle` parameter carries, and
-  shared resources. It is wanted eventually and waits for a title that needs
-  it: both World of Warcraft targets create a plain device, and nothing else
-  in the tested set asks for 9Ex. Issue #789 is the record of the decision
-  and of what an implementation would cover.
+- D3D9Ex shared resources: a `pSharedHandle` on a default-pool create of an
+  extended device answers `D3DERR_NOTAVAILABLE`, and `Caps2` leaves
+  `CANSHARERESOURCE` off. The `D3DFMT_D32_LOCKABLE` and `D3DFMT_S8_LOCKABLE`
+  depth formats are refused on extended devices as on plain ones, as DXVK
+  refuses both on every device.
+- SM3 relative addressing of anything but the float constants: an input
+  read through the loop counter (`v[aL]` in `ps_3_0` and `vs_3_0`) and a
+  `vs_3_0` output written through it (`o[aL]`). A shader that writes
+  `o[aL]` fails `CreateVertexShader` with `D3DERR_INVALIDCALL`; one that
+  reads `v[aL]` is created, but its translation fails with a logged error
+  and its draws are left out, so this one does not fail cleanly. No known
+  title needs either.
 - A draw that samples the colour render target it is drawing into (a
   feedback loop) has no hazard handling, and nothing detects the bind, so
   this one does not fail cleanly. Metal leaves the result undefined, and an
@@ -219,12 +261,30 @@ unless its entry says otherwise.
   could not grow latches `E_OUTOFMEMORY` instead. Every later call that
   reports device state, `TestCooperativeLevel` and `Reset` included,
   returns the latched code until the device is released, and the log names
-  the step that failed first. There is no recovery short of creating a new
-  device.
+  the step that failed first. A failed device drops its open frame at each
+  `Present`, and its final `Release` destroys the render targets and depth
+  surfaces released after the failure. There is no recovery short of
+  creating a new device. An extended device keeps the same latch with the
+  answers D3D9Ex documents: `TestCooperativeLevel` answers `D3D_OK` whatever
+  the latch holds, while `Present`, `PresentEx`, the swap chain's `Present`,
+  `CheckDeviceState`, `Reset` and `ResetEx` return the latched code, with
+  `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, the out-of-memory
+  code `PresentEx` and `CheckDeviceState` document, and neither reset clears
+  it. A `Reset` the layer could not complete, which leaves a plain device
+  answering `D3DERR_DEVICENOTRESET` from `TestCooperativeLevel`, shows on an
+  extended device only as that code from `Present`, `PresentEx` and the swap
+  chain's `Present`; `CheckDeviceState` does not report it.
+  `D3DERR_DEVICEREMOVED`, which tells a D3D9Ex application to create a new
+  device, is not used: one latch serves both kinds of device, and an
+  extended device keeps the code a plain one reports, `D3DERR_DEVICELOST`,
+  which `CheckDeviceState` documents as a lost device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,
   palettized textures. Accepted or rejected per spec, non-functional.
+- The depth formats `D15S1` and `D24X4S4`, whose one- and four-bit stencil no
+  Metal format has: answered `D3DERR_NOTAVAILABLE` and refused by every
+  create, as the reference implementations do.
 
 ## Kept divergences
 
@@ -234,6 +294,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 
 - `LockRect` serves a level of a non-dynamic DEFAULT-pool 2D texture, which
   D3D9 rejects. No knob.
+- Under a `render.scale` below one, the last reported mip levels of a
+  render-target or depth texture at the back-buffer size can share one rasterized
+  level, so a write into one is seen by the others. No knob.
 - `GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once
   instead of waiting for the GPU. `query.flushImmediate`, off by default.
 - EVENT query polls queue the open frame even without `D3DGETDATA_FLUSH`,
@@ -265,7 +328,35 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - The window procedure carrying cursor realization and the windowed
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
+- A rejected `Reset` leaves render target 0 on the back buffer and the
+  depth stencil on the implicit surface, as a successful one does, where
+  the reference implementations leave both unbound; what D3D9 itself
+  leaves there is not observable. No knob.
+- A texture whose Metal allocation is refused at an extent within the
+  reported limits still creates: its Metal texture is made on the encoder
+  thread after `CreateTexture`, `CreateCubeTexture` or `CreateVolumeTexture`
+  has returned `D3D_OK`, so the refusal is logged and the texture samples as
+  opaque black, where D3D9 answers the create with an out-of-memory error.
+  No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- A `D3DSAMP_BORDERCOLOR` other than transparent black, opaque black or
+  opaque white reads as opaque black under `D3DTADDRESS_BORDER`; D3D9
+  returns the colour the game set. No knob.
+- `ATI1` creates as a 2D texture in every pool and as an offscreen plain
+  surface in every pool a plain surface takes, while every format query
+  answers `D3DERR_NOTAVAILABLE` for it, and its lock reports the BC4 block
+  pitch rather than the pitch D3D9 reports for the format. No knob.
+- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and as
+  a depth-stencil texture, on a 32-bit float depth, while every depth query
+  answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth surface
+  fails, warned once. They are single-sampled; a multisampled swap chain
+  refuses them, as `CheckDeviceMultiSampleType` does. A standalone
+  depth-stencil surface in either format is refused, as before. No knob.
+- `CreateDevice` and `Reset` accept any back-buffer format and present a
+  BGRA8 back buffer for every one but A8R8G8B8 and X8R8G8B8, which
+  `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside
+  its back-buffer set and keeps a 16-bit one. `CheckDeviceType` offers that
+  set only. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes
@@ -286,3 +377,41 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and appears once the build lands; D3D9 draws every call in its frame.
   Building inline stalls the frame for the length of a Metal compile.
   `shader.asyncCompile`, on by default.
+- The fixed-function specular add clamps its sum to [0, 1] before fog
+  blends it, where both reference implementations fog the unclamped sum. No
+  knob.
+- An extended device copies a create's user memory into the level once:
+  `LockRect` then maps the layer's own copy at a 4-byte-aligned pitch, not
+  the application's memory at its packed pitch, and a later write to either
+  side does not reach the other. No knob.
+- An extended device's present and state checks never answer
+  `S_PRESENT_OCCLUDED` or `S_PRESENT_MODE_CHANGED`: no exclusive mode is
+  taken, and a present into a covered window already skips the drawable.
+  No knob.
+- `SetMaximumFrameLatency` is stored and reported but not enforced; the
+  encoder's queue bounds the frames in flight. No knob.
+- The `D3DPRESENT_*` flags of `PresentEx` and `IDirect3DSwapChain9::Present`
+  are logged and not honoured: `DONOTWAIT` waits and `FORCEIMMEDIATE`
+  follows the presentation interval. No knob.
+- `GetDisplayModeEx` always reports the identity rotation, and the display
+  mode `CreateDeviceEx` and `ResetEx` take is checked against the back
+  buffer but not used: a fullscreen device sets the mode its back buffer
+  names. No knob.
+- A windowed device on a maximized window gets a back buffer of the
+  window's client rect, not the size it asked for, on either kind of
+  device: the window manager sizes a maximized window, as it does a
+  fullscreen one. Wine's `d3d9ex.c` tests and a few `device.c` tests
+  maximize their windows, so the `device.c/test_scissor_size` sites and 26
+  of the `d3d9ex.c` sites read the window's size. No knob.
+- An extended device leaving fullscreen puts its window back at the rect it
+  had before the display mode was restored when anything but the window's
+  own procedure moved it during the restore, so a move the application makes
+  from another thread in that span is undone, where D3D9 keeps it. No knob.
+- `GetRenderTargetData` from an X render target into a system-memory
+  surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
+  A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,
+  where D3D9 reads it as one. No knob.
+- Every back-buffer index of a swap chain is one surface object over one
+  texture, so a write to one index shows in all of them, and a
+  `StretchRect` that stretches between two indices is refused where D3D9
+  copies it. No knob.

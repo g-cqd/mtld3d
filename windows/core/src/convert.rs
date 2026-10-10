@@ -8,17 +8,18 @@ use mtld3d_shared::{
     },
 };
 use mtld3d_types::{
-    D3DBLEND_BLENDFACTOR, D3DBLEND_DESTALPHA, D3DBLEND_DESTCOLOR, D3DBLEND_INVBLENDFACTOR,
-    D3DBLEND_INVDESTALPHA, D3DBLEND_INVDESTCOLOR, D3DBLEND_INVSRCALPHA, D3DBLEND_INVSRCCOLOR,
-    D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLEND_SRCALPHASAT, D3DBLEND_SRCCOLOR, D3DBLEND_ZERO,
-    D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN, D3DBLENDOP_REVSUBTRACT, D3DBLENDOP_SUBTRACT,
-    D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
-    D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE,
-    D3DDECL_END_STREAM, D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_DEC3N,
-    D3DDECLTYPE_FLOAT1, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4,
-    D3DDECLTYPE_FLOAT16_2, D3DDECLTYPE_FLOAT16_4, D3DDECLTYPE_SHORT2, D3DDECLTYPE_SHORT2N,
-    D3DDECLTYPE_SHORT4, D3DDECLTYPE_SHORT4N, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N,
-    D3DDECLTYPE_UDEC3, D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N, D3DDECLUSAGE_BLENDINDICES,
+    D3DBLEND_BLENDFACTOR, D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA,
+    D3DBLEND_DESTCOLOR, D3DBLEND_INVBLENDFACTOR, D3DBLEND_INVDESTALPHA, D3DBLEND_INVDESTCOLOR,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_INVSRCCOLOR, D3DBLEND_ONE, D3DBLEND_SRCALPHA,
+    D3DBLEND_SRCALPHASAT, D3DBLEND_SRCCOLOR, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX,
+    D3DBLENDOP_MIN, D3DBLENDOP_REVSUBTRACT, D3DBLENDOP_SUBTRACT, D3DCMP_ALWAYS, D3DCMP_EQUAL,
+    D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER,
+    D3DCMP_NOTEQUAL, D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DDECL_END_STREAM,
+    D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_DEC3N, D3DDECLTYPE_FLOAT1,
+    D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4, D3DDECLTYPE_FLOAT16_2,
+    D3DDECLTYPE_FLOAT16_4, D3DDECLTYPE_SHORT2, D3DDECLTYPE_SHORT2N, D3DDECLTYPE_SHORT4,
+    D3DDECLTYPE_SHORT4N, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_UDEC3,
+    D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFILL_POINT,
     D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A1R5G5B5, D3DFMT_A2B10G10R10, D3DFMT_A2R10G10B10,
@@ -39,7 +40,10 @@ use mtld3d_types::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::dxso::{DeclUsage, ff_attr_index_for_semantic};
+use crate::dxso::{
+    DeclUsage, FF_PASSTHROUGH_ATTR_BASE, MAX_LINKED_INPUTS, decl_passthrough_code,
+    ff_attr_index_for_semantic,
+};
 
 /// `(usage, usage_index) → input register index` pulled from a parsed VS's `dcl_*` declarations.
 ///
@@ -378,8 +382,11 @@ pub fn d3d_to_metal_blend(d3d_blend: u32) -> BlendFactor {
         D3DBLEND_ONE => BlendFactor::One,
         D3DBLEND_SRCCOLOR => BlendFactor::SourceColor,
         D3DBLEND_INVSRCCOLOR => BlendFactor::OneMinusSourceColor,
-        D3DBLEND_SRCALPHA => BlendFactor::SourceAlpha,
-        D3DBLEND_INVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
+        // The `BOTH*` shorthands are source-only; `pipeline_state` resolves
+        // them as a source factor. Written as a destination factor, each
+        // reads as its source half.
+        D3DBLEND_SRCALPHA | D3DBLEND_BOTHSRCALPHA => BlendFactor::SourceAlpha,
+        D3DBLEND_INVSRCALPHA | D3DBLEND_BOTHINVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
         D3DBLEND_DESTALPHA => BlendFactor::DestinationAlpha,
         D3DBLEND_INVDESTALPHA => BlendFactor::OneMinusDestinationAlpha,
         D3DBLEND_DESTCOLOR => BlendFactor::DestinationColor,
@@ -463,6 +470,19 @@ pub fn d3d_depth_bias_to_clip(raw_d3d: u32, min_z: f32, max_z: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Convert D3D9's raw `D3DRS_SLOPESCALEDEPTHBIAS` into the slope factor Metal's depth bias takes.
+///
+/// D3D9 multiplies the factor by the depth slope per pixel of the size it
+/// reports. On a target `render.scale` rasterizes smaller, Metal measures the
+/// slope per render pixel, which is the reported slope divided by the
+/// scale, so the factor is multiplied by the scale (render pixels per
+/// reported pixel) to leave the offset D3D9 asked for. `scale_factor` is
+/// exactly `1.0` at the identity, so the default path is unchanged.
+#[must_use]
+pub fn d3d_slope_scale_to_metal(raw_d3d: u32, scale_factor: f32) -> f32 {
+    f32::from_bits(raw_d3d) * scale_factor
 }
 
 /// D3DCULL_* → Metal cull mode.
@@ -876,35 +896,36 @@ pub fn vertex_count(d3d_type: u32, primitive_count: u32) -> u32 {
 /// blends), and FF color inputs would need a compensating `.zyxw`
 /// swizzle.
 pub fn decl_type_to_metal_format(ty: u8) -> (VertexFormat, u32) {
-    match ty {
-        D3DDECLTYPE_FLOAT1 => (VertexFormat::Float, 4),
-        D3DDECLTYPE_FLOAT2 => (VertexFormat::Float2, 8),
-        D3DDECLTYPE_FLOAT3 => (VertexFormat::Float3, 12),
-        D3DDECLTYPE_FLOAT4 => (VertexFormat::Float4, 16),
-        D3DDECLTYPE_D3DCOLOR => (VertexFormat::UChar4NormalizedBgra, 4),
-        D3DDECLTYPE_UBYTE4 => (VertexFormat::UChar4, 4),
-        D3DDECLTYPE_SHORT2 => (VertexFormat::Short2, 4),
-        D3DDECLTYPE_SHORT4 => (VertexFormat::Short4, 8),
-        D3DDECLTYPE_UBYTE4N => (VertexFormat::UChar4Normalized, 4),
-        D3DDECLTYPE_SHORT2N => (VertexFormat::Short2Normalized, 4),
-        D3DDECLTYPE_SHORT4N => (VertexFormat::Short4Normalized, 8),
-        D3DDECLTYPE_USHORT2N => (VertexFormat::UShort2Normalized, 4),
-        D3DDECLTYPE_USHORT4N => (VertexFormat::UShort4Normalized, 8),
-        D3DDECLTYPE_FLOAT16_2 => (VertexFormat::Half2, 4),
-        D3DDECLTYPE_FLOAT16_4 => (VertexFormat::Half4, 8),
-        // Packed 10-10-10 formats have no direct Metal equivalent — mark
+    let format = match ty {
+        D3DDECLTYPE_FLOAT1 => VertexFormat::Float,
+        D3DDECLTYPE_FLOAT2 => VertexFormat::Float2,
+        D3DDECLTYPE_FLOAT3 => VertexFormat::Float3,
+        D3DDECLTYPE_FLOAT4 => VertexFormat::Float4,
+        D3DDECLTYPE_D3DCOLOR => VertexFormat::UChar4NormalizedBgra,
+        D3DDECLTYPE_UBYTE4 => VertexFormat::UChar4,
+        D3DDECLTYPE_SHORT2 => VertexFormat::Short2,
+        D3DDECLTYPE_SHORT4 => VertexFormat::Short4,
+        D3DDECLTYPE_UBYTE4N => VertexFormat::UChar4Normalized,
+        D3DDECLTYPE_SHORT2N => VertexFormat::Short2Normalized,
+        D3DDECLTYPE_SHORT4N => VertexFormat::Short4Normalized,
+        D3DDECLTYPE_USHORT2N => VertexFormat::UShort2Normalized,
+        D3DDECLTYPE_USHORT4N => VertexFormat::UShort4Normalized,
+        D3DDECLTYPE_FLOAT16_2 => VertexFormat::Half2,
+        D3DDECLTYPE_FLOAT16_4 => VertexFormat::Half4,
+        // Packed 10-10-10 formats have no direct Metal equivalent: mark
         // invalid and log at the caller. Uncommon in SM2 content.
         D3DDECLTYPE_UDEC3 | D3DDECLTYPE_DEC3N => {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "D3DDECLTYPE UDEC3/DEC3N has no Metal format — element dropped");
-            (VertexFormat::Invalid, 0)
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "D3DDECLTYPE UDEC3/DEC3N has no Metal format, element dropped");
+            VertexFormat::Invalid
         }
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "D3DDECLTYPE {other} unhandled — element dropped (no Metal format)"
+                "D3DDECLTYPE {other} unhandled, element dropped (no Metal format)"
             );
-            (VertexFormat::Invalid, 0)
+            VertexFormat::Invalid
         }
-    }
+    };
+    (format, format.byte_size())
 }
 
 /// Convert an FVF bitmask into an equivalent `D3DVERTEXELEMENT9[]` sequence.
@@ -1147,6 +1168,9 @@ pub struct FfVsLayout {
     pub declared_weights_count: u8,
 }
 
+// Small enough to pass and copy by value (CONVENTIONS, the 16-byte rule).
+const _: () = assert!(core::mem::size_of::<FfVsLayout>() <= 16);
+
 bitflags::bitflags! {
     /// Boolean predicates for `FfVsLayout`.
     ///
@@ -1167,13 +1191,8 @@ bitflags::bitflags! {
         /// Drives whether the FF VS emit needs the indexed-palette input
         /// attribute (slot 13).
         const DECLARED_INDICES = 1 << 4;
-        /// The vertex format came from `SetVertexDeclaration`, not `SetFVF`.
-        ///
-        /// A COLORVERTEX material source pointing at a vertex colour the
-        /// declaration omits reads 0 (FVF instead falls back to the material).
-        const USES_VERTEX_DECL = 1 << 5;
         /// Vertex declaration has a PSIZE element (per-vertex point size).
-        const HAS_PSIZE = 1 << 6;
+        const HAS_PSIZE = 1 << 5;
     }
 }
 
@@ -1182,11 +1201,6 @@ impl FfVsLayout {
     #[must_use]
     pub const fn has_normal(&self) -> bool {
         self.flags.contains(FfVsLayoutFlags::HAS_NORMAL)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn uses_vertex_decl(&self) -> bool {
-        self.flags.contains(FfVsLayoutFlags::USES_VERTEX_DECL)
     }
     #[inline]
     #[must_use]
@@ -1222,9 +1236,8 @@ impl FfVsLayout {
 /// Panics if `tex_coord_count` exceeds the `u8` range (clamped to ≤8 by the
 /// loop, so unreachable).
 #[must_use]
-pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: bool) -> FfVsLayout {
+pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9]) -> FfVsLayout {
     let mut flags = FfVsLayoutFlags::empty();
-    flags.set(FfVsLayoutFlags::USES_VERTEX_DECL, uses_decl);
     let mut max_texcoord_index: Option<u8> = None;
     let mut tex_coord_dims = [0u8; 8];
     let mut declared_weights_count = 0u8;
@@ -1280,6 +1293,51 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
     }
 }
 
+/// The elements a pre-transformed declaration passes to the pixel stage by semantic.
+///
+/// The `FfVsKey::passthrough` list (`dxso::decl_passthrough_code` gives
+/// its shape): each element whose semantic passes through, in declaration
+/// order, once per semantic, and empty for a declaration without an
+/// in-range POSITIONT element. An element `resolve_attrs` drops (a stream
+/// past the slot table, a type with no Metal format) is left out too, so the
+/// FF VS never declares an attribute the descriptor lacks. Past
+/// [`MAX_LINKED_INPUTS`] entries, which is what the varying budget leaves
+/// beside the fixed-function members, the rest read zero, warned once.
+#[must_use]
+pub fn rhw_passthrough(elements: &[D3DVERTEXELEMENT9]) -> [u8; MAX_LINKED_INPUTS] {
+    let mut passthrough = [0; MAX_LINKED_INPUTS];
+    let pretransformed = elements
+        .iter()
+        .any(|e| e.usage == D3DDECLUSAGE_POSITIONT && u32::from(e.stream) < MAX_STREAMS);
+    if !pretransformed {
+        return passthrough;
+    }
+    let mut len = 0;
+    for e in elements {
+        if u32::from(e.stream) >= MAX_STREAMS
+            || decl_type_to_metal_format(e.type_).0 == VertexFormat::Invalid
+        {
+            continue;
+        }
+        let Some(code) = decl_passthrough_code(e.usage, e.usage_index) else {
+            continue;
+        };
+        if passthrough[..len].contains(&code) {
+            continue;
+        }
+        if len == MAX_LINKED_INPUTS {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "FF vertex decl: pre-transformed layout passes more than {MAX_LINKED_INPUTS} \
+                 semantics to the pixel stage → the rest read zero"
+            );
+            break;
+        }
+        passthrough[len] = code;
+        len += 1;
+    }
+    passthrough
+}
+
 /// Whether a declaration contains an in-range pre-transformed position.
 ///
 /// Binding needs only this flag. Scan every element so TEXCOORD diagnostics
@@ -1308,10 +1366,32 @@ pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
 /// Same as [`resolve_attrs_for_vs`] but uses the FF VS's attribute convention.
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
-/// declarations — its input layout is fixed.
+/// declarations, so its input layout is fixed, but for the elements a
+/// pre-transformed layout passes through: `passthrough` is the
+/// declaration's [`rhw_passthrough`] list, and its entry `k` reads attribute
+/// `FF_PASSTHROUGH_ATTR_BASE + k` instead of a fixed-function one.
+///
+/// A `D3DCOLOR` `BLENDINDICES` element is fetched as four unnormalized bytes
+/// in memory order, the order `D3DCOLORtoUBYTE4` gives a programmable shader,
+/// so each lane reaches the FF VS as its byte value rather than a normalized
+/// and swizzled colour channel. One a pre-transformed layout passes through
+/// keeps the normalized colour fetch its declared type names, as a `vs_3_0`
+/// input does, since the pixel shader reads it as data, not as an index.
 #[must_use]
-pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
-    resolve_attrs(elements, "FF", |e| {
+pub fn resolve_attrs_for_ff(
+    elements: &[D3DVERTEXELEMENT9],
+    passthrough: &[u8; MAX_LINKED_INPUTS],
+) -> ResolvedAttrs {
+    let blend_indices = ff_attr_index_for_semantic(D3DDECLUSAGE_BLENDINDICES, 0).map(u32::from);
+    let mut resolved = resolve_attrs(elements, "FF", |e| {
+        if passthrough[0] != 0
+            && let Some(code) = decl_passthrough_code(e.usage, e.usage_index)
+            && let Some((attr, _)) = (FF_PASSTHROUGH_ATTR_BASE..)
+                .zip(passthrough)
+                .find(|(_, entry)| **entry == code)
+        {
+            return Some(attr);
+        }
         let reg = ff_attr_index_for_semantic(e.usage, e.usage_index);
         if reg.is_none() {
             mtld3d_shared::log_once_warn_by!(
@@ -1323,7 +1403,15 @@ pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
             );
         }
         reg
-    })
+    });
+    for attr in &mut resolved.attrs {
+        if Some(attr.attr_index) == blend_indices
+            && attr.format == VertexFormat::UChar4NormalizedBgra
+        {
+            attr.format = VertexFormat::UChar4;
+        }
+    }
+    resolved
 }
 
 /// Convenience: hash a contiguous `&[D3DVERTEXELEMENT9]` for use as a pipeline-cache key.
@@ -1356,6 +1444,8 @@ pub struct PackedVertexDecl {
     /// Lets the draw path pick the streams to snapshot without walking the
     /// elements per draw. Streams past the slot table contribute no bit.
     pub stream_mask: u16,
+    /// [`rhw_passthrough`] of the elements, built once here rather than on every layout rebuild.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
 }
 
 /// Validate + pack the raw element slice a game passes to `CreateVertexDeclaration`.
@@ -1374,10 +1464,12 @@ pub fn pack_vertex_decl(elements: &[D3DVERTEXELEMENT9]) -> Option<PackedVertexDe
         .iter()
         .filter(|e| u32::from(e.stream) < MAX_STREAMS)
         .fold(0u16, |m, e| m | (1 << e.stream));
+    let passthrough = rhw_passthrough(&packed[..end_pos]);
     Some(PackedVertexDecl {
         elements_with_end: packed,
         hash,
         stream_mask,
+        passthrough,
     })
 }
 
@@ -1426,7 +1518,7 @@ const fn decl_usage_to_byte(u: crate::dxso::DeclUsage) -> u8 {
 /// Clamp the declaration's TEXCOORD extent and diagnose the largest invalid index.
 fn checked_tex_coord_count(max_texcoord_index: Option<u8>) -> u8 {
     // D3D9 spec caps TEXCOORD usage_index at 7 (D3DDP_MAXTEXCOORD = 8).
-    // FfVsKey's per-stage arrays (tci_modes, tci_coord_indices, tt_flags)
+    // FfVsKey's per-stage arrays (tci, tt_flags)
     // are sized [u8; 8]; a larger usage_index would index out of bounds on
     // the encoder thread. Clamp at the source and surface the offending raw
     // value once per distinct usage_index.

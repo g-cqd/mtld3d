@@ -7,7 +7,10 @@
 //! none, so their bytes are reachable only through `Lock`, `UpdateTexture` /
 //! `UpdateSurface`, and `GetRenderTargetData`.
 
-use mtld3d_types::{D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DUSAGE_DYNAMIC};
+use mtld3d_types::{
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_MANAGED_EX, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DUSAGE_DYNAMIC,
+};
 
 /// Whether a resource created in `pool` is system memory with no GPU allocation.
 ///
@@ -47,6 +50,53 @@ pub const fn is_runtime_managed(pool: u32) -> bool {
 #[must_use]
 pub const fn usage_conflicts_with_pool(usage: u32, pool: u32) -> bool {
     usage & D3DUSAGE_DYNAMIC != 0 && matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SCRATCH)
+}
+
+/// The pool a create that names `pool` makes its resource in.
+///
+/// `D3DPOOL_MANAGED_EX` is the managed pool under another value, on either
+/// kind of device; every other value is the pool it names. A create resolves
+/// its pool after [`refused_on_extended`] has seen the value the caller
+/// passed, since an extended device refuses `D3DPOOL_MANAGED` and takes
+/// `D3DPOOL_MANAGED_EX`.
+#[must_use]
+pub const fn resolve(pool: u32) -> u32 {
+    if pool == D3DPOOL_MANAGED_EX {
+        D3DPOOL_MANAGED
+    } else {
+        pool
+    }
+}
+
+/// Whether an extended device refuses a create in `pool`.
+///
+/// An extended device keeps its default-pool resources across `Reset`, so
+/// the copy the managed pool exists to restore is never needed, and a create
+/// that names `D3DPOOL_MANAGED` is `D3DERR_INVALIDCALL`. It still takes the
+/// managed pool under the value `D3DPOOL_MANAGED_EX`, which is not refused
+/// here. A plain device refuses nothing here.
+#[must_use]
+pub const fn refused_on_extended(pool: u32, extended: bool) -> bool {
+    extended && pool == D3DPOOL_MANAGED
+}
+
+/// Whether `SetPriority` stores a value for a resource in `pool`.
+///
+/// The priority orders what a memory manager evicts first. On a plain device
+/// that is the runtime's managed pool. An extended device lets the driver
+/// page its default-pool resources instead, so there the default pool takes
+/// the priority. Callers ask with the device's kind for a default-pool
+/// resource alone and with `extended` false otherwise, so a managed
+/// resource, which an extended device makes through `D3DPOOL_MANAGED_EX`,
+/// stores its priority on either kind of device. Every other pair keeps the
+/// priority at zero.
+#[must_use]
+pub const fn priority_settable(pool: u32, extended: bool) -> bool {
+    if extended {
+        pool == D3DPOOL_DEFAULT
+    } else {
+        pool == D3DPOOL_MANAGED
+    }
 }
 
 #[cfg(test)]

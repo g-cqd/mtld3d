@@ -285,6 +285,19 @@ const ENABLE_SKIP_DEAD_DRAWS: bool = true;
 /// join does not model.
 const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
 
+/// Compile-time gate for Rule K (`DontCare` under a first draw that covers render target 0).
+///
+/// A pass opened through [`PassState::open_pass_for_covering_draw`] starts
+/// with a draw its caller knows writes every pixel and sample of render target
+/// 0, the `StretchRect` render quad over a whole destination level, so
+/// nothing the pass would load survives that draw. The pass still opens with
+/// `Load`, and every other rule reasons over that `Load` as before; once they
+/// have run, a covered pass that still loads discards instead. Not a
+/// divergence: the load it removes is one no pixel of the result reads. Flip
+/// to `false` if a covering caller turns out to leave part of the attachment
+/// unwritten.
+const ENABLE_COVERED_COLOR_DONTCARE: bool = true;
+
 /// The blend factor, as a `D3DCOLOR`, that a fresh Metal render encoder blends with.
 ///
 /// A fresh encoder blends with (0, 0, 0, 0), not with D3D9's default opaque
@@ -919,17 +932,10 @@ pub struct Pass {
     ///
     /// See [`PassDepthFlags`] for the bits.
     depth_flags: PassDepthFlags,
-    /// Latched `true` as soon as any draw arrives at the pass with `D3DRS_COLORWRITEENABLE != 0`.
+    /// What the pass's draws did with render target 0.
     ///
-    /// Default `false` at pass-open. When the pass closes with this still
-    /// `false` AND at least one real (non-clear-quad) draw was emitted,
-    /// Rule H (`strip_color_from_no_color_draw_passes`) strips the color
-    /// attachment and rewrites the pass's `SetRenderPipelineState`
-    /// commands to bind the matching no-color pipeline variant —
-    /// eliminating Apple's "Unused Texture" warning on cascade caster
-    /// passes where every draw runs with color writes masked off but
-    /// the bound pipeline still declares a color output.
-    color_writes_observed: bool,
+    /// See [`PassColorFlags`] for the bits.
+    color_flags: PassColorFlags,
     /// `[start, end)` command-index ranges of color clear-quad blocks emitted into this pass.
     ///
     /// Recorded by `PassState::open_color_clear_quad_block` /
@@ -1100,7 +1106,9 @@ impl Pass {
         self.depth_flags |=
             next.depth_flags & (PassDepthFlags::USED | PassDepthFlags::STENCIL_WRITTEN);
         self.has_counting_visibility |= next.has_counting_visibility;
-        self.color_writes_observed |= next.color_writes_observed;
+        // Whether this pass's first draw covers render target 0 stays this
+        // pass's own: the joined draws run after it.
+        self.color_flags |= next.color_flags & PassColorFlags::WRITES_OBSERVED;
     }
     /// The per-pass half of [`PassState::resolve_pending_pipelines`].
     fn resolve_pending_pipelines(
@@ -1321,7 +1329,7 @@ impl Pass {
 
     #[must_use]
     pub const fn color_writes_observed(&self) -> bool {
-        self.color_writes_observed
+        self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
     }
 
     #[must_use]
@@ -1418,7 +1426,7 @@ bitflags::bitflags! {
         const DEPTH_SAMPLEABLE = 1 << 1;
         /// Set when the bound depth attachment's D3D format carries a stencil plane.
         ///
-        /// D24S8 / D24FS8 / D15S1 / D24X4S4 all map to the combined Metal
+        /// D24S8 / D24FS8 / INTZ all map to the combined Metal
         /// `Depth32Float_Stencil8` texture. The clear-quad pipelines must declare
         /// the matching depth/stencil attachment formats or Metal's
         /// pipeline-vs-render-pass validation rejects them (undefined behaviour /
@@ -1485,6 +1493,30 @@ bitflags::bitflags! {
         const USED = 1 << 2;
         /// A draw or clear-quad in the pass can write the stencil plane.
         const STENCIL_WRITTEN = 1 << 3;
+    }
+}
+
+bitflags::bitflags! {
+    /// What the draws of a pass did with its render target 0.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PassColorFlags: u8 {
+        /// A draw arrived at the pass with `D3DRS_COLORWRITEENABLE != 0`.
+        ///
+        /// Clear when the pass opens. When the pass closes with this still
+        /// clear AND at least one real (non-clear-quad) draw was emitted,
+        /// Rule H (`strip_color_from_no_color_draw_passes`) strips the color
+        /// attachment and rewrites the pass's `SetRenderPipelineState`
+        /// commands to bind the matching no-color pipeline variant,
+        /// eliminating Apple's "Unused Texture" warning on cascade caster
+        /// passes where every draw runs with color writes masked off but the
+        /// bound pipeline still declares a color output.
+        const WRITES_OBSERVED = 1 << 0;
+        /// The first draw of the pass writes every pixel and sample of render target 0.
+        ///
+        /// Set by [`PassState::open_pass_for_covering_draw`] on the pass it
+        /// opens, and read by Rule K. A pass joined onto another by Rule J
+        /// leaves it behind, since its draws then follow the other pass's.
+        const FIRST_DRAW_COVERS = 1 << 1;
     }
 }
 
@@ -3211,7 +3243,7 @@ impl PassState {
         if mask != 0
             && let Some(pass) = self.passes.last_mut()
         {
-            pass.color_writes_observed = true;
+            pass.color_flags.insert(PassColorFlags::WRITES_OBSERVED);
         }
     }
 
@@ -3497,8 +3529,41 @@ impl PassState {
     /// opening a pass is the out-of-line `open_pass`.
     #[inline]
     pub fn ensure_pass_open(&mut self) {
-        if self.current_pass_closed || self.passes.is_empty() {
+        if self.opens_pass() {
             self.open_pass();
+        }
+    }
+
+    /// Whether the next command opens a pass rather than joining the open one.
+    #[inline]
+    const fn opens_pass(&self) -> bool {
+        self.current_pass_closed || self.passes.is_empty()
+    }
+
+    /// Ensure a pass is live for a draw that writes every pixel and sample of render target 0.
+    ///
+    /// The caller vouches for the draw, which has to be the next one the pass
+    /// records. Only a pass this call opens is marked
+    /// `PassColorFlags::FIRST_DRAW_COVERS`: a pass already open has draws
+    /// of its own, and its load serves them. Nor is a pass with other colour
+    /// targets beside render target 0, which the draw does not write. The pass
+    /// opens with the load action any other opening gives it; Rule K
+    /// ([`Self::discard_covered_color_loads`]) acts on the mark once the other
+    /// rules have run.
+    pub fn open_pass_for_covering_draw(&mut self) {
+        let opens = self.opens_pass();
+        self.ensure_pass_open();
+        if opens
+            && let Some(pass) = self.passes.last_mut()
+            && !pass.color_texture.is_null()
+            && !pass.extra_color.iter().any(PassColorAttachment::is_bound)
+        {
+            debug_assert_eq!(
+                pass.viewport,
+                (0, 0, pass.color_size.0, pass.color_size.1),
+                "a draw that covers render target 0 runs under a viewport that covers it"
+            );
+            pass.color_flags.insert(PassColorFlags::FIRST_DRAW_COVERS);
         }
     }
 
@@ -3756,7 +3821,7 @@ impl PassState {
             leading_blits,
             has_counting_visibility: false,
             depth_flags: self.pass_depth_flags(),
-            color_writes_observed: false,
+            color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color,
         };
@@ -3911,7 +3976,7 @@ impl PassState {
             depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
-            color_writes_observed: true,
+            color_flags: PassColorFlags::WRITES_OBSERVED,
             color_clear_quad_ranges: Vec::new(),
             extra_color: [PassColorAttachment::NONE; 3],
         };
@@ -4110,7 +4175,7 @@ impl PassState {
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
             depth_flags: self.pass_depth_flags(),
-            color_writes_observed: false,
+            color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
         });
@@ -4322,14 +4387,16 @@ impl PassState {
         self.current_depth_size = size;
     }
 
-    /// Forget a depth texture whose storage is on its way to the retention queue.
+    /// Unbind a depth texture whose storage is on its way to the retention queue.
     ///
     /// Called when the standalone surface that owns the texture finalizes.
-    /// Every set keyed by a texture handle drops the entry, so a later Metal
-    /// texture handed back at the same address is not mistaken for this one:
-    /// the sampled and sampleable-depth sets outlive a frame by design, and
-    /// a stale member there would let the load/store rules keep a store or
-    /// classify a sample against storage that is gone.
+    /// Only the attachment goes here: the handle-keyed records stay until
+    /// [`Self::unregister_texture`] drops them at the retirement boundary,
+    /// since the passes this frame has built still name the texture and
+    /// their store actions are not final until submit. A depth `StretchRect`
+    /// out of the texture marked it read, and that mark is what keeps the
+    /// store of its last pass; dropping it here would discard the depth the
+    /// queued transfer reads.
     ///
     /// The unbind is the ordinary case rather than an error. A surface
     /// finalizes when the device drops the reference it holds while bound,
@@ -4340,19 +4407,9 @@ impl PassState {
     /// stencil clear materialising against the outgoing attachment, exactly
     /// as the replacement bind would have done.
     pub fn retire_depth_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
-        if texture.is_null() {
-            return;
-        }
-        if self.current_depth_texture == texture {
+        if !texture.is_null() && self.current_depth_texture == texture {
             self.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         }
-        self.seen_depth_rts.remove(&texture);
-        self.seen_sampleable_depth_textures.remove(&texture);
-        self.seen_sampled_textures.remove(&texture);
-        self.frame_sampled_textures.remove(&texture);
-        self.blit_written_rts.remove(&texture);
-        self.frame_caster_writes.remove(&texture);
-        self.frame_cascade_samples.remove(&texture);
     }
 
     /// Apply a whole-target colour clear.
@@ -4930,13 +4987,14 @@ impl PassState {
     ///
     /// Exposed so the encoder wrapper can dedup against the *resolved*
     /// rect — when scissor test is disabled, the rect falls back to the
-    /// current viewport, which can change mid-pass.
+    /// current viewport, which can change mid-pass. With the test on, an
+    /// empty rect stays empty and the draw writes no pixel.
     ///
     /// `rect` arrives in the game's coordinate space and comes back in the
     /// bound texture's, so the dedup upstream compares post-conversion rects.
     #[must_use]
     pub fn resolved_scissor_rect(&self, test_enable: bool, rect: [u32; 4]) -> (u32, u32, u32, u32) {
-        if test_enable && rect[2] != 0 && rect[3] != 0 {
+        if test_enable {
             self.target_extent()
                 .rect(rect[0], rect[1], rect[2], rect[3])
         } else {
@@ -5140,10 +5198,14 @@ impl PassState {
     /// `DontCare` load stored undefined contents anyway).
     ///
     /// If the side-map is missing an entry for a non-clear-quad `SetPSO`
-    /// inside a candidate pass, abort the strip for that pass (single
-    /// `log_once` warning) — means a zero-mask draw skipped the
-    /// dual-build path in `FrameEncoder::get_or_create_pipeline`, which
-    /// would be a correctness bug elsewhere.
+    /// inside a candidate pass, the strip is skipped for that pass (one
+    /// `log_once_info!` line per process). A miss is expected: the no-colour
+    /// twin builds asynchronously and nothing waits for it, so passes drawn
+    /// with a freshly built pipeline find no entry until the twin lands, and
+    /// a pipeline whose twin failed or that queues none never has one. The
+    /// pass keeps its colour attachment, its store actions and its
+    /// with-colour pipelines, so it renders as it would without Rule H; the
+    /// only cost is that pass's colour load and store bandwidth.
     ///
     /// Must run after `finalize_store_actions`, whose store decisions the
     /// clear-quad check reads, and after `strip_dead_color_in_clear_only_passes`
@@ -5158,7 +5220,7 @@ impl PassState {
             return;
         }
         for pass in &mut self.passes {
-            if pass.color_writes_observed
+            if pass.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
                 // Without the colour attachment the depth attachment alone
@@ -5205,8 +5267,8 @@ impl PassState {
                     || alt.contains_key(&c.param_b)
             });
             if !all_resolvable {
-                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                    "strip_color_from_no_color_draw_passes: side-map miss → keeping color attachment");
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "strip_color_from_no_color_draw_passes: a pipeline has no no-colour twin mapped → pass keeps its colour attachment");
                 continue;
             }
             // The mask-0 draws write no colour, so dropping the attachment
@@ -5350,8 +5412,9 @@ impl PassState {
     ///
     /// Only adjacent passes join, walked front to back so a run of them
     /// becomes one pass. The upload prefix is left alone: it is submitted in a
-    /// command buffer of its own. Runs last, after Rule F has taken out the
-    /// empty passes that would otherwise separate two joinable ones.
+    /// command buffer of its own. Runs after Rule F has taken out the empty
+    /// passes that would otherwise separate two joinable ones, and before
+    /// Rule K, so a pass that loads can still join the one before it.
     pub fn merge_adjacent_identical_passes(&mut self) {
         if !ENABLE_MERGE_ADJACENT_PASSES {
             return;
@@ -5390,6 +5453,38 @@ impl PassState {
             }
         }
         self.passes.truncate(write + 1);
+    }
+
+    /// Rule K: discard the load of render target 0 under a first draw that covers it.
+    ///
+    /// Acts on the passes [`Self::open_pass_for_covering_draw`] marked whose
+    /// render target 0 still loads. A `Clear` Rule E folded into such a pass
+    /// stays, since a clear load costs no more than a discard, and a pass
+    /// Rule J joined onto the one before it is no longer one of them. Runs
+    /// after every other rule, which therefore all reasoned over the `Load`:
+    /// a covered pass that discarded from the start would stop Rule E from
+    /// folding a clear into it and Rule J from joining it onto the pass before,
+    /// and Rule A's correction would put the load back whenever anything
+    /// samples the attachment, though no pixel of the result reads it.
+    pub fn discard_covered_color_loads(&mut self) {
+        if !ENABLE_COVERED_COLOR_DONTCARE {
+            return;
+        }
+        for pass in &mut self.passes {
+            if pass.color_flags.contains(PassColorFlags::FIRST_DRAW_COVERS)
+                && !pass.color_texture.is_null()
+                && matches!(pass.color_load, ColorLoad::Load)
+            {
+                pass.color_load = ColorLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load color={:#x} Load → DontCare (its first draw covers it)",
+                        pass.color_texture,
+                    );
+                }
+            }
+        }
     }
 
     /// Rule I: drop clear-only passes whose every cleared target is overwritten before a read.
@@ -7010,6 +7105,11 @@ pub struct LastBoundCache {
     /// changes, so the per-draw cost is a length-then-memcmp against
     /// `vs_draw::VS_DRAW_BYTES`.
     vs_draw: Vec<u8>,
+    /// VS LOD slot: the per-vertex-sampler explicit-LOD rows.
+    ///
+    /// Set only for a draw whose vertex shader samples a slot that needs its
+    /// row; `sampler_state::VS_LOD_BYTES`.
+    vs_lod: Vec<u8>,
     /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
     ps_alpha_ref: Vec<u8>,
     /// PS slot 13 — fog colour vec4, when fog is enabled.
@@ -7029,7 +7129,8 @@ pub struct LastBoundCache {
     ps_draw: Vec<u8>,
     /// Vertex stream slots 0..16 — bound `MTLBuffer` handle, byte offset, backing generation.
     ///
-    /// Indexed by D3D9 stream, which is the Metal vertex buffer slot.
+    /// Indexed by Metal vertex buffer slot: D3D9 stream `n` binds at slot `n`,
+    /// and a crossing attribute at a slot of its own (`streams::CrossingFetch`).
     /// `(0, _, _)` is the unset sentinel (Metal buffer handles are never
     /// zero). The generation is the backing allocation's identity behind the
     /// handle: a handle is a raw object address, and an address reused by a
@@ -7049,8 +7150,8 @@ pub struct LastBoundCache {
     blend_color: u32,
     /// The `setDepthBias` pair.
     ///
-    /// Only `D3DRS_SLOPESCALEDEPTHBIAS` (or the implicit decal slope) is
-    /// non-zero in practice: the constant `D3DRS_DEPTHBIAS` term reaches the
+    /// Only the application's `D3DRS_SLOPESCALEDEPTHBIAS` is non-zero in
+    /// practice: the constant `D3DRS_DEPTHBIAS` term reaches the
     /// vertex shader through `pos_fixup` instead. Stored as raw bits so the
     /// comparison is exact (no NaN ambiguity) and the slot has a
     /// definite "not yet bound" sentinel — `(0, 0)` matches Metal's
@@ -7073,6 +7174,7 @@ impl LastBoundCache {
             triangle_fill_mode: TriangleFillMode::Fill,
             vs_pos_fixup: Vec::new(),
             vs_draw: Vec::new(),
+            vs_lod: Vec::new(),
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
@@ -7103,6 +7205,7 @@ impl LastBoundCache {
         self.triangle_fill_mode = TriangleFillMode::Fill;
         self.vs_pos_fixup.clear();
         self.vs_draw.clear();
+        self.vs_lod.clear();
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
@@ -7305,6 +7408,12 @@ impl LastBoundCache {
     #[inline]
     pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_draw, bytes)
+    }
+
+    /// Record the vertex LOD table; true when it differs from the last bound.
+    #[inline]
+    pub fn vs_lod_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_lod, bytes)
     }
 
     #[inline]

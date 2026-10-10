@@ -6,9 +6,15 @@
 //! decode selector, and the CPU twins of the YUV decodes the blit fragment
 //! function runs.
 
-use mtld3d_types::{D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12};
+use mtld3d_types::{
+    D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_YV12,
+};
 
-use crate::{pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch};
+use crate::{
+    encoder_data::StretchSurfaceFlags, format::FormatMapping, pixel_convert::can_convert,
+    planar_yuv::planar_yuv_layout_from_pitch,
+};
 
 /// Parsed source / destination region for a `StretchRect`.
 ///
@@ -88,6 +94,12 @@ pub enum RejectReason {
     EmptyRect,
     /// A source or destination rect has an edge outside its surface.
     RectOutsideSurface,
+    /// The destination is neither a render target nor a default-pool offscreen plain.
+    DestinationClass,
+    /// An offscreen-plain destination with a source that is no offscreen plain.
+    SourceIntoOffscreenPlain,
+    /// Source and destination are one surface and the two rects differ in size.
+    SameSurfaceStretch,
 }
 
 impl RejectReason {
@@ -110,17 +122,70 @@ impl RejectReason {
             Self::PlanarDestination => "destination is a planar YUV surface (decode only)",
             Self::EmptyRect => "a source or destination rect is empty or inverted",
             Self::RectOutsideSurface => "a source or destination rect leaves its surface",
+            Self::DestinationClass => {
+                "the destination is neither a render target nor an offscreen-plain surface"
+            }
+            Self::SourceIntoOffscreenPlain => {
+                "an offscreen-plain destination takes only an offscreen-plain source"
+            }
+            Self::SameSurfaceStretch => "a stretch between two rects of one surface",
         }
     }
 }
 
+/// The surface-class rule a colour `StretchRect` pair breaks on a plain device, if any.
+///
+/// D3D9 copies, with or without a stretch, into a render target (a standalone
+/// one, the back buffer, or a level or face of a render-target texture) from
+/// any default-pool colour surface, and into a default-pool offscreen plain
+/// only from another offscreen plain. An ordinary texture level or cube face
+/// is never a destination. `None` means the classes allow the pair; pools,
+/// formats, rects and depth-stencil pairs are judged elsewhere.
+#[must_use]
+pub const fn class_reject(
+    src: StretchSurfaceFlags,
+    dst: StretchSurfaceFlags,
+) -> Option<RejectReason> {
+    if dst.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+        None
+    } else if !dst.contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT) {
+        Some(RejectReason::DestinationClass)
+    } else if src.contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT) {
+        None
+    } else {
+        Some(RejectReason::SourceIntoOffscreenPlain)
+    }
+}
+
+/// Whether an extended device accepts a `StretchRect` between surfaces of no eligible class.
+///
+/// A plain device copies only into a render target, or between two default-pool
+/// offscreen plains. An extended device also copies between any two
+/// default-pool surfaces, a texture level that is no render target included,
+/// as long as the call is a plain copy: no rects at all (a rect covering the
+/// whole surface does not count), one format, one size. `src` and `dst` are
+/// each surface's `(format, width, height)`.
+#[must_use]
+pub fn extended_whole_surface_copy(
+    extended: bool,
+    rects_given: bool,
+    src: (u32, u32, u32),
+    dst: (u32, u32, u32),
+) -> bool {
+    extended && !rects_given && src == dst
+}
+
 /// How a `StretchRect` whose two endpoints are one Metal texture is carried out.
 ///
-/// D3D9 performs a copy between two rectangles of the same surface; only an
-/// overlapping pair is undefined. Metal's blit encoder copies within a single
-/// texture as long as the two regions do not overlap, and the render quad
-/// cannot sample the texture it draws into at all, so the cases split three
-/// ways.
+/// D3D9 performs a 1:1 copy between two rectangles of the same surface and
+/// refuses a stretch there, which the API thread answers before it gets here.
+/// A size change still reaches this between two levels or two faces of one
+/// texture, between two surfaces that alias one texture, and between two
+/// equal rects of one surface that `render.scale` rounds to two extents.
+/// Metal's blit encoder
+/// copies within a single texture as long as the two regions do not overlap,
+/// and the render quad cannot sample the texture it draws into at all, so the
+/// cases split three ways.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SameSurfaceRoute {
     /// The two regions name the same texels, so the copy writes what is there.
@@ -217,8 +282,9 @@ pub const fn planar_stretch_route(
 /// pipeline per destination format serves every source format: mode 0 samples
 /// the source as-is, the packed modes fetch the 4:2:2 macropixel and the
 /// planar modes the luma texel and its 4:2:0 chroma sample, and all four YUV
-/// modes convert to RGB. The discriminants are the uniform's values; the MSL
-/// in `unix/unix/src/metal/blit.rs` matches on them.
+/// modes convert to RGB. The opaque-alpha mode samples as-is and replaces the
+/// alpha with one. The discriminants are the uniform's values; the MSL in
+/// `unix/unix/src/metal/blit.rs` matches on them.
 #[repr(u32)]
 pub enum BlitDecode {
     /// Sample the source texture as-is (any RGB format).
@@ -231,6 +297,8 @@ pub enum BlitDecode {
     Yv12 = 3,
     /// `D3DFMT_NV12`: luma rows, one interleaved U, V plane, backed by one R8 texture.
     Nv12 = 4,
+    /// An X format: sample as-is, alpha one, since its padding bits carry no alpha.
+    OpaqueAlpha = 5,
 }
 
 impl BlitDecode {
@@ -243,6 +311,7 @@ impl BlitDecode {
             Self::Uyvy => 2.0,
             Self::Yv12 => 3.0,
             Self::Nv12 => 4.0,
+            Self::OpaqueAlpha => 5.0,
         }
     }
 }
@@ -255,8 +324,36 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
         D3DFMT_UYVY => BlitDecode::Uyvy,
         D3DFMT_YV12 => BlitDecode::Yv12,
         D3DFMT_NV12 => BlitDecode::Nv12,
+        D3DFMT_X8R8G8B8 | D3DFMT_X8B8G8R8 | D3DFMT_X1R5G5B5 => BlitDecode::OpaqueAlpha,
         _ => BlitDecode::None,
     }
+}
+
+/// Whether a copy of the bytes would hand a source's padding to the destination as alpha.
+///
+/// Takes the mappings the two textures were created with on this device. A
+/// source without alpha whose storage still has an alpha lane (an X format,
+/// or a format widened to BGRA8) leaves undefined padding or a forced value
+/// in it, and D3D9 reads such a surface's alpha as one, so a destination that
+/// does carry alpha has to receive alpha one rather than those bits. The other
+/// direction is a byte copy, since every reader of a destination without alpha
+/// already ignores the alpha an A source leaves in it.
+#[must_use]
+pub const fn exposes_padding_as_alpha(src: &FormatMapping, dst: &FormatMapping) -> bool {
+    !src.has_alpha() && dst.has_alpha()
+}
+
+/// Whether the render quad into `rect` writes every pixel of a destination level of `size`.
+///
+/// Both are in the destination texture's own space. The quad is drawn under
+/// a viewport and a scissor equal to `rect`, with no blending and every
+/// colour channel enabled, and its one triangle covers the whole viewport,
+/// so it writes every sample of every pixel inside `rect`. A rect that starts
+/// at the origin and spans the level therefore leaves nothing of the previous
+/// contents for its pass to load.
+#[must_use]
+pub const fn quad_covers_destination(rect: StretchRegion, size: (u32, u32)) -> bool {
+    rect.x == 0 && rect.y == 0 && rect.w == size.0 && rect.h == size.1
 }
 
 /// Whether `d3d_format` is one of the two packed 4:2:2 YUV formats.

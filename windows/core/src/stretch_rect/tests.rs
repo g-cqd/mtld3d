@@ -6,11 +6,24 @@
 //! separate check keeps every `RejectReason` key distinct, which is what makes the
 //! once-per-reason warn fire once per reason rather than collapsing to a single line.
 //!
+//! `class_reject` is pinned against the D3D9 surface-class matrix: every colour class
+//! into a render target, an offscreen plain only into an offscreen plain or a render
+//! target, and nothing into an ordinary texture level or cube face, each refusal naming
+//! the rule it breaks.
+//!
 //! `same_surface_route` is pinned against the four shapes a within-one-surface copy
 //! takes: disjoint rects that the blit encoder can copy in place, overlapping rects and
 //! scaled rects that have to stage through a scratch texture, and an identical pair that
 //! writes each texel its own value. Two cube faces of one texture are disjoint whatever
 //! their rects say, so the face pair is pinned alongside the mip pair.
+//!
+//! An X source selects the opaque-alpha decode, and only a source without alpha into a
+//! destination with alpha is a pair whose byte copy would hand the padding over as alpha,
+//! on a device with the packed 16-bit formats and on one that widens them.
+//!
+//! The render quad covers its destination only when the rect starts at the origin and
+//! spans the level on both axes; a shorter rect, one moved off the origin and a level of
+//! another size each leave pixels the pass has to load.
 //!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
@@ -25,6 +38,8 @@
 //! from `NV12` with a sample whose U and V differ, the pitch-relative chroma addressing
 //! on a surface whose pitch is wider than its width, and the route a planar endpoint
 //! takes through `StretchRect`.
+
+use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8};
 
 use super::*;
 
@@ -97,6 +112,9 @@ fn reject_keys_are_distinct() {
         RejectReason::PlanarDestination,
         RejectReason::EmptyRect,
         RejectReason::RectOutsideSurface,
+        RejectReason::DestinationClass,
+        RejectReason::SourceIntoOffscreenPlain,
+        RejectReason::SameSurfaceStretch,
     ]
     .iter()
     .map(|r| r.key())
@@ -105,6 +123,33 @@ fn reject_keys_are_distinct() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(keys.len(), sorted.len());
+}
+
+#[test]
+fn class_reject_follows_the_d3d9_surface_class_matrix() {
+    let texture = StretchSurfaceFlags::empty();
+    let render_target = StretchSurfaceFlags::IS_RENDER_TARGET;
+    let offscreen_plain = StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT;
+    for src in [texture, render_target, offscreen_plain] {
+        assert_eq!(
+            class_reject(src, render_target),
+            None,
+            "{src:?} into a render target"
+        );
+        assert_eq!(
+            class_reject(src, texture),
+            Some(RejectReason::DestinationClass),
+            "{src:?} into a texture level"
+        );
+    }
+    assert_eq!(class_reject(offscreen_plain, offscreen_plain), None);
+    for src in [texture, render_target] {
+        assert_eq!(
+            class_reject(src, offscreen_plain),
+            Some(RejectReason::SourceIntoOffscreenPlain),
+            "{src:?} into an offscreen plain"
+        );
+    }
 }
 
 const fn region(x: u32, y: u32, w: u32, h: u32) -> StretchRegion {
@@ -211,21 +256,111 @@ fn identical_same_surface_rects_are_a_no_op() {
 fn blit_decode_follows_the_source_format() {
     assert!(matches!(blit_decode(D3DFMT_YUY2), BlitDecode::Yuy2));
     assert!(matches!(blit_decode(D3DFMT_UYVY), BlitDecode::Uyvy));
-    assert!(matches!(
-        blit_decode(mtld3d_types::D3DFMT_X8R8G8B8),
-        BlitDecode::None
-    ));
+    for format in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_A1R5G5B5,
+        mtld3d_types::D3DFMT_R5G6B5,
+    ] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::None),
+            "{format:#x}"
+        );
+    }
+    // An X format's padding bits are no alpha, so the quad forces it to one.
+    for format in [D3DFMT_X8R8G8B8, D3DFMT_X8B8G8R8, D3DFMT_X1R5G5B5] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::OpaqueAlpha),
+            "{format:#x}"
+        );
+    }
     // The uniform values are the discriminants the MSL matches on.
     assert_eq!(BlitDecode::None.uniform().to_bits(), 0.0f32.to_bits());
     assert_eq!(BlitDecode::Yuy2.uniform().to_bits(), 1.0f32.to_bits());
     assert_eq!(BlitDecode::Uyvy.uniform().to_bits(), 2.0f32.to_bits());
+    assert_eq!(
+        BlitDecode::OpaqueAlpha.uniform().to_bits(),
+        5.0f32.to_bits()
+    );
     assert!(is_packed_yuv(D3DFMT_YUY2) && is_packed_yuv(D3DFMT_UYVY));
     assert!(!is_packed_yuv(mtld3d_types::D3DFMT_R5G6B5));
 }
 
 #[test]
+fn only_a_source_without_alpha_into_one_with_alpha_exposes_padding() {
+    use mtld3d_types::{D3DFMT_A4R4G4B4, D3DFMT_R5G6B5};
+
+    use crate::format::map_d3d_format_device;
+    let exposes = |src: u32, dst: u32, native_packed16: bool| {
+        let map = |format| map_d3d_format_device(format, native_packed16).expect("mapped");
+        exposes_padding_as_alpha(&map(src), &map(dst))
+    };
+    for native_packed16 in [true, false] {
+        for (src, dst) in [
+            (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
+            (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
+            (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4),
+        ] {
+            assert!(
+                exposes(src, dst, native_packed16),
+                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
+            );
+        }
+        // The A into X direction, a format into itself, and a pair whose ends
+        // both carry alpha or both lack it are byte copies as far as alpha goes.
+        for (src, dst) in [
+            (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8),
+            (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8),
+            (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8),
+            (D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8),
+            (D3DFMT_A8R8G8B8, D3DFMT_A1R5G5B5),
+            (D3DFMT_X1R5G5B5, D3DFMT_R5G6B5),
+        ] {
+            assert!(
+                !exposes(src, dst, native_packed16),
+                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_a_rect_spanning_the_whole_level_covers_the_destination() {
+    let rect = |x, y, w, h| StretchRegion { x, y, w, h };
+    // The 1:1 copy of a back buffer into a texture of its size, and a level
+    // of one pixel.
+    assert!(quad_covers_destination(rect(0, 0, 1280, 720), (1280, 720)));
+    assert!(quad_covers_destination(rect(0, 0, 1, 1), (1, 1)));
+    // A rect short of the level on either axis leaves pixels to keep.
+    assert!(!quad_covers_destination(rect(0, 0, 1279, 720), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 0, 1280, 719), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 0, 640, 360), (1280, 720)));
+    // A rect of the level's size moved off the origin leaves a row or a
+    // column unwritten.
+    assert!(!quad_covers_destination(rect(1, 0, 1280, 720), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 1, 1280, 720), (1280, 720)));
+    assert!(!quad_covers_destination(
+        rect(640, 360, 640, 360),
+        (1280, 720)
+    ));
+    // A level of another size than the rect, smaller or larger.
+    assert!(!quad_covers_destination(
+        rect(0, 0, 1280, 720),
+        (1920, 1080)
+    ));
+    assert!(!quad_covers_destination(
+        rect(0, 0, 1280, 720),
+        (1280, 1024)
+    ));
+    assert!(!quad_covers_destination(rect(0, 0, 1280, 720), (640, 720)));
+}
+
+#[test]
 fn a_packed_yuv_byte_copy_needs_both_ends_in_one_format() {
-    use mtld3d_types::{D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8};
+    use mtld3d_types::D3DFMT_A8L8;
     // The two packed formats order luma and chroma differently, and A8L8
     // shares their storage without being YUV at all.
     for (src, dst) in [
@@ -509,4 +644,24 @@ fn a_planar_endpoint_routes_by_destination_class() {
         planar_stretch_route(D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, false, true),
         PlanarStretch::NotPlanar
     );
+}
+
+#[test]
+fn an_extended_device_copies_between_whole_default_surfaces_alone() {
+    let surface = (21, 64, 64);
+    assert!(extended_whole_surface_copy(true, false, surface, surface));
+    assert!(!extended_whole_surface_copy(false, false, surface, surface));
+    assert!(!extended_whole_surface_copy(true, true, surface, surface));
+    assert!(!extended_whole_surface_copy(
+        true,
+        false,
+        surface,
+        (22, 64, 64)
+    ));
+    assert!(!extended_whole_surface_copy(
+        true,
+        false,
+        surface,
+        (21, 64, 32)
+    ));
 }

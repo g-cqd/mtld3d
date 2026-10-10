@@ -4,7 +4,10 @@
 //! dependency); only the calls the tests exercise are declared.
 
 use core::ffi::{c_char, c_void};
-use std::sync::{Mutex, Once, PoisonError};
+use std::{
+    sync::{Mutex, Once, PoisonError},
+    time::{Duration, Instant},
+};
 
 use mtld3d_types::ICONINFO;
 
@@ -34,6 +37,13 @@ unsafe extern "system" {
         filter_max: u32,
         remove: u32,
     ) -> i32;
+    fn MsgWaitForMultipleObjectsEx(
+        count: u32,
+        handles: *const usize,
+        millis: u32,
+        wake_mask: u32,
+        flags: u32,
+    ) -> u32;
     fn TranslateMessage(msg: *const Msg) -> i32;
     fn DispatchMessageA(msg: *const Msg) -> isize;
     fn PostQuitMessage(exit_code: i32);
@@ -49,6 +59,7 @@ unsafe extern "system" {
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetClientRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
+    fn SetWindowLongA(hwnd: usize, index: i32, new_long: i32) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
@@ -63,9 +74,18 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+// `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
+// same query through `GetWindowLongA`, which the header aliases it to.
+#[cfg(target_pointer_width = "64")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowLongPtrA(hwnd: usize, index: i32) -> isize;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleA(name: *const c_char) -> usize;
+    fn GetProcAddress(module: usize, name: *const c_char) -> *mut c_void;
     fn GetCurrentProcess() -> *mut c_void;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     fn GetLastError() -> u32;
@@ -79,6 +99,9 @@ unsafe extern "system" {
         counters: *mut ProcessMemoryCounters,
         size: u32,
     ) -> i32;
+    fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+    fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -95,6 +118,17 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 /// `MEM_FREE`: the region belongs to no allocation.
 const MEM_FREE: u32 = 0x1_0000;
+/// `MEM_RELEASE`: `VirtualFree` gives back the whole reservation.
+const MEM_RELEASE: u32 = 0x8000;
+/// `PAGE_NOACCESS`: any access to the page faults.
+const PAGE_NOACCESS: u32 = 0x01;
+/// `PAGE_READWRITE`.
+const PAGE_READWRITE: u32 = 0x04;
+/// Span of the readable part and of the guard of a [`GuardedSlice`].
+///
+/// 16 KiB, so the guard starts on a page boundary whether the host maps 4 KiB
+/// or 16 KiB pages.
+const GUARD_SPAN: usize = 16 * 1024;
 
 static FAILURE_EXIT_HOOK: Once = Once::new();
 
@@ -128,6 +162,85 @@ pub fn install_failure_exit_hook() {
             unsafe { TerminateProcess(process, TEST_FAILURE_EXIT_CODE) };
         }));
     });
+}
+
+/// A copy of a slice that ends where a no-access page begins.
+///
+/// Reading one byte past the copy faults, so a test can pin that a call reads
+/// no more of an application's array than the API promises it may.
+pub struct GuardedSlice<T: Copy> {
+    base: *mut c_void,
+    data: *const T,
+    len: usize,
+}
+
+impl<T: Copy> GuardedSlice<T> {
+    /// Copy `items` so that their last byte is the last readable one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` exceed 16 KiB, are not a multiple of `T`'s alignment
+    /// long, or the allocation or protection change fails.
+    #[must_use]
+    pub fn new(items: &[T]) -> Self {
+        let bytes = size_of_val(items);
+        assert!(bytes <= GUARD_SPAN, "a guarded slice holds at most 16 KiB");
+        assert!(
+            bytes.is_multiple_of(align_of::<T>()),
+            "the copy ends on the guard, so its start keeps T's alignment"
+        );
+        // SAFETY: kernel32 export; a fresh reservation of two spans, committed
+        // read-write, at an address the system picks.
+        let base = unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                2 * GUARD_SPAN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null(), "VirtualAlloc of a guarded slice failed");
+        // SAFETY: the guard span lies inside the reservation just made.
+        let guard = unsafe { base.cast::<u8>().add(GUARD_SPAN) };
+        let mut old = 0;
+        // SAFETY: kernel32 export; the second span of the reservation above.
+        let ok = unsafe {
+            VirtualProtect(
+                guard.cast::<c_void>(),
+                GUARD_SPAN,
+                PAGE_NOACCESS,
+                &raw mut old,
+            )
+        };
+        assert!(ok != 0, "VirtualProtect of the guard span failed");
+        // SAFETY: `bytes <= GUARD_SPAN`, so the copy starts inside the first span.
+        let data = unsafe { guard.sub(bytes) }.cast::<T>();
+        // SAFETY: `data` addresses `bytes` writable bytes, aligned for `T`
+        // (the reservation is page-aligned and `bytes` a multiple of the
+        // alignment), disjoint from `items`.
+        unsafe { core::ptr::copy_nonoverlapping(items.as_ptr(), data, items.len()) };
+        Self {
+            base,
+            data,
+            len: items.len(),
+        }
+    }
+
+    /// The copy, ending at the guard.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[T] {
+        // SAFETY: `new` wrote `len` initialized items at `data`, which stay
+        // mapped read-write until `drop` releases the reservation.
+        unsafe { core::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+impl<T: Copy> Drop for GuardedSlice<T> {
+    fn drop(&mut self) {
+        // SAFETY: kernel32 export; `base` is the reservation `new` made, released once.
+        let ok = unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
+        assert!(ok != 0, "VirtualFree of a guarded slice failed");
+    }
 }
 
 /// This process's address space by region state, and its peak working set, in bytes.
@@ -293,11 +406,23 @@ pub struct Msg {
 }
 
 const WM_DESTROY: u32 = 0x0002;
+/// `WM_DISPLAYCHANGE`: the display mode changed, sent to every top-level window.
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+/// `GWL_USERDATA`: the long a window keeps for its application.
+///
+/// Here the top edge [`move_window_on_next_display_change`] arms.
+const GWL_USERDATA: i32 = -21;
 const WM_QUIT: u32 = 0x0012;
 /// `PM_NOREMOVE`: `PeekMessageA` leaves the message it finds in the queue.
 const PM_NOREMOVE: u32 = 0;
 /// `PM_REMOVE`: `PeekMessageA` takes the message it finds out of the queue.
 const PM_REMOVE: u32 = 1;
+/// `QS_SENDMESSAGE`: a message another thread sent is waiting in the queue.
+const QS_SENDMESSAGE: u32 = 0x0040;
+/// `PM_QS_SENDMESSAGE`: `PeekMessageA` handles sent messages and returns no other.
+const PM_QS_SENDMESSAGE: u32 = QS_SENDMESSAGE << 16;
+/// `MWMO_INPUTAVAILABLE`: the wait also returns for a message that was already waiting.
+const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 const CW_USEDEFAULT: i32 = 0x8000_0000_u32.cast_signed();
 /// `WS_OVERLAPPEDWINDOW` — a normal framed window, initially hidden.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -326,6 +451,12 @@ pub enum WindowStyle {
 }
 
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    if msg == WM_HARNESS_PROBE {
+        return HARNESS_PROBE_REPLY;
+    }
+    if msg == WM_DISPLAYCHANGE {
+        move_to_armed_top(hwnd);
+    }
     if msg == WM_DESTROY {
         // A window that `destroy_window` destroys takes this quit back out, so
         // only a window destroyed from outside the harness ends the pump.
@@ -548,6 +679,19 @@ pub struct Rect {
 /// `WM_ACTIVATEAPP` — the app-level activation message a fullscreen device answers.
 pub const WM_ACTIVATEAPP: u32 = 0x001C;
 
+/// A private message the harness window's own procedure answers with [`HARNESS_PROBE_REPLY`].
+///
+/// Sent to a test window, it tells whether the window's own procedure still
+/// receives what reaches the window, through whatever subclass the layer put
+/// in front of it: the default procedure answers it with 0. `WM_APP` range.
+pub const WM_HARNESS_PROBE: u32 = 0x8000 + 0x0E2E;
+
+/// What the harness window's procedure answers [`WM_HARNESS_PROBE`] with.
+pub const HARNESS_PROBE_REPLY: isize = 0x6D74_6C64;
+
+/// `GWLP_WNDPROC`: a window's procedure.
+const GWLP_WNDPROC: i32 = -4;
+
 /// `GWL_STYLE` — a window's style bits.
 pub const GWL_STYLE: i32 = -16;
 /// `GWL_EXSTYLE` — a window's extended style bits.
@@ -572,6 +716,89 @@ pub fn window_rect(hwnd: usize) -> Rect {
     let ok = unsafe { GetWindowRect(hwnd, &raw mut rect) };
     assert!(ok != 0, "GetWindowRect failed");
     rect
+}
+
+/// The procedure `hwnd` currently runs, as an address.
+///
+/// # Panics
+///
+/// Panics if a 32-bit target's procedure address does not fit `usize`, which
+/// it always does.
+#[must_use]
+pub fn window_proc(hwnd: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+        // the index is the documented `GWLP_WNDPROC`.
+        unsafe { GetWindowLongPtrA(hwnd, GWLP_WNDPROC) }.cast_unsigned()
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        usize::try_from(
+            // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+            // the index is the documented `GWLP_WNDPROC`, a 32-bit long here.
+            unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) }.cast_unsigned(),
+        )
+        .expect("a 32-bit procedure address fits usize")
+    }
+}
+
+/// Have the window's own procedure move its top edge to `top` on the next `WM_DISPLAYCHANGE`.
+///
+/// The move a game makes answering a mode change, from inside the procedure
+/// the mode change calls: to a place of its own, keeping the window's left
+/// edge and size, whatever moved the window before the message arrived. One
+/// move per call; `top` lives in the window's `GWL_USERDATA`, which the
+/// harness uses for nothing else.
+///
+/// # Panics
+///
+/// Panics if `top` is not positive: zero is the disarmed value.
+pub fn move_window_on_next_display_change(hwnd: usize, top: i32) {
+    assert!(top > 0, "an armed top edge is positive, zero disarms");
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is the documented `GWL_USERDATA`.
+    unsafe { SetWindowLongA(hwnd, GWL_USERDATA, top) };
+}
+
+/// Make the move [`move_window_on_next_display_change`] armed, once.
+fn move_to_armed_top(hwnd: usize) {
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for and
+    // the index is the documented `GWL_USERDATA`.
+    let top = unsafe { SetWindowLongA(hwnd, GWL_USERDATA, 0) };
+    if top == 0 {
+        return;
+    }
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and `rect` is an owned out-param.
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) } == 0 {
+        return;
+    }
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and the geometry is plain scalars.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            rect.left,
+            top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The procedure the harness window class registers, as an address.
+#[must_use]
+pub fn harness_window_proc() -> usize {
+    wnd_proc as *const () as usize
 }
 
 /// `GetWindowLongA` — one of a window's `GWL_*` longs, as a bit mask.
@@ -859,10 +1086,81 @@ pub fn foreground_window(hwnd: usize) -> bool {
     unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
+/// Wait up to `timeout` for a message another thread sends to this thread's windows, and answer it.
+///
+/// For a thread that owns a window and waits for something it cannot wait
+/// on together with its queue: it waits in steps of this, answering
+/// between them, and looks at what it waits for after each. A message that
+/// was already waiting ends the wait at once. A display mode change sends
+/// `WM_DISPLAYCHANGE` to every top-level window and waits up to two seconds
+/// for each to answer, so a window whose thread blocks without answering
+/// holds up every mode change of the session for that long.
+///
+/// # Panics
+///
+/// Panics when `timeout` does not fit the wait's milliseconds.
+pub fn wait_answering_sent_messages(timeout: Duration) {
+    let millis = u32::try_from(timeout.as_micros().div_ceil(1000))
+        .expect("a wait between answers fits u32 milliseconds");
+    // SAFETY: Win32 thunk; no handles, so the wait is on the thread's own
+    // queue alone, for at most `millis`.
+    unsafe {
+        MsgWaitForMultipleObjectsEx(
+            0,
+            core::ptr::null(),
+            millis,
+            QS_SENDMESSAGE,
+            MWMO_INPUTAVAILABLE,
+        )
+    };
+    answer_sent_messages();
+}
+
+/// Let `duration` pass, answering the messages other threads send to this thread's windows.
+///
+/// The wait of [`wait_answering_sent_messages`] for a pause of a known length.
+pub fn answer_sent_messages_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        wait_answering_sent_messages(left);
+    }
+}
+
+/// Answer the messages other threads have sent to this thread's windows, leaving its queue alone.
+///
+/// A peek limited to sent messages calls the window procedure for each one
+/// that is waiting and returns no posted message, so what a test posted to
+/// itself, and a `WM_QUIT`, stay queued for its own pump.
+fn answer_sent_messages() {
+    let mut msg = zeroed_msg();
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with
+    // `PM_QS_SENDMESSAGE` handles the thread's sent messages alone.
+    unsafe { PeekMessageA(&raw mut msg, 0, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE) };
+}
+
 /// Whether the calling thread's queue holds a `WM_QUIT`, taken out when `remove` is `PM_REMOVE`.
 fn peek_quit(remove: u32) -> bool {
     let mut msg = zeroed_msg();
     // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with a
     // `WM_QUIT`-only filter peeks the thread queue's quit message alone.
     unsafe { PeekMessageA(&raw mut msg, 0, WM_QUIT, WM_QUIT, remove) != 0 }
+}
+
+/// The address the loaded `d3d9.dll` exports under `name`, or null when it exports none.
+///
+/// Resolving by name keeps an export the image lacks a test failure: a
+/// `raw-dylib` import of it would stop the whole binary from loading.
+#[must_use]
+pub fn d3d9_export(name: &core::ffi::CStr) -> *mut c_void {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    let module = unsafe { GetModuleHandleA(c"d3d9.dll".as_ptr()) };
+    if module == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: kernel32 export; `module` is a loaded module and `name` is NUL-terminated.
+    unsafe { GetProcAddress(module, name.as_ptr()) }
 }

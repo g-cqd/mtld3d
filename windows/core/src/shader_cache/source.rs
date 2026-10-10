@@ -108,6 +108,7 @@ impl ShaderSource {
                     clip_plane_count,
                     sampler_kinds.volume_mask,
                     sampler_kinds.cube_mask,
+                    u8::from(sampler_kinds.lod_table),
                 ]);
             }
             Specialization::Pixel(variant) => encode_variant(variant, out),
@@ -129,6 +130,11 @@ impl ShaderSource {
             let sampler_kinds = VsSamplerKinds {
                 volume_mask: reader.u8()?,
                 cube_mask: reader.u8()?,
+                lod_table: match reader.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
             };
             if usize::from(clip_plane_count) > crate::vs_draw::MAX_CLIP_PLANES
                 || (sampler_kinds.volume_mask | sampler_kinds.cube_mask) & !0x0F != 0
@@ -184,7 +190,7 @@ enum Specialization {
 
 fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
     let VariantKey {
-        reserved: _,
+        linked_input_mask,
         alpha_func,
         fog_mode,
         fog_table_mode,
@@ -212,12 +218,17 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
     ] {
         out.extend_from_slice(&mask.to_le_bytes());
     }
-    out.extend_from_slice(&[tt_projected_mask, color_out_mask, sample_mask, flags.bits()]);
+    out.extend_from_slice(&[
+        tt_projected_mask,
+        color_out_mask,
+        sample_mask,
+        flags.bits(),
+        linked_input_mask,
+    ]);
 }
 
 fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
     Some(VariantKey {
-        reserved: 0,
         alpha_func: reader.u8()?,
         fog_mode: reader.u8()?,
         fog_table_mode: reader.u8()?,
@@ -232,5 +243,6 @@ fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
         color_out_mask: reader.u8()?,
         sample_mask: reader.u8()?,
         flags: VariantFlags::from_bits(reader.u8()?)?,
+        linked_input_mask: reader.u8()?,
     })
 }

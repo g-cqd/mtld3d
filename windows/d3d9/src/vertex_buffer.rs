@@ -103,22 +103,25 @@ pub struct VertexBufferInner {
     /// Stamped at Draw snapshot time; read by `lock` to decide whether
     /// a rename is needed.
     last_submit_seq: u64,
-    /// Lock/Unlock pairing sanity.
+    /// Number of `Lock`s not yet ended by an `Unlock`.
     ///
-    /// Non-fatal mismatches are logged once via `log_once_warn!`.
-    locked: bool,
+    /// D3D9 lets a locked buffer be locked again, and every pointer handed
+    /// out stays valid until the last `Unlock`, which is the one that
+    /// publishes the writes. An `Unlock` with no lock out is logged once.
+    lock_count: u32,
     /// References state blocks hold on this vertex buffer.
     ///
     /// A `D3DPOOL_DEFAULT` vertex buffer a state block keeps alive is a `Reset`
     /// blocker until this and the public refcount are both zero
     /// (`ComChild::state_block_refs_mut`).
     state_block_refs: u32,
-    /// App-set managed-resource priority, round-tripped by `GetPriority` / `SetPriority`.
+    /// App-set resource priority, round-tripped by `GetPriority` / `SetPriority`.
     ///
-    /// D3D9 only honours priority for `D3DPOOL_MANAGED` buffers (it drives
-    /// the resource manager's eviction order); for every other pool both
-    /// accessors are fixed at `0`. Metal has no eviction-order hint, so
-    /// this is app-visible state only and never acted upon.
+    /// D3D9 honours priority for the pool a memory manager pages, which
+    /// orders its evictions: `D3DPOOL_MANAGED` on a plain device and
+    /// `D3DPOOL_DEFAULT` on an extended one. For every other pool both
+    /// accessors are fixed at `0`. Metal has no eviction-order hint, so this
+    /// is app-visible state only and never acted upon.
     priority: u32,
 }
 
@@ -222,7 +225,7 @@ impl VertexBufferInner {
     /// the clear.
     #[inline]
     pub fn flush_staged_if_mapped(&mut self, dev: &mut DeviceInner) {
-        if !self.locked || !matches!(self.map_mode, BufferMapMode::Staged) {
+        if self.lock_count == 0 || !matches!(self.map_mode, BufferMapMode::Staged) {
             return;
         }
         self.flush_mapped_dirty_span(dev);
@@ -294,13 +297,17 @@ pub struct VertexBufferCreateInfo {
 }
 
 impl Direct3DVertexBuffer9 {
-    pub fn new(info: &VertexBufferCreateInfo) -> Self {
+    /// A buffer of `info.length` zeroed bytes, `None` when the process cannot allocate them.
+    ///
+    /// The CPU backing is the one allocation of a buffer create that may
+    /// fail, which the create answers with `E_OUTOFMEMORY`.
+    pub fn new(info: &VertexBufferCreateInfo) -> Option<Self> {
         // Zeroed, not uninit: a `Staged` buffer's first upload carries the
         // whole staging region, so any byte the game left alone has to be
         // a defined value rather than heap residue. One `bzero` per create,
         // and renames keep using the recycle pool.
         let backing = BufferBacking::new(
-            PageBox::new_zeroed(info.length as usize),
+            PageBox::try_new_zeroed(info.length as usize)?,
             info.length,
             classify_backing(info.usage, info.pool),
         );
@@ -336,16 +343,16 @@ impl Direct3DVertexBuffer9 {
             dirty,
             backing,
             last_submit_seq: 0,
-            locked: false,
+            lock_count: 0,
             state_block_refs: 0,
             priority: 0,
         }));
-        Self {
+        Some(Self {
             vtbl: &raw const DIRECT3D_VERTEX_BUFFER9_VTBL,
             refcount: 1,
             private_refcount: 0,
             inner,
-        }
+        })
     }
 
     pub const fn vtbl(&self) -> &IDirect3DVertexBuffer9Vtbl {
@@ -444,8 +451,8 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
     // `Box::into_raw(VertexBufferInner)` from `Self::new` and no
     // other reference can survive.
     let mut inner_box = unsafe { Box::from_raw(inner_ptr) };
-    // A buffer that already released its backing has nothing left to
-    // retain: the GPU reads its device buffer, not this memory.
+    // A buffer that already released its backing has no CPU copy left to
+    // retain, and the release destroys the device buffer the GPU reads.
     let current_box = inner_box.backing.release();
     let VertexBufferInner {
         device_inner,
@@ -453,14 +460,12 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
         last_submit_seq,
         ..
     } = *inner_box;
-    if !device_inner.is_null()
-        && let Some(current_box) = current_box
-    {
+    if !device_inner.is_null() {
         // SAFETY: `device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
         let dev = unsafe { &mut *device_inner };
-        dev.queue_vbib_retention(buffer_id, current_box, last_submit_seq);
+        dev.retire_released_buffer(buffer_id, current_box, last_submit_seq);
     }
     // SAFETY: both counters reached zero; `this` is the original
     // `Box::into_raw(Direct3DVertexBuffer9)` allocation.
@@ -576,10 +581,11 @@ extern "system" fn vb_free_private_data(this: *mut c_void, guid: *const Guid) ->
     obj.inner_mut().private_data.free(&guid)
 }
 
-// Priority is honoured only for `D3DPOOL_MANAGED` resources (D3D9 manager
-// eviction order). For every other pool both accessors are fixed at `0`.
-// Metal has no eviction-order hint, so the value is stored and round-tripped
-// but never acted upon.
+// Priority is honoured for the pool a device's memory manager pages:
+// `D3DPOOL_MANAGED` on a plain device, `D3DPOOL_DEFAULT` on an extended one.
+// For every other pool both accessors are fixed at `0`. Metal has no
+// eviction-order hint, so the value is stored and round-tripped but never
+// acted upon.
 extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
@@ -588,7 +594,11 @@ extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
         return 0;
     };
     let inner = obj.inner_mut();
-    if inner.pool != mtld3d_types::D3DPOOL_MANAGED {
+    let extended = inner.pool == mtld3d_types::D3DPOOL_DEFAULT
+        // SAFETY: a default-pool buffer forwards a reference to its device,
+        // so `device_inner` is null or that live device.
+        && unsafe { crate::device::device_inner_is_extended(inner.device_inner as u64) };
+    if !mtld3d_core::pool::priority_settable(inner.pool, extended) {
         return 0;
     }
     core::mem::replace(&mut inner.priority, priority)
@@ -830,8 +840,6 @@ extern "system" fn vb_lock(
         }
     }
 
-    inner.locked = true;
-
     let unknown = flags & !D3DLOCK_KNOWN_BITS;
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: unrecognised D3DLOCK bits {unknown:#x} ignored");
@@ -845,6 +853,9 @@ extern "system" fn vb_lock(
         unsafe { *pp_data = core::ptr::null_mut() };
         return D3DERR_INVALIDCALL;
     };
+    // Counted only once the pointer exists: a refused Lock maps nothing for
+    // an Unlock to end.
+    inner.lock_count = inner.lock_count.saturating_add(1);
     // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
     // ABI points to a writable `*mut c_void` slot owned by the caller.
     unsafe { *pp_data = ptr.cast::<c_void>() };
@@ -859,10 +870,17 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let inner = obj.inner_mut();
-    if !inner.locked {
+    if inner.lock_count == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_unlock: Unlock without matching Lock → S_OK");
+    } else {
+        inner.lock_count -= 1;
+        if inner.lock_count != 0 {
+            // An earlier lock is still out and its pointer maps this
+            // backing: the writes publish at the Unlock that ends the last
+            // lock, as D3D9 counts them.
+            return D3D_OK;
+        }
     }
-    inner.locked = false;
     if matches!(inner.map_mode, BufferMapMode::Staged)
         && let Some((min, max)) = inner.dirty.span()
         && !inner.device_inner.is_null()
@@ -937,7 +955,7 @@ fn release_backing_after_upload(inner: &mut VertexBufferInner) {
     // announces, and the only way to carry those writes is to upload the whole
     // buffer out of the CPU copy. Releasing the copy would leave that upload
     // nothing true to carry, so the knob keeps it.
-    if inner.locked
+    if inner.lock_count != 0
         || ignore_lock_bounds(inner)
         || !may_release_backing(inner.usage, inner.pool)
         || !inner.backing.may_widen_upload()

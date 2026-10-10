@@ -215,6 +215,12 @@ pub const D3DUSAGE_QUERY_VERTEXTEXTURE: u32 = 0x0010_0000;
 pub const D3DUSAGE_QUERY_WRAPANDMIP: u32 = 0x0020_0000;
 pub const D3DUSAGE_NONSECURE: u32 = 0x0080_0000;
 pub const D3DUSAGE_DMAP: u32 = 0x0000_4000;
+/// `D3DUSAGE_RESTRICTED_CONTENT`, an extended-device usage for protected content.
+pub const D3DUSAGE_RESTRICTED_CONTENT: u32 = 0x0000_0800;
+/// `D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER`, an extended-device usage for a shared resource.
+pub const D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER: u32 = 0x0000_1000;
+/// `D3DUSAGE_RESTRICT_SHARED_RESOURCE`, an extended-device usage for a shared resource.
+pub const D3DUSAGE_RESTRICT_SHARED_RESOURCE: u32 = 0x0000_2000;
 
 // ── D3D9 resource pools (`D3DPOOL`, the `Pool` arg of the Create*
 // methods) ──
@@ -223,6 +229,12 @@ pub const D3DPOOL_DEFAULT: u32 = 0;
 pub const D3DPOOL_MANAGED: u32 = 1;
 pub const D3DPOOL_SYSTEMMEM: u32 = 2;
 pub const D3DPOOL_SCRATCH: u32 = 3;
+/// `D3DPOOL_MANAGED_EX`, the managed pool under a value an extended device also accepts.
+///
+/// Absent from the public SDK headers. Every device treats it as
+/// `D3DPOOL_MANAGED`, and an extended device, which refuses
+/// `D3DPOOL_MANAGED` itself, accepts it.
+pub const D3DPOOL_MANAGED_EX: u32 = 6;
 
 // ── D3D9 device types (`D3DDEVTYPE`) ──
 
@@ -301,6 +313,8 @@ pub const D3DFMT_YV12: u32 = 0x3231_5659;
 pub const D3DFMT_NV12: u32 = 0x3231_564E;
 /// `MAKEFOURCC('A','T','I','1')` — ATI1N / BC4 single-channel block format.
 pub const D3DFMT_ATI1: u32 = 0x3149_5441;
+/// `MAKEFOURCC('A','T','I','2')`: ATI2N / BC5 two-channel block format, which no create takes.
+pub const D3DFMT_ATI2: u32 = 0x3249_5441;
 
 // ── D3D9 sampler state types ──
 
@@ -355,6 +369,8 @@ pub const D3DFMT_D24X4S4: u32 = 79;
 pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_D32F_LOCKABLE: u32 = 82;
 pub const D3DFMT_D24FS8: u32 = 83;
+pub const D3DFMT_D32_LOCKABLE: u32 = 84;
+pub const D3DFMT_S8_LOCKABLE: u32 = 85;
 
 // ── D3D9 FOURCC sampleable-depth formats ──
 //
@@ -872,6 +888,17 @@ pub const D3DPRESENT_INTERVAL_THREE: u32 = 0x0000_0004;
 pub const D3DPRESENT_INTERVAL_FOUR: u32 = 0x0000_0008;
 pub const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 
+// D3DPRESENT_* flags of `PresentEx` and `IDirect3DSwapChain9::Present`.
+pub const D3DPRESENT_DONOTWAIT: u32 = 0x0000_0001;
+pub const D3DPRESENT_LINEAR_CONTENT: u32 = 0x0000_0002;
+pub const D3DPRESENT_DONOTFLIP: u32 = 0x0000_0004;
+pub const D3DPRESENT_FLIPRESTART: u32 = 0x0000_0008;
+pub const D3DPRESENT_VIDEO_RESTRICT_TO_MONITOR: u32 = 0x0000_0010;
+pub const D3DPRESENT_UPDATEOVERLAYONLY: u32 = 0x0000_0020;
+pub const D3DPRESENT_HIDEOVERLAY: u32 = 0x0000_0040;
+pub const D3DPRESENT_UPDATECOLORKEY: u32 = 0x0000_0080;
+pub const D3DPRESENT_FORCEIMMEDIATE: u32 = 0x0000_0100;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3DPRESENT_PARAMETERS {
@@ -1147,6 +1174,92 @@ pub struct IDirect3DDevice9Vtbl {
     pub delete_patch: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     pub create_query: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
 }
+
+// ── IDirect3DDevice9Ex vtable ──
+
+/// The `IDirect3DDevice9Ex` vtable: the `IDirect3DDevice9` slots, then the fifteen extended ones.
+///
+/// The base table is embedded, so a pointer to this table is a valid pointer
+/// to its `IDirect3DDevice9Vtbl` and the base slots have one definition.
+#[repr(C)]
+pub struct IDirect3DDevice9ExVtbl {
+    pub base: IDirect3DDevice9Vtbl,
+    pub set_convolution_mono_kernel:
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut f32, *mut f32) -> i32,
+    pub compose_rects: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *mut c_void,
+        u32,
+        i32,
+        i32,
+    ) -> i32,
+    pub present_ex: unsafe extern "system" fn(
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        u32,
+    ) -> i32,
+    pub get_gpu_thread_priority: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32,
+    pub set_gpu_thread_priority: unsafe extern "system" fn(*mut c_void, i32) -> i32,
+    pub wait_for_vblank: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    pub check_resource_residency:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32) -> i32,
+    pub set_maximum_frame_latency: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    pub get_maximum_frame_latency: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    pub check_device_state: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+    pub create_render_target_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        i32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub create_offscreen_plain_surface_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub create_depth_stencil_surface_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        i32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub reset_ex: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
+    pub get_display_mode_ex:
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, *mut u32) -> i32,
+}
+
+const VTBL_SLOT: usize = core::mem::size_of::<usize>();
+const _: () = assert!(core::mem::size_of::<IDirect3DDevice9Vtbl>() == 119 * VTBL_SLOT);
+const _: () = assert!(
+    core::mem::offset_of!(IDirect3DDevice9ExVtbl, set_convolution_mono_kernel) == 119 * VTBL_SLOT
+);
+const _: () = assert!(core::mem::offset_of!(IDirect3DDevice9ExVtbl, present_ex) == 121 * VTBL_SLOT);
+const _: () = assert!(core::mem::offset_of!(IDirect3DDevice9ExVtbl, reset_ex) == 132 * VTBL_SLOT);
+const _: () = assert!(core::mem::size_of::<IDirect3DDevice9ExVtbl>() == 134 * VTBL_SLOT);
 
 // ── D3DDISPLAYMODE ──
 
@@ -1516,6 +1629,56 @@ pub struct IDirect3DSwapChain9Vtbl {
     pub get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
     pub get_present_parameters: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
 }
+
+/// The `IDirect3DSwapChain9Ex` vtable.
+///
+/// The `IDirect3DSwapChain9` slots, embedded, then the three extended ones.
+#[repr(C)]
+pub struct IDirect3DSwapChain9ExVtbl {
+    pub base: IDirect3DSwapChain9Vtbl,
+    pub get_last_present_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    pub get_present_stats: unsafe extern "system" fn(*mut c_void, *mut D3DPRESENTSTATS) -> i32,
+    pub get_display_mode_ex: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32) -> i32,
+}
+
+const _: () = assert!(core::mem::size_of::<IDirect3DSwapChain9Vtbl>() == 10 * VTBL_SLOT);
+const _: () = assert!(
+    core::mem::offset_of!(IDirect3DSwapChain9ExVtbl, get_last_present_count) == 10 * VTBL_SLOT
+);
+const _: () = assert!(core::mem::size_of::<IDirect3DSwapChain9ExVtbl>() == 13 * VTBL_SLOT);
+
+/// The 32-bit words of padding `D3DPRESENTSTATS` carries before its first time.
+///
+/// `d3d9types.h` packs its structs to 4 bytes on x86 alone, so there the two
+/// `LARGE_INTEGER` times follow the three counts directly; every other target
+/// aligns them to 8, one word past the counts.
+pub const D3DPRESENTSTATS_PAD_WORDS: usize = if cfg!(target_arch = "x86") { 0 } else { 1 };
+
+/// `D3DPRESENTSTATS`, what `IDirect3DSwapChain9Ex::GetPresentStats` fills.
+///
+/// The two Win32 `LARGE_INTEGER` times are `[u32; 2]` halves (`LowPart`,
+/// `HighPart`), so every field is 4-aligned as the 32-bit layout needs, and
+/// the 8-byte alignment the 64-bit layout gives them is spelled out as
+/// [`D3DPRESENTSTATS_PAD_WORDS`] of padding. The struct is 28 bytes with the
+/// times at offset 12 on x86 and 32 bytes with them at 16 everywhere else.
+#[repr(C)]
+pub struct D3DPRESENTSTATS {
+    pub present_count: u32,
+    pub present_refresh_count: u32,
+    pub sync_refresh_count: u32,
+    pub pad: [u32; D3DPRESENTSTATS_PAD_WORDS],
+    pub sync_qpc_time: [u32; 2],
+    pub sync_gpu_time: [u32; 2],
+}
+
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::size_of::<D3DPRESENTSTATS>() == 28);
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::offset_of!(D3DPRESENTSTATS, sync_qpc_time) == 12);
+#[cfg(not(target_arch = "x86"))]
+const _: () = assert!(core::mem::size_of::<D3DPRESENTSTATS>() == 32);
+#[cfg(not(target_arch = "x86"))]
+const _: () = assert!(core::mem::offset_of!(D3DPRESENTSTATS, sync_qpc_time) == 16);
 
 // ── D3D9 query constants ──
 

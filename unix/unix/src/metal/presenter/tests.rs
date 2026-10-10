@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use mtld3d_shared::mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind};
+use mtld3d_shared::{
+    mtl::PresentDebugFlags,
+    mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind},
+};
 use objc2_metal::MTLPixelFormat;
 
 use super::*;
@@ -108,7 +111,7 @@ fn empty_inner() -> Inner {
         presented_seq: 0,
         flags: PresenterFlags::empty(),
         slots: [const { None }; SNAPSHOT_SLOTS],
-        last_drawable_wait_ns: 0,
+        unreported_drawable_wait_ns: 0,
         gate: None,
     }
 }
@@ -121,6 +124,7 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
         present_retired: AtomicU64::new(0),
         thread: Mutex::new(None),
         stalled: AtomicBool::new(false),
+        present_occluded: false,
     })
 }
 
@@ -144,9 +148,16 @@ fn a_record_keeps_the_queue_alive_for_its_thread() {
     // and releases when it drops at the end of this test.
     let handle =
         unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
-    let record = DeviceRecord::new(handle, None);
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
     assert!(spawn(&record), "the presenter thread starts");
     stop_and_join(record.present());
+}
+
+/// `debug.presentOccluded` reaches the state the presenter reads, and nothing else sets it.
+#[test]
+fn present_occluded_comes_from_the_queue_flags_alone() {
+    assert!(!PresentState::new(None, PresentDebugFlags::empty()).present_occluded);
+    assert!(PresentState::new(None, PresentDebugFlags::PRESENT_OCCLUDED).present_occluded);
 }
 
 /// A handle round-trips to its record, and only the destroying caller ends it.
@@ -156,7 +167,11 @@ fn a_record_keeps_the_queue_alive_for_its_thread() {
 /// `consume` takes that last reference back.
 #[test]
 fn a_record_handle_round_trips_and_only_consume_ends_it() {
-    let record = DeviceRecord::new(MetalHandle::<MTLCommandQueueKind>::NULL, None);
+    let record = DeviceRecord::new(
+        MetalHandle::<MTLCommandQueueKind>::NULL,
+        None,
+        PresentDebugFlags::empty(),
+    );
     let handle = Arc::clone(&record).into_handle();
     {
         // SAFETY: the handle came from `into_handle` above and has not been
@@ -443,4 +458,24 @@ fn two_devices_keep_their_own_wait_policy() {
     );
     set_wait_policy(&state_a, PresentWaitPolicy::WaitForCommit);
     assert!(state_a.lock().flags.is_empty());
+}
+
+/// Each push reports the drawable waits committed since the previous one, once.
+///
+/// Two presents can commit between two pushes, and two pushes can come
+/// without a commit between them: the first case reports both waits, the
+/// second reports nothing again. A push to a stopped presenter still takes
+/// what it was owed.
+#[test]
+fn a_push_takes_the_drawable_waits_committed_since_the_last_one() {
+    let state = state_with(empty_inner());
+    state.lock().note_drawable_wait(3_000);
+    state.lock().note_drawable_wait(4_000);
+    assert_eq!(push(&state, packet(1, None)), 7_000, "both waits");
+    assert_eq!(push(&state, packet(2, None)), 0, "none twice");
+
+    state.lock().note_drawable_wait(5_000);
+    state.lock().flags.insert(PresenterFlags::STOP);
+    assert_eq!(push(&state, packet(3, None)), 5_000);
+    assert_eq!(push(&state, packet(4, None)), 0);
 }

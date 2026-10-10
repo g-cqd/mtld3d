@@ -64,8 +64,12 @@
 use core::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
 
-use log::{debug, warn};
-use mtld3d_core::display_mode::{ModeRequest, mode_set_attempts};
+use log::{Level, debug, info, log, warn};
+use mtld3d_core::{
+    display_mode::{ModeRequest, ModeSetOutcome, RegistryRestore, mode_set_attempts},
+    fullscreen_log::{LeaveReason, RectLabel, SessionMode, WindowPlacement},
+    fullscreen_resize::REASSERTS_LOGGED_AT_INFO,
+};
 use rustc_hash::FxHashMap;
 
 /// Sub-target shared with the display-enumeration probes in `direct3d9`.
@@ -356,20 +360,20 @@ pub fn warn_if_dpi_scaled(hwnd: *mut c_void) {
     );
 }
 
-/// Set `request` as the primary display's mode, `true` on success.
+/// Set `request` as the primary display's mode, saying what happened.
 ///
 /// Compare-first: a mode that is already current is left alone, which keeps
 /// a fullscreen `Reset` at the same mode and a re-activation free of a
 /// `WM_DISPLAYCHANGE` broadcast. Each attempt from `mode_set_attempts` is a
 /// `CDS_FULLSCREEN` change (temporary, so the registry mode stays the
-/// desktop's for [`restore_registry_mode`]). Failure is reported once; the
-/// caller keeps the monitor-covering window as the fallback.
-fn set_display_mode(request: ModeRequest) -> bool {
+/// desktop's for [`restore_registry_mode`]). Failure is warned about once;
+/// the caller keeps the monitor-covering window as the fallback and names
+/// the outcome in its transition line.
+fn set_display_mode(request: ModeRequest) -> ModeSetOutcome {
     let (cur_w, cur_h) =
         query_display_mode(ENUM_CURRENT_SETTINGS).map_or((0, 0), |mode| (mode.width, mode.height));
     if (cur_w, cur_h) == (request.width, request.height) {
-        debug!(target: LOG_TARGET, "display mode {cur_w}x{cur_h} already current");
-        return true;
+        return ModeSetOutcome::AlreadyCurrent(request);
     }
     let mut ret = DISP_CHANGE_SUCCESSFUL;
     for attempt in mode_set_attempts(request) {
@@ -384,12 +388,11 @@ fn set_display_mode(request: ModeRequest) -> bool {
         }
         ret = change_display_settings(Some(&mut dm), CDS_FULLSCREEN);
         if ret == DISP_CHANGE_SUCCESSFUL {
-            debug!(
-                target: LOG_TARGET,
-                "set display mode {}x{}@{}Hz (was {cur_w}x{cur_h})",
-                attempt.width, attempt.height, attempt.refresh_hz,
-            );
-            return true;
+            return ModeSetOutcome::Changed {
+                requested: request,
+                set: attempt,
+                was: (cur_w, cur_h),
+            };
         }
         debug!(
             target: LOG_TARGET,
@@ -403,7 +406,12 @@ fn set_display_mode(request: ModeRequest) -> bool {
          instead and present scales the frame, so mouse coordinates stay in monitor space",
         request.width, request.height,
     );
-    false
+    ModeSetOutcome::Refused(request)
+}
+
+/// Set the session's mode for `requested`, or nothing when it names no settable mode.
+fn set_requested_mode(requested: Option<ModeRequest>) -> ModeSetOutcome {
+    requested.map_or(ModeSetOutcome::NoMode, set_display_mode)
 }
 
 /// Put the desktop back to the registry display mode when it differs.
@@ -415,29 +423,24 @@ fn set_display_mode(request: ModeRequest) -> bool {
 /// guard keeps the nothing-changed case free of a spurious
 /// `WM_DISPLAYCHANGE` broadcast; the refresh rate is ignored in the
 /// comparison because the registry view may report 0 where the current view
-/// reports the real rate.
-pub fn restore_registry_mode() {
+/// reports the real rate. The caller names the outcome in its own line,
+/// which says why the mode went back.
+pub fn restore_registry_mode() -> RegistryRestore {
     let Some(cur) = query_display_mode(ENUM_CURRENT_SETTINGS) else {
-        return;
+        return RegistryRestore::Unreadable;
     };
     let Some(reg) = query_display_mode(ENUM_REGISTRY_SETTINGS) else {
-        return;
+        return RegistryRestore::Unreadable;
     };
-    let (cur_w, cur_h, reg_w, reg_h) = (cur.width, cur.height, reg.width, reg.height);
-    if (cur_w, cur_h) == (reg_w, reg_h) {
-        return;
+    let (was, registry) = ((cur.width, cur.height), (reg.width, reg.height));
+    if was == registry {
+        return RegistryRestore::AlreadyCurrent(registry);
     }
     let ret = change_display_settings(None, 0);
     if ret == DISP_CHANGE_SUCCESSFUL {
-        debug!(
-            target: LOG_TARGET,
-            "restored registry display mode {reg_w}x{reg_h} (was {cur_w}x{cur_h})"
-        );
+        RegistryRestore::Restored { registry, was }
     } else {
-        warn!(
-            target: LOG_TARGET,
-            "ChangeDisplaySettingsW(NULL) failed restoring {reg_w}x{reg_h} from {cur_w}x{cur_h}: ret={ret}"
-        );
+        RegistryRestore::Failed { registry, was, ret }
     }
 }
 
@@ -498,6 +501,7 @@ const GWL_STYLE: i32 = -16;
 const GWL_EXSTYLE: i32 = -20;
 
 const WS_POPUP: u32 = 0x8000_0000;
+const WS_CHILD: u32 = 0x4000_0000;
 const WS_SYSMENU: u32 = 0x0008_0000;
 const WS_CAPTION: u32 = 0x00C0_0000;
 const WS_THICKFRAME: u32 = 0x0004_0000;
@@ -510,6 +514,7 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
+const SWP_HIDEWINDOW: u32 = 0x0080;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 
 const MONITOR_DEFAULTTOPRIMARY: u32 = 0x0000_0001;
@@ -623,6 +628,19 @@ impl Rect {
     pub const fn height(&self) -> i32 {
         self.bottom.saturating_sub(self.top)
     }
+
+    /// Whether `other` has the same four edges.
+    const fn same_as(&self, other: &Self) -> bool {
+        self.left == other.left
+            && self.top == other.top
+            && self.right == other.right
+            && self.bottom == other.bottom
+    }
+
+    /// The rect as a log line names it.
+    const fn label(&self) -> RectLabel {
+        RectLabel::new(self.left, self.top, self.right, self.bottom)
+    }
 }
 
 // ── Re-entrancy latch ──
@@ -691,6 +709,119 @@ impl Drop for DrivingGuard {
                 driving.remove(&self.hwnd);
             }
         }
+    }
+}
+
+// ── Moves during an extended leave ──
+
+/// What a window's own procedure did while an extended device's leave restored the mode.
+#[derive(Default)]
+struct LeaveWatch {
+    /// How many calls into the application's procedure for the window are on the stack.
+    app_calls: u32,
+    /// Whether the window moved or resized inside one of those calls.
+    app_moved: bool,
+}
+
+/// The extended leaves in flight, per window (`HWND` as `usize`).
+///
+/// Read by the cursor subclass, which is the one place that sees a window's
+/// messages and knows whether a move happened inside the application's own
+/// procedure, as it does when a game answers the mode restore's
+/// `WM_DISPLAYCHANGE` by moving its window. It is keyed by the window for the
+/// reason [`DRIVING_WINDOWS`] is: the subclass that sees the messages belongs
+/// to whichever device is subclassed on the window, not necessarily the one
+/// leaving. And it is a static because the leave runs inside the device it
+/// would otherwise live on, while that device's subclass re-enters on the same
+/// thread. An entry exists exactly while an extended leave of its window
+/// restores the display mode.
+static LEAVE_WATCHES: LazyLock<Mutex<FxHashMap<usize, LeaveWatch>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// Holds the [`LEAVE_WATCHES`] entry of one window for the span of a mode restore.
+struct LeaveWatchGuard {
+    hwnd: usize,
+}
+
+impl LeaveWatchGuard {
+    fn new(hwnd: *mut c_void) -> Self {
+        let hwnd = hwnd as usize;
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .insert(hwnd, LeaveWatch::default());
+        Self { hwnd }
+    }
+
+    /// Whether the application's own procedure moved or resized the window so far.
+    fn app_moved(&self) -> bool {
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .get(&self.hwnd)
+            .is_some_and(|watch| watch.app_moved)
+    }
+}
+
+impl Drop for LeaveWatchGuard {
+    fn drop(&mut self) {
+        LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .remove(&self.hwnd);
+    }
+}
+
+/// Counts one call into the application's procedure for a watched window while it lives.
+pub struct AppProcedureCall {
+    hwnd: usize,
+}
+
+/// Mark a call into the application's procedure for `hwnd`, if an extended leave watches it.
+///
+/// The cursor subclass holds the returned value across its call to the
+/// procedure it replaced, so a move the procedure makes is told apart from
+/// one the driver applies while the thread waits.
+pub fn app_procedure_call(hwnd: *mut c_void) -> Option<AppProcedureCall> {
+    let hwnd = hwnd as usize;
+    LEAVE_WATCHES
+        .lock()
+        .expect("leave-watches mutex poisoned")
+        .get_mut(&hwnd)?
+        .app_calls += 1;
+    Some(AppProcedureCall { hwnd })
+}
+
+impl Drop for AppProcedureCall {
+    fn drop(&mut self) {
+        if let Some(watch) = LEAVE_WATCHES
+            .lock()
+            .expect("leave-watches mutex poisoned")
+            .get_mut(&self.hwnd)
+        {
+            watch.app_calls = watch.app_calls.saturating_sub(1);
+        }
+    }
+}
+
+/// Note a `WM_WINDOWPOSCHANGED` of `hwnd` whose `WINDOWPOS` carries `flags`.
+///
+/// A move or resize that arrives while the application's procedure for the
+/// window is running is the application's own, and an extended leave keeps
+/// it. Any other is the driver's or another thread's. A driver move the
+/// thread applies while that procedure is itself waiting counts as the
+/// application's, so the leave keeps it, as it kept every move before.
+pub fn note_window_pos_changed(hwnd: *mut c_void, flags: u32) {
+    if flags & (SWP_NOMOVE | SWP_NOSIZE) == SWP_NOMOVE | SWP_NOSIZE {
+        return;
+    }
+    if let Some(watch) = LEAVE_WATCHES
+        .lock()
+        .expect("leave-watches mutex poisoned")
+        .get_mut(&(hwnd as usize))
+        && watch.app_calls > 0
+    {
+        watch.app_moved = true;
     }
 }
 
@@ -770,10 +901,17 @@ pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) 
         mode: None,
         manage_window,
     };
-    saved.mode = mode.filter(|request| set_display_mode(*request));
-    if !window_changes_suppressed(&saved) {
-        apply_fullscreen_window(hwnd, &saved);
-    }
+    let outcome = set_requested_mode(mode);
+    saved.mode = outcome.mode_in_place();
+    let placement = if window_changes_suppressed(&saved) {
+        WindowPlacement::AppOwned
+    } else {
+        apply_fullscreen_window(hwnd, &saved)
+    };
+    info!(
+        target: LOG_TARGET,
+        "fullscreen entered on window {hwnd:p}: {outcome}; {placement}",
+    );
     saved
 }
 
@@ -787,12 +925,19 @@ pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) 
 /// session.
 pub fn update(saved: &mut SavedWindow, mode: Option<ModeRequest>) {
     let _driving = DrivingGuard::new(saved.hwnd);
-    saved.mode = mode.filter(|request| set_display_mode(*request));
-    if window_changes_suppressed(saved) {
-        return;
-    }
-    saved.guard.reset();
-    apply_fullscreen_window(saved.hwnd, saved);
+    let outcome = set_requested_mode(mode);
+    saved.mode = outcome.mode_in_place();
+    let placement = if window_changes_suppressed(saved) {
+        WindowPlacement::AppOwned
+    } else {
+        saved.guard.reset();
+        apply_fullscreen_window(saved.hwnd, saved)
+    };
+    info!(
+        target: LOG_TARGET,
+        "fullscreen kept across Reset on window {:p}: {outcome}; {placement}",
+        saved.hwnd,
+    );
 }
 
 /// Re-assert the mode and the monitor rect after the app is activated again.
@@ -804,16 +949,36 @@ pub fn update(saved: &mut SavedWindow, mode: Option<ModeRequest>) {
 /// mode, except re-covering a managed window.
 pub fn reactivate(saved: &mut SavedWindow) {
     let _driving = DrivingGuard::new(saved.hwnd);
-    let mode_set = saved.mode.is_some_and(set_display_mode);
-    if window_changes_suppressed(saved) {
-        return;
-    }
-    saved.guard.reset();
-    apply_fullscreen_window(saved.hwnd, saved);
-    debug!(
+    let outcome = set_requested_mode(saved.mode);
+    let placement = if window_changes_suppressed(saved) {
+        WindowPlacement::AppOwned
+    } else {
+        saved.guard.reset();
+        apply_fullscreen_window(saved.hwnd, saved)
+    };
+    info!(
         target: LOG_TARGET,
-        "fullscreen device reactivated: display mode {}, window re-covered",
-        if mode_set { "re-asserted" } else { "not ours to set" },
+        "app activated, fullscreen re-asserted on window {:p}: {outcome}; {placement}",
+        saved.hwnd,
+    );
+}
+
+/// Put the registry display mode back after the app lost focus.
+///
+/// The focus-loss half of the mode contract, run from the cursor subclass's
+/// `WM_ACTIVATEAPP FALSE`. The window stays where it is: native D3D9 neither
+/// minimises it nor loses the device, and [`reactivate`] re-covers the
+/// monitor when the app comes back.
+///
+/// It takes the window rather than the session: the restore broadcasts
+/// `WM_DISPLAYCHANGE` synchronously, which can re-enter the subclass and
+/// borrow the device mutably, so no borrow of the device may span it.
+pub fn deactivate(hwnd: *mut c_void) {
+    let restore = restore_registry_mode();
+    log!(
+        target: LOG_TARGET,
+        if restore.failed() { Level::Warn } else { Level::Info },
+        "app deactivated, fullscreen window {hwnd:p} left in place: {restore}",
     );
 }
 
@@ -840,22 +1005,48 @@ pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
         return;
     };
     let monitor = (rect.width().cast_unsigned(), rect.height().cast_unsigned());
-    match saved.guard.decide(incoming, monitor) {
-        ExternalResizeAction::Covered => {}
-        ExternalResizeAction::Reassert => {
+    let action = saved.guard.decide(incoming, monitor);
+    let reasserts = saved.guard.reasserts();
+    let (hwnd, mode) = (saved.hwnd, SessionMode::new(saved.mode));
+    match action {
+        ExternalResizeAction::Covered => {
             debug!(
                 target: LOG_TARGET,
-                "external resize to {}x{} on a fullscreen window; re-asserting the monitor rect",
-                incoming.0, incoming.1,
+                "external resize of fullscreen window {hwnd:p} to {}x{} covers the monitor rect \
+                 {}; left as it is",
+                incoming.0, incoming.1, rect.label(),
             );
-            apply_fullscreen_window(saved.hwnd, saved);
+        }
+        ExternalResizeAction::Reassert => {
+            let placement = apply_fullscreen_window(hwnd, saved);
+            // Bounded by the guard's budget between refills, and by the info
+            // cap across them (see `REASSERTS_LOGGED_AT_INFO`).
+            let level = if reasserts <= REASSERTS_LOGGED_AT_INFO {
+                Level::Info
+            } else {
+                Level::Debug
+            };
+            log!(
+                target: LOG_TARGET,
+                level,
+                "external resize of fullscreen window {hwnd:p} to {}x{} against the monitor rect \
+                 {} ({mode}); re-assert {reasserts} of this session: {placement}{}",
+                incoming.0, incoming.1, rect.label(),
+                if reasserts == REASSERTS_LOGGED_AT_INFO {
+                    "; later re-asserts of this session log at debug"
+                } else {
+                    ""
+                },
+            );
         }
         ExternalResizeAction::Suppressed => {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "the window manager keeps re-sizing the fullscreen window ({}x{}); leaving it, \
-                 the back buffer keeps its size and present scales the frame",
-                incoming.0, incoming.1,
+                "the window manager keeps re-sizing the fullscreen window {hwnd:p} to {}x{} \
+                 against the monitor rect {} ({mode}) after {reasserts} re-assert(s) this \
+                 session; leaving it, the back buffer keeps its size and present scales the \
+                 frame",
+                incoming.0, incoming.1, rect.label(),
             );
         }
     }
@@ -879,8 +1070,9 @@ const fn fullscreen_exstyle(exstyle: u32) -> u32 {
 ///
 /// Runs after any mode-set: win32u recomputes a window's physical rect only
 /// on its next `SetWindowPos`, so this is also what puts the `NSWindow` onto
-/// the physical monitor once the mode is in place.
-fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
+/// the physical monitor once the mode is in place. Returns where the window
+/// went, for the caller's transition line.
+fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) -> WindowPlacement {
     let _driving = DrivingGuard::new(hwnd);
     let style = fullscreen_style(saved.style);
     let exstyle = fullscreen_exstyle(saved.exstyle);
@@ -889,7 +1081,7 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
 
     let Some(rect) = primary_monitor_rect() else {
         warn!(target: LOG_TARGET, "GetMonitorInfo failed — device window not resized to the monitor");
-        return;
+        return WindowPlacement::NoMonitor;
     };
     // Deliberately `SWP_NOZORDER` rather than `HWND_TOPMOST`. Raising a
     // window to the topmost level makes Wine's mac driver re-derive the Cocoa
@@ -914,6 +1106,19 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
         "fullscreen window {}x{} at ({}, {}), style {style:#010x}/{exstyle:#010x}",
         rect.width(), rect.height(), rect.left, rect.top,
     );
+    WindowPlacement::Placed(rect.label())
+}
+
+/// How leaving fullscreen puts the window back, which the kind of device decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeaveKind {
+    /// A plain device: the pre-fullscreen rect, with the visibility the window has now.
+    Plain,
+    /// An extended device: the window stays where fullscreen put it and gets its saved visibility.
+    ///
+    /// `D3D9Ex` restores the window's style when it leaves fullscreen,
+    /// visibility included, and leaves its position and size alone.
+    Extended,
 }
 
 /// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.
@@ -922,7 +1127,7 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
 /// session intact for a retry, and roll back to the actual display mode and
 /// window state, which the application may have changed while fullscreen.
 /// A failed snapshot rejects the transition before anything moves.
-pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
+pub fn try_leave(saved: &SavedWindow, kind: LeaveKind, accept: impl FnOnce() -> bool) -> bool {
     let mut mode = empty_devmode();
     if !enum_display_settings(ENUM_CURRENT_SETTINGS, &mut mode) {
         warn!(target: LOG_TARGET, "cannot snapshot the display mode for a windowed Reset");
@@ -942,15 +1147,19 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
     // Covers the display-change broadcasts as well as both window moves:
     // the provisional geometry must never trigger a device auto-resize.
     let _driving = DrivingGuard::new(saved.hwnd);
-    leave(saved);
+    leave(saved, kind, &LeaveReason::ProvisionalWindowedReset);
     if accept() {
         return true;
     }
     let result = change_display_settings(Some(&mut mode), CDS_FULLSCREEN);
-    if result != DISP_CHANGE_SUCCESSFUL {
-        warn!(target: LOG_TARGET, "failed to restore the display after a rejected Reset (ret={result})");
-    }
-    if let Some(rect) = rect {
+    // A window with no snapshot was the app's or was already destroyed, and
+    // is left as it is.
+    let untouched = if saved.manage_window {
+        WindowPlacement::Gone
+    } else {
+        WindowPlacement::AppOwned
+    };
+    let placement = rect.map_or(untouched, |rect| {
         set_window_long(saved.hwnd, GWL_STYLE, style);
         set_window_long(saved.hwnd, GWL_EXSTYLE, exstyle);
         set_window_pos(
@@ -959,24 +1168,97 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
             rect,
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
         );
+        WindowPlacement::Placed(rect.label())
+    });
+    let (width, height) = (mode.pels_width, mode.pels_height);
+    if result == DISP_CHANGE_SUCCESSFUL {
+        info!(
+            target: LOG_TARGET,
+            "windowed Reset rejected, fullscreen kept on window {:p}: display mode \
+             {width}x{height} put back; {placement}",
+            saved.hwnd,
+        );
+    } else {
+        warn!(
+            target: LOG_TARGET,
+            "windowed Reset rejected, fullscreen kept on window {:p}: putting display mode \
+             {width}x{height} back failed (ret={result}); {placement}",
+            saved.hwnd,
+        );
     }
     false
 }
 
-/// Restore the display mode and the window state captured by [`enter`].
-pub fn leave(saved: &SavedWindow) {
+/// Restore the display mode and the window state captured by [`enter`], as `kind` says.
+///
+/// One line names `reason`, the registry restore and where the window went.
+pub fn leave(saved: &SavedWindow, kind: LeaveKind, reason: &LeaveReason) {
     // Leaving fullscreen (windowed `Reset` or device destruction) puts the
     // registry display mode back first, matching native D3D9's order (mode
     // restore, then window restore), so the saved rect lands in the space it
     // was captured in. No-op when the mode is already the desktop's.
-    restore_registry_mode();
+    //
+    // An extended device keeps the window where it is, which is where it
+    // stands before the mode restore. D3D9Ex leaves its position and size
+    // alone; this passes the rect read here to the final `SetWindowPos`
+    // instead, which on Windows is the same rect. Under Wine on macOS the
+    // restore can move the window: AppKit keeps a window it still shows
+    // below the menu bar when the screen changes, and Wine applies that move
+    // to the Win32 rect whenever the thread processes driver events, as it
+    // does while the mode change's `WM_DISPLAYCHANGE` broadcast waits for
+    // other threads' windows. The explicit rect undoes that move. A move the
+    // application's own procedure makes during the restore, answering the
+    // broadcast or the driver's move, is the application's, and the window
+    // stays where it put it. A move another thread makes in that span is
+    // undone with the driver's, which on Windows would stay;
+    // `CONFORMANCE.md` keeps that as a divergence. A child window's rect is
+    // in its parent's space, not the screen's, so it is left alone.
+    let kept = match kind {
+        LeaveKind::Extended if window_long(saved.hwnd, GWL_STYLE) & WS_CHILD == 0 => {
+            window_rect(saved.hwnd)
+        }
+        LeaveKind::Extended | LeaveKind::Plain => None,
+    };
+    let watch = kept.map(|_| LeaveWatchGuard::new(saved.hwnd));
+    let restore = restore_registry_mode();
+    let kept = match (kept, watch.as_ref().is_some_and(LeaveWatchGuard::app_moved)) {
+        (Some(_), true) => KeptRect::AppMoved,
+        (Some(rect), false) => KeptRect::Read(rect),
+        (None, _) => KeptRect::Unread,
+    };
+    drop(watch);
+    let placement = restore_window(saved, kind, &kept);
+    log!(
+        target: LOG_TARGET,
+        if restore.failed() { Level::Warn } else { Level::Info },
+        "fullscreen left ({reason}) on window {:p}: {restore}; {placement}",
+        saved.hwnd,
+    );
+}
+
+/// Where an extended device's leave puts the window, as [`leave`] decided it.
+enum KeptRect {
+    /// The rect read before the mode restore, put back explicitly.
+    Read(Rect),
+    /// The application moved the window during the restore; it stays there.
+    AppMoved,
+    /// No rect was read (a plain device, a child window, or an unreadable rect).
+    Unread,
+}
+
+/// Put the window back as [`enter`] found it and `kind` says, saying where it went.
+///
+/// `kept` is used by an extended device alone: the rect it leaves the window
+/// at, or the position and size it leaves alone when the application moved
+/// the window during the restore or the rect could not be read.
+fn restore_window(saved: &SavedWindow, kind: LeaveKind, kept: &KeptRect) -> WindowPlacement {
     if window_changes_suppressed(saved) {
-        return;
+        return WindowPlacement::AppOwned;
     }
     let _driving = DrivingGuard::new(saved.hwnd);
     let hwnd = saved.hwnd;
     if !is_window(hwnd) {
-        return;
+        return WindowPlacement::Gone;
     }
 
     // WS_VISIBLE changed because *we* changed it, so it is excluded from both
@@ -999,27 +1281,54 @@ pub fn leave(saved: &SavedWindow) {
         set_window_long(hwnd, GWL_EXSTYLE, saved.exstyle);
     }
 
-    let show = if style & WS_VISIBLE == 0 {
-        0
-    } else {
-        SWP_SHOWWINDOW
+    // An extended device gives the window back the visibility it had before
+    // fullscreen showed it; a plain device keeps the visibility the window
+    // has now.
+    let visible = match kind {
+        LeaveKind::Extended => saved.style,
+        LeaveKind::Plain => style,
+    } & WS_VISIBLE
+        != 0;
+    let show = match (kind, visible) {
+        (_, true) => SWP_SHOWWINDOW,
+        (LeaveKind::Extended, false) => SWP_HIDEWINDOW,
+        (LeaveKind::Plain, false) => 0,
     };
-    // A window whose rect we never managed to read stays where it is rather
-    // than being teleported to a zero rect at the desktop origin.
-    let geometry = if saved.rect.width() == 0 || saved.rect.height() == 0 {
-        SWP_NOMOVE | SWP_NOSIZE
-    } else {
-        0
+    // An extended device leaves the window where fullscreen put it, at the
+    // rect read before the mode restore. A window whose rect we never managed
+    // to read stays where it is too, rather than being teleported to a zero
+    // rect at the desktop origin.
+    let unknown_rect = saved.rect.width() == 0 || saved.rect.height() == 0;
+    let (rect, geometry) = match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::Read(kept)) => (*kept, 0),
+        (LeaveKind::Extended, KeptRect::AppMoved | KeptRect::Unread) => {
+            (saved.rect, SWP_NOMOVE | SWP_NOSIZE)
+        }
+        (LeaveKind::Plain, _) if unknown_rect => (saved.rect, SWP_NOMOVE | SWP_NOSIZE),
+        (LeaveKind::Plain, _) => (saved.rect, 0),
+    };
+    // Where the restore left the window, named when the leave puts it back.
+    let put_back = match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::Read(kept)) => window_rect(hwnd)
+            .filter(|now| !now.same_as(kept))
+            .map(|now| now.label()),
+        _ => None,
     };
     set_window_pos(
         hwnd,
         core::ptr::null_mut(),
-        saved.rect,
+        rect,
         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | show | geometry,
     );
-    debug!(
-        target: LOG_TARGET,
-        "restored windowed rect {}x{} at ({}, {})",
-        saved.rect.width(), saved.rect.height(), saved.rect.left, saved.rect.top,
-    );
+    match (kind, kept) {
+        (LeaveKind::Extended, KeptRect::AppMoved) => {
+            WindowPlacement::KeptAppMove { shown: visible }
+        }
+        (LeaveKind::Extended, _) => WindowPlacement::KeptFullscreen {
+            shown: visible,
+            put_back,
+        },
+        (LeaveKind::Plain, _) if unknown_rect => WindowPlacement::Unmoved,
+        (LeaveKind::Plain, _) => WindowPlacement::Placed(saved.rect.label()),
+    }
 }

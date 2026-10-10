@@ -2,8 +2,8 @@ use super::{
     Thunk, Thunks,
     mtl::{
         BufferKind, ColorSpacePolicy, CursorOverlayFlags, DestroyKind, DeviceCapsFlags, LoadAction,
-        PixelFormat, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle,
-        TextureUsage, VertexFormat, VertexStepFunction,
+        PixelFormat, PresentDebugFlags, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode,
+        StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -35,6 +35,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
+    assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
@@ -47,34 +48,70 @@ const _: () = {
 ///
 /// Fired once from d3d9.dll on load, before other thunks can log.
 /// The UTF-8 filter comes from the PE process environment and is borrowed for the call.
+///
+/// `early_dir` and `early_stem` name the default log location, the unix path
+/// of `mtld3d-logs` beside the executable and the executable's stem, both
+/// UTF-8 without a terminator and borrowed for the call. A crash report that
+/// arrives before `OpenLog` opens `<early_dir>/<early_stem>-<pid>.log` there,
+/// since the process may die before `Direct3DCreate9` names the real one. A
+/// zero length means the PE side could not derive it.
 #[repr(C, align(8))]
 pub struct InitLoggerParams {
     pub filter_ptr: u64,
+    pub early_dir_ptr: u64,  // in: *const u8
+    pub early_stem_ptr: u64, // in: *const u8
     pub filter_len: u32,
-    pub reserved: u32,
+    pub early_dir_len: u32,  // in: byte count
+    pub early_stem_len: u32, // in: byte count
+    pub pad0: u32,
 }
 
 const _: () = {
-    assert!(size_of::<InitLoggerParams>() == 16);
+    assert!(size_of::<InitLoggerParams>() == 40);
     assert!(align_of::<InitLoggerParams>() == 8);
     assert!(core::mem::offset_of!(InitLoggerParams, filter_ptr) == 0);
-    assert!(core::mem::offset_of!(InitLoggerParams, filter_len) == 8);
-    assert!(core::mem::offset_of!(InitLoggerParams, reserved) == 12);
+    assert!(core::mem::offset_of!(InitLoggerParams, early_dir_ptr) == 8);
+    assert!(core::mem::offset_of!(InitLoggerParams, early_stem_ptr) == 16);
+    assert!(core::mem::offset_of!(InitLoggerParams, filter_len) == 24);
+    assert!(core::mem::offset_of!(InitLoggerParams, early_dir_len) == 28);
+    assert!(core::mem::offset_of!(InitLoggerParams, early_stem_len) == 32);
+    assert!(core::mem::offset_of!(InitLoggerParams, pad0) == 36);
 };
 
 impl Thunk for InitLoggerParams {
     const CODE: u32 = Thunks::InitLogger as u32;
 }
 
-/// One formatted log line from the PE-side logger, for the unix stderr.
+/// What a line `WriteLog` carries is, which decides where it may go.
+#[repr(u32)]
+pub enum LogLineKind {
+    /// An ordinary line: it waits in the backlog until `OpenLog` names the file.
+    Ordinary = 0,
+    /// A line of a fault report the process may still recover from.
+    ///
+    /// Written as an ordinary line, except that the unix side only tries the
+    /// sink's lock, which a fault raised out of a unix call can leave held.
+    FaultReport = 1,
+    /// A line of a terminal fault's report: before `OpenLog` it opens the early location.
+    CrashReport = 2,
+}
+
+/// One formatted log line from the PE-side logger, for the process's log file.
 ///
 /// `ptr`/`len` describe a byte slice the PE side keeps alive for the call.
 #[repr(C, align(8))]
 pub struct WriteLogParams {
-    pub ptr: u64, // in: *const u8
-    pub len: u32, // in: byte count
-    pub pad0: u32,
+    pub ptr: u64,          // in: *const u8
+    pub len: u32,          // in: byte count
+    pub kind: LogLineKind, // in
 }
+
+const _: () = {
+    assert!(size_of::<WriteLogParams>() == 16);
+    assert!(align_of::<WriteLogParams>() == 8);
+    assert!(core::mem::offset_of!(WriteLogParams, len) == 8);
+    assert!(core::mem::offset_of!(WriteLogParams, kind) == 12);
+};
 
 impl Thunk for WriteLogParams {
     const CODE: u32 = Thunks::WriteLog as u32;
@@ -160,7 +197,8 @@ pub struct CreateCommandQueueParams {
     /// side copies them into the presenter state it creates for this queue.
     pub gate_file_ptr: u64, // in: *const u8
     pub gate_file_len: u32,                        // in: byte count
-    pub pad0: u32,
+    /// The queue's presenter switches, `debug.presentOccluded` among them.
+    pub present_debug: PresentDebugFlags, // in
 }
 
 impl Thunk for CreateCommandQueueParams {
@@ -408,15 +446,15 @@ pub struct VertexAttrDesc {
     pub format: VertexFormat, // in
 }
 
-/// One vertex buffer layout of a render pipeline: a D3D9 stream the draw reads.
+/// One vertex buffer layout of a render pipeline: a Metal vertex buffer slot the draw reads.
 ///
 /// Borrowed by native pipeline creation,
-/// one entry per stream that contributes an attribute. `stride` is never 0
+/// one entry per Metal vertex buffer slot that feeds an attribute. `stride` is never 0
 /// (Metal rejects it for every step function). `step_rate` is the instances
 /// per advance for `PerInstance`, 1 for `PerVertex`, 0 for `Constant`.
 #[repr(C, align(4))]
 pub struct VertexBufferLayoutDesc {
-    pub buffer_index: u32, // in: Metal vertex buffer slot (= D3D9 stream)
+    pub buffer_index: u32, // in: Metal vertex buffer slot (stream n at n, or a crossing slot)
     pub stride: u32,       // in: bytes per step
     pub step_function: VertexStepFunction, // in
     pub step_rate: u32,    // in

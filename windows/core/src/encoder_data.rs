@@ -15,7 +15,7 @@ use mtld3d_types::SAMPLER_STATE_COUNT;
 use crate::{
     buffer_rename::BufferMapMode,
     dirty_rect::DirtyRect,
-    draw_data::{CurrentSnapshotPtr, DrawOp, ScratchSlice},
+    draw_data::{DrawOp, ScratchSlice},
     encoder_reply::{ReplyBool, ReplyU64},
     ids::{BufferId, ProgramId, TextureId},
     page_box::{PageBox, PageBoxRead},
@@ -199,6 +199,39 @@ pub struct StretchSurfaceInfo {
     pub sample_count: u8,
 }
 
+impl StretchSurfaceInfo {
+    /// Name the surface class `StretchRect` eligibility is judged on, for a rejection line.
+    ///
+    /// A standalone colour surface is the back buffer or a `CreateRenderTarget`
+    /// surface. Both report `D3DUSAGE_RENDERTARGET`, so the name does not tell
+    /// them apart.
+    #[must_use]
+    pub const fn class_name(&self) -> &'static str {
+        match self.kind {
+            StretchKind::DepthStencil(_) => "depth-stencil surface",
+            StretchKind::Backbuffer(_) => "standalone render target",
+            StretchKind::Texture(_) => {
+                if self
+                    .flags
+                    .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
+                {
+                    "offscreen-plain surface"
+                } else if self.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+                    if self.slice.is_some() {
+                        "render-target cube face"
+                    } else {
+                        "render-target texture level"
+                    }
+                } else if self.slice.is_some() {
+                    "cube face"
+                } else {
+                    "texture level"
+                }
+            }
+        }
+    }
+}
+
 /// Render target 0 as the encoder binds it.
 ///
 /// A parameter bag rather than eight positional arguments. `logical_size` is
@@ -253,8 +286,8 @@ pub struct BlitSide {
 ///
 /// `GetDC` and `LockRect` hand their bytes out at the extent D3D9 reports, so
 /// under a `render.scale` below 100% the page the caller wrote is larger than
-/// the texture it belongs in. Serves writable backbuffer and render-target
-/// locks and device contexts. Built by `surface.rs` on the API
+/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and
+/// `UnlockRect` write-back. Built by `surface.rs` on the API
 /// thread, which is where the device's scale and the surface's extent are both
 /// reachable.
 pub struct ResampledUpload {
@@ -280,24 +313,29 @@ pub struct ResampledUpload {
     pub sample_count: u8,
 }
 
-/// One `UpdateSurface` region into a colour surface no texture backs, resolved on the API thread.
+/// One region of rows into a colour surface or texture level, resolved on the API thread.
 ///
-/// The destination is a render-target surface or the back buffer. Built by
-/// `device_update_surface`, where the surface's extent and scale are
-/// reachable, and run by `update_color_region` on the encoder thread, in API
-/// order among the application's passes.
+/// The destination is a render-target surface or the back buffer, written by
+/// `UpdateSurface` (`device_update_surface`); a lockable render target,
+/// written whole at its `UnlockRect` or `ReleaseDC` (`lockable_rt_upload`); or
+/// a level of a render-target texture `render.scale` shrinks, written by any
+/// CPU path into its staging (`texture::schedule_resampled_upload`). Each
+/// builder runs where the destination's extent and scale are reachable;
+/// `update_color_region` runs it
+/// on the encoder thread, in API order among the application's passes, after
+/// resolving the destination's `MTLTexture` from the op's kind.
 pub struct ColorRegionUpdate {
-    /// Destination colour `MTLTexture`.
-    pub color_handle: u64,
+    /// Mip level of the destination; 0 for a surface.
+    pub level: u32,
     /// Metal format of the destination, which the rows are already encoded in.
     pub format: PixelFormat,
     /// Where the region's top-left texel lands, in the coordinates D3D9 reports.
     pub origin: (u32, u32),
     /// Extent of the region, which is the extent the rows describe.
     pub extent: (u32, u32),
-    /// Extent of the destination as D3D9 reports it.
+    /// Extent of the destination level as D3D9 reports it.
     pub logical: (u32, u32),
-    /// Extent Metal allocated for the destination, at or below `logical`.
+    /// Extent Metal allocated for the destination level, at or below `logical`.
     pub texture: (u32, u32),
     /// The scale that relates `texture` to `logical`.
     pub scale: RenderScale,
@@ -429,6 +467,18 @@ pub struct TextureInfo {
     pub usage_flags: TextureUsage,
 }
 
+impl TextureInfo {
+    /// The level of this Metal texture a reported mip `level` addresses.
+    ///
+    /// `levels` is the Metal chain, which a texture rasterized at a
+    /// `render.scale` may hold shorter than the chain D3D9 reports; see
+    /// [`crate::render_scale::rasterized_level`].
+    #[must_use]
+    pub const fn rasterized_level(&self, level: u32) -> u32 {
+        crate::render_scale::rasterized_level(level, self.levels)
+    }
+}
+
 /// The Metal textures a standalone colour surface owns, for retirement.
 ///
 /// A surface can carry up to four: the single-sample texture the D3D9
@@ -473,6 +523,10 @@ pub struct SetViewportOp {
 
 pub struct SetVertexSamplerOp {
     pub slot: u8,
+    /// The vertex sampler's `D3DSAMP_*` states, indexed by state.
+    ///
+    /// Index [`crate::sampler_state::TEXTURE_LOD_SLOT`] is always 0: a vertex
+    /// sample names its level, so no texture LOD reaches a vertex row.
     pub state: [u32; SAMPLER_STATE_COUNT],
 }
 
@@ -503,6 +557,16 @@ pub struct UnbindExtraColorOp {
 
 pub struct DestroyTextureOp {
     pub tex_id: TextureId,
+}
+
+/// A vertex or index buffer released with no CPU backing left to retire.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy once
+/// an upload has carried every byte, so its release has no `PageBox` to send
+/// through the retention queue. The device buffer the draws bind is still
+/// cached on the encoder, and this is what takes it out.
+pub struct DestroyBufferOp {
+    pub buffer_id: BufferId,
 }
 
 pub struct ReadColorHandleOp {
@@ -628,6 +692,7 @@ pub struct UploadResampledOp {
 }
 
 pub struct UpdateColorRegionOp {
+    pub kind: StretchKind,
     pub target: ColorRegionUpdate,
     pub bytes: ScratchSlice,
 }
@@ -738,8 +803,6 @@ pub enum Op {
         rows: u16,
         data: ScratchSlice,
     },
-    /// Install decoded native state before dependent draws.
-    SetSnapshot(CurrentSnapshotPtr),
     /// Issue a draw using the current snapshot.
     Draw(DrawOp),
     SetViewport(
@@ -773,6 +836,10 @@ pub enum Op {
     DestroyTexture(
         #[cfg(windows)] DestroyTextureOp,
         #[cfg(not(windows))] Box<DestroyTextureOp>,
+    ),
+    DestroyBuffer(
+        #[cfg(windows)] DestroyBufferOp,
+        #[cfg(not(windows))] Box<DestroyBufferOp>,
     ),
     ReadColorHandle(
         #[cfg(windows)] ReadColorHandleOp,
@@ -924,14 +991,14 @@ bitflags::bitflags! {
         /// texture safe to read from the subsequent readback-blit command
         /// buffer.
         const NO_PRESENT = 1 << 1;
-        /// First frame of an F12 run: start the Metal GPU capture before it.
+        /// First frame of a Ctrl+Shift+P run: start the Metal GPU capture before it.
         ///
         /// Set by `frame_dump_present` on the frame it arms. The encoder
         /// drains the submit thread, starts the capture and runs every frame
         /// synchronously until `GPU_CAPTURE_STOP` so each `SubmitFrame`
         /// thunk falls inside the bracket.
         const GPU_CAPTURE_START = 1 << 2;
-        /// Last frame of an F12 run: stop the Metal GPU capture after it.
+        /// Last frame of a Ctrl+Shift+P run: stop the Metal GPU capture after it.
         ///
         /// A frame swap that does not present moves this bit onto the
         /// continuation, so the capture ends with the piece the closing
@@ -1622,3 +1689,6 @@ pub const fn capture_op<T>(value: T) -> T {
 pub fn capture_op<T>(value: T) -> Box<T> {
     Box::new(value)
 }
+
+#[cfg(test)]
+mod tests;

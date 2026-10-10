@@ -30,7 +30,27 @@
 //!
 //! Faults in other modules (game code, `ClientExtensions.dll` `VMProtect`
 //! probes, system DLLs) pass through to SEH normally, so `VMProtect`'s
-//! first-chance recovery still works and `WoW` continues.
+//! first-chance recovery still works and `WoW` continues. Their report is a
+//! first-chance one: it waits in the backlog and opens no log, since the
+//! fault may be handled. When nothing handles it, Wine ends the process with
+//! `TerminateProcess` on itself, which runs nothing of ours, so before
+//! `Direct3DCreate9` that report dies with the process and only the unix
+//! side's first-chance line on stderr remains. A top-level filter for
+//! unhandled exceptions does not cover that case: the startup code of a game
+//! built with Visual Studio 2015 or later replaces such a filter without
+//! chaining, and one left behind by a `FreeLibrary` before any device would
+//! point into unmapped code.
+//!
+//! The vectored handler runs on whatever thread raised the exception, and
+//! nothing it reaches touches a Rust thread-local or the allocator: fixed
+//! buffers, atomics, `kernel32` lookups that allocate nothing, and the
+//! synchronous log thunk. Wine leaves `TEB.ThreadLocalStoragePointer` null
+//! on a thread created without thread-attach notifications and after a
+//! thread's detach, and copy protectors raise exceptions on such threads, so
+//! a thread-local read in the handler faults inside this image; that fault
+//! reaches the handler again, and a protector's frame that resumes the first
+//! exception at its own PC loops the thread. A faulting thread may also hold
+//! an allocator's lock.
 //!
 //! `RUST_BACKTRACE=1` is set here (if unset) so the default panic hook
 //! attempts a backtrace.
@@ -40,6 +60,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
+use mtld3d_core::address_space::FreeSpace;
 use mtld3d_shared::crumb;
 
 // NTSTATUS codes the handler filters on.
@@ -53,6 +74,8 @@ const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// `GetModuleHandleEx` flag that leaves the module's reference count as it is.
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 2;
 /// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
 
@@ -83,14 +106,27 @@ struct MemoryBasicInformation {
 
 const MEM_FREE: u32 = 0x1_0000;
 
-/// The largest free region of the address space in MiB.
+/// Free address space of this process: the sum of the usable free regions and the largest.
 ///
-/// Free space that no single allocation can use is what fails a DLL load
-/// or a game's streaming block long before the total runs out, so this is
-/// the number to read next to `avail_virtual_mib`. Walks every region
-/// once (a few thousand `VirtualQuery` calls).
-pub fn largest_free_region_mib() -> u64 {
-    let mut largest = 0usize;
+/// The free figure the address-space watch and the crash lines report. It is
+/// not `GlobalMemoryStatusEx`'s `ullAvailVirtual`, which Wine computes as the
+/// total minus the process working set (see `mtld3d_core::address_space`).
+/// Free space that no single allocation can use is what fails a DLL load or a
+/// game's streaming block long before the total runs out, so both come from
+/// the same walk. Allocation-free, so the exception handler can call it.
+pub fn free_space() -> FreeSpace {
+    let mut space = FreeSpace::new();
+    walk_regions(|addr, info| {
+        space.add_region(info.state == MEM_FREE, addr as u64, info.region_size as u64);
+    });
+    space
+}
+
+/// Visit every region of the address space in address order, with its base address.
+///
+/// One `VirtualQuery` per region (a few thousand calls), stopping where the
+/// query fails or the address would wrap.
+fn walk_regions(mut visit: impl FnMut(usize, &MemoryBasicInformation)) {
     let mut addr = 0usize;
     loop {
         let mut info = MemoryBasicInformation {
@@ -113,15 +149,12 @@ pub fn largest_free_region_mib() -> u64 {
         if got == 0 || info.region_size == 0 {
             break;
         }
-        if info.state == MEM_FREE {
-            largest = largest.max(info.region_size);
-        }
+        visit(addr, &info);
         let Some(next) = addr.checked_add(info.region_size) else {
             break;
         };
         addr = next;
     }
-    (largest as u64) >> 20
 }
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -131,39 +164,13 @@ const MEM_MAPPED: u32 = 0x4_0000;
 
 /// A summary of the address space: region counts by state and the largest regions.
 ///
-/// One line of text for the log, built when the largest free block has
-/// collapsed, so the log names who owns the space (image, mapped file,
-/// private commit, private reserve) and where the biggest holes are.
+/// One line of text for the log, built when the free space crosses one of
+/// the watch's thresholds, so the log names who owns the space (image,
+/// mapped file, private commit, private reserve) and where the biggest holes
+/// are.
 pub fn address_space_map() -> String {
     let mut regions: Vec<(usize, usize, u32, u32)> = Vec::new();
-    let mut addr = 0usize;
-    loop {
-        let mut info = MemoryBasicInformation {
-            base_address: core::ptr::null_mut(),
-            allocation_base: core::ptr::null_mut(),
-            allocation_protect: 0,
-            region_size: 0,
-            state: 0,
-            protect: 0,
-            kind: 0,
-        };
-        // SAFETY: kernel32 export filling a struct of the size passed.
-        let got = unsafe {
-            VirtualQuery(
-                addr as *const c_void,
-                &raw mut info,
-                size_of::<MemoryBasicInformation>(),
-            )
-        };
-        if got == 0 || info.region_size == 0 {
-            break;
-        }
-        regions.push((addr, info.region_size, info.state, info.kind));
-        let Some(next) = addr.checked_add(info.region_size) else {
-            break;
-        };
-        addr = next;
-    }
+    walk_regions(|addr, info| regions.push((addr, info.region_size, info.state, info.kind)));
     let mut free = 0usize;
     let mut committed = 0usize;
     let mut reserved = 0usize;
@@ -232,41 +239,6 @@ pub fn address_space_map() -> String {
     out
 }
 
-/// `MEMORYSTATUSEX`; only the virtual-address-space fields are read.
-#[repr(C)]
-struct MemoryStatusEx {
-    length: u32,
-    memory_load: u32,
-    total_phys: u64,
-    avail_phys: u64,
-    total_page_file: u64,
-    avail_page_file: u64,
-    total_virtual: u64,
-    avail_virtual: u64,
-    avail_extended_virtual: u64,
-}
-
-/// Free virtual address space of this process in MiB, if the query works.
-///
-/// The number that matters for a 32-bit game: when it reaches zero,
-/// allocations fail and the game follows a garbage pointer soon after.
-pub fn avail_virtual_mib() -> Option<u64> {
-    let mut status = MemoryStatusEx {
-        length: u32::try_from(size_of::<MemoryStatusEx>()).expect("64-byte struct"),
-        memory_load: 0,
-        total_phys: 0,
-        avail_phys: 0,
-        total_page_file: 0,
-        avail_page_file: 0,
-        total_virtual: 0,
-        avail_virtual: 0,
-        avail_extended_virtual: 0,
-    };
-    // SAFETY: kernel32 export filling the struct whose `length` names its size.
-    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
-    (ok != 0).then_some(status.avail_virtual >> 20)
-}
-
 #[repr(C)]
 struct ExceptionRecord {
     code: u32,
@@ -289,8 +261,7 @@ unsafe extern "system" {
     fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
-    fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
-    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
     fn VirtualQuery(
         address: *const c_void,
         buffer: *mut MemoryBasicInformation,
@@ -345,7 +316,10 @@ pub fn uninstall() {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        write_stderr(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
+        // A panic ends the process: its report may open the early log, with
+        // the lines queued since load ahead of it.
+        crate::log_sink::forward_parked();
+        crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
         crumb::dump_recent(32);
         emit_image_bases();
         // Chain to the default hook so the usual "thread '…' panicked
@@ -378,7 +352,7 @@ fn emit_image_bases() {
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] d3d9.dll base=");
     push_hex(&mut buf, &mut pos, our as usize as u64);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
+    crate::log_sink::write_crash(&buf[..pos]);
 }
 
 extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
@@ -409,8 +383,15 @@ extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
 
     // Diagnostic-only. Do NOT terminate — let SEH unwind so the game's own
     // unhandled-exception filter still gets to write its crash report.
+    // Only an always-fatal code is known to end the process here; a fault in
+    // our image is still a first chance a frame up the stack may handle.
     if always_fatal || (possibly_fatal && fault_in_our_dll(addr)) {
-        emit_fatal(code, addr);
+        let line = fatal_line(code, addr);
+        if always_fatal {
+            crate::log_sink::write_crash(line.bytes());
+        } else {
+            crate::log_sink::write_fault(line.bytes());
+        }
         crumb::dump_recent(32);
     } else if possibly_fatal {
         report_foreign_fault(code, addr);
@@ -429,23 +410,32 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
         return;
     }
+    // The lookup and the file name each take Wine's loader lock for the
+    // walk of the module list (`RtlPcToFileHeader` and `LdrGetDllFullName`
+    // enter `loader_section` in `dlls/ntdll/loader.c`). The lock is a critical
+    // section, so a fault on the thread that holds it re-enters it, and the
+    // report costs this only for the first few foreign faults. The handle is
+    // borrowed: without UNCHANGED_REFCOUNT every report would add a reference
+    // the faulting module never loses.
     let mut module: *mut c_void = core::ptr::null_mut();
     // SAFETY: kernel32 export; `addr` is only used as a lookup key.
     let found = unsafe {
         GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             addr.cast::<u8>(),
             &raw mut module,
         )
     };
-    let mut path = [0u8; 260];
+    // The wide form: the ANSI one converts through a buffer it allocates on
+    // the process heap.
+    let mut path = [0u16; 260];
     let path_len = if found == 0 || module.is_null() {
         0
     } else {
-        // SAFETY: kernel32 export writing at most `path.len()` bytes.
-        unsafe { GetModuleFileNameA(module, path.as_mut_ptr(), 260) }
+        // SAFETY: kernel32 export writing at most `path.len()` UTF-16 units.
+        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), 260) }
     };
-    let mut buf = [0u8; 400];
+    let mut buf = [0u8; 1024];
     let mut pos = 0;
     push(
         &mut buf,
@@ -460,63 +450,67 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
         push(&mut buf, &mut pos, b"?");
     } else {
         let n = (path_len as usize).min(path.len());
-        push(&mut buf, &mut pos, &path[..n]);
+        push_utf16(&mut buf, &mut pos, &path[..n]);
         push(&mut buf, &mut pos, b" base=");
         push_hex(&mut buf, &mut pos, module as usize as u64);
     }
-    push_avail_virtual(&mut buf, &mut pos);
+    push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
+    // A first chance: the fault may be handled, so the line opens no log.
+    crate::log_sink::write_fault(&buf[..pos]);
     crumb::dump_recent(16);
 }
 
-/// Append the address-space state so a crash line carries it.
-fn push_avail_virtual(buf: &mut [u8], pos: &mut usize) {
-    if let Some(mib) = avail_virtual_mib() {
-        push(buf, pos, b" avail_virtual_mib=");
-        push_hex(buf, pos, mib);
-    }
+/// Append the free address space so a crash line carries it.
+fn push_free_space(buf: &mut [u8], pos: &mut usize) {
+    let space = free_space();
+    push(buf, pos, b" free_mib=");
+    push_hex(buf, pos, space.total_mib());
     push(buf, pos, b" largest_free_mib=");
-    push_hex(buf, pos, largest_free_region_mib());
+    push_hex(buf, pos, space.largest_mib());
 }
 
+/// Whether `addr` lies in this image, from its own headers.
+///
+/// Every access violation and illegal instruction in the process asks this,
+/// so it makes no call: no loader lock, and no reference taken on the module
+/// that faulted.
 fn fault_in_our_dll(addr: *mut c_void) -> bool {
-    let our = D3D9_HMODULE.load(Ordering::Acquire);
-    if our.is_null() {
+    let base = D3D9_HMODULE.load(Ordering::Acquire) as usize;
+    if base == 0 {
         return false;
     }
-    let mut module: *mut c_void = core::ptr::null_mut();
-    // SAFETY: GetModuleHandleExA with FROM_ADDRESS returns the HMODULE
-    // containing `addr` without incrementing its refcount when paired
-    // with UNCHANGED_REFCOUNT (flag 2). Passing just FROM_ADDRESS
-    // (flag 4) adds a refcount — the leak is acceptable because this
-    // only runs on a fault the process does not survive.
-    let ok = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            addr.cast::<u8>(),
-            &raw mut module,
-        )
+    // SAFETY: `base` is this image's `HMODULE` from `DllMain`, and the
+    // handler is registered only while the image is mapped.
+    let Some(size) = (unsafe { mtld3d_shared::identity::image_size(base) }) else {
+        return false;
     };
-    ok != 0 && module == our
+    (addr as usize).wrapping_sub(base) < size
 }
 
-fn emit_fatal(code: u32, addr: *mut c_void) {
-    let mut buf = [0u8; 128];
+/// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
+struct FatalLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl FatalLine {
+    /// The line's bytes.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+fn fatal_line(code: u32, addr: *mut c_void) -> FatalLine {
+    let mut buf = [0u8; 160];
     let mut pos = 0;
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] FATAL: code=");
     push_hex(&mut buf, &mut pos, u64::from(code));
     push(&mut buf, &mut pos, b" addr=");
     push_hex(&mut buf, &mut pos, addr as usize as u64);
-    push_avail_virtual(&mut buf, &mut pos);
+    push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
-    write_stderr(&buf[..pos]);
-}
-
-fn write_stderr(bytes: &[u8]) {
-    // Synchronously through the unix side, into the process's log file: a
-    // launcher-spawned game has no usable stderr handle of its own.
-    crate::log_sink::write_raw(bytes);
+    FatalLine { buf, len: pos }
 }
 
 fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {
@@ -524,6 +518,15 @@ fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {
     let take = bytes.len().min(avail);
     buf[*pos..*pos + take].copy_from_slice(&bytes[..take]);
     *pos += take;
+}
+
+/// Append UTF-16 text as UTF-8, an unpaired surrogate as U+FFFD.
+fn push_utf16(buf: &mut [u8], pos: &mut usize, units: &[u16]) {
+    for c in char::decode_utf16(units.iter().copied()) {
+        let mut utf8 = [0u8; 4];
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        push(buf, pos, c.encode_utf8(&mut utf8).as_bytes());
+    }
 }
 
 fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {

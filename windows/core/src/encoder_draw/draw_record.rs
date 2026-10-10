@@ -915,33 +915,47 @@ impl<'a> VertexView<'a> {
     }
 }
 
-/// Vertex layouts derived directly from borrowed command stream records.
-#[must_use]
+/// Write into `layouts` the vertex layouts derived directly from borrowed command stream records.
+///
+/// Sets in `crossing` the streams an attribute crosses (see
+/// [`crate::draw_data::stream_layouts_with`]), and ORs into `offsets` the
+/// offset of every stream read from a vertex buffer, so a nonzero
+/// [`crate::streams::offset_shift`] of it says one of them is off a
+/// four-byte boundary.
 pub fn stream_layouts_view(
+    layouts: &mut [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize],
     source: &VertexView<'_>,
     attrs: &crate::draw_data::AttrSnapshot,
-) -> [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize] {
+    crossing: &mut u16,
+    offsets: &mut u32,
+) {
     use mtld3d_shared::mtl::VertexStepFunction;
 
     use crate::{
         pipeline_state::StreamLayout,
         streams::{bound_stream_layout, layout_stride},
     };
-    crate::draw_data::stream_layouts_with(attrs, |stream, extent| match source.feed(stream) {
-        StreamViewFeed::Inline { stride } => StreamLayout {
-            stride: layout_stride(stride, extent),
-            step: VertexStepFunction::PerVertex,
-            step_rate: 1,
+    crate::draw_data::stream_layouts_with(
+        layouts,
+        attrs,
+        |stream, extent| match source.feed(stream) {
+            StreamViewFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamViewFeed::Buffer(record) => {
+                *offsets |= record.offset;
+                bound_stream_layout(record.stride, extent, record.frequency)
+            }
+            StreamViewFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
         },
-        StreamViewFeed::Buffer(record) => {
-            bound_stream_layout(record.stride, extent, record.frequency)
-        }
-        StreamViewFeed::Null => StreamLayout {
-            stride: extent,
-            step: VertexStepFunction::Constant,
-            step_rate: 0,
-        },
-    })
+        crossing,
+    );
 }
 
 #[cfg(test)]
