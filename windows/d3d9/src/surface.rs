@@ -9,7 +9,9 @@ use mtld3d_core::{
     perf::SurfaceSubCategory,
     render_scale::{RenderScale, TargetExtent},
     stretch_rect::{StretchRegion, parse_rect},
-    surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
+    surface_lock::{
+        ColorSurfaceLock, classify_color_surface_lock, region_offset, writeback_regions,
+    },
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
@@ -2665,13 +2667,7 @@ fn backbuffer_lock_readback(
     let offset = if read_only {
         Some(0)
     } else {
-        (region.y as usize)
-            .checked_mul(pitch as usize)
-            .and_then(|row| {
-                (region.x as usize)
-                    .checked_mul(bpp as usize)
-                    .and_then(|column| row.checked_add(column))
-            })
+        region_offset(region, pitch, bpp, page.len())
     };
     let Some(pixels) = offset.and_then(|offset| page.as_mut_slice().get_mut(offset..)) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -2850,17 +2846,14 @@ fn backbuffer_snapshot_upload(inner: &mut SurfaceInner) {
         });
         return;
     }
+    let (source_region, destination_region) = writeback_regions(scale, snapshot.region);
     let target = ResampledUpload {
         color_handle,
         format,
         logical: (width, height),
         texture: (scale.dimension(width), scale.dimension(height)),
-        source_region: snapshot.region,
-        destination_region: {
-            let region = snapshot.region;
-            let (x, y, w, h) = scale.rect(region.x, region.y, region.w, region.h);
-            StretchRegion { x, y, w, h }
-        },
+        source_region,
+        destination_region,
         bytes_per_row: src_stride,
         msaa: inner.live_msaa_handle(),
         msaa_srgb: inner.live_msaa_srgb_handle(),
