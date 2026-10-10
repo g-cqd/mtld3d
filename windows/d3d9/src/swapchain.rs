@@ -268,7 +268,7 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
 }
 
 // SAFETY: `refcount_mut` exposes this wrapper's own counter and
-// `private_refcount` the back buffer's binding references; `finalize` frees an app-owned
+// `private_refcount` the back buffer's references; `finalize` frees an app-owned
 // swapchain exactly once when both are zero. The device-owned implicit
 // swapchain forwards its refcount to the device and is never finalized here.
 unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {

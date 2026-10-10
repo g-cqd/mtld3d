@@ -1604,14 +1604,25 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
     if tex.is_null() {
         // SAFETY: a standalone/implicit surface — the central engine finalizes it
         // (or forwards the device release for a device-owned implicit surface).
-        let chain = {
+        let (chain, device) = {
             // SAFETY: this is the live surface whose reference is being released.
             let surface = unsafe { &*this.cast::<Direct3DSurface9>() };
             if surface.refcount == 0 {
                 return 0;
             }
-            surface.forward_swapchain()
+            let chain = surface.forward_swapchain();
+            let device = if chain.is_null() {
+                core::ptr::null_mut()
+            } else {
+                crate::com_ref::ComChild::device_forward_target(surface)
+            };
+            (chain, device)
         };
+        // An additional chain retained privately holds no device reference once
+        // the application has released it, so this surface's forwarded one can
+        // be the device's last: hold the device across the chain's finalize,
+        // which still reaches it, and release it after.
+        crate::device::device_wrapper_add_ref(device);
         // SAFETY: the surface owns the public reference being released.
         let count = unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
         if count == 0 && !chain.is_null() {
@@ -1622,6 +1633,7 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
                 crate::swapchain::Direct3DSwapChain9::private_refcount_dec_maybe_finalize(chain);
             };
         }
+        crate::device::device_wrapper_release(device);
         return count;
     }
     // A texture sub-surface: drop our own refcount and free the surface Box once

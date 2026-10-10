@@ -279,7 +279,8 @@ pub unsafe trait ComChild: Sized {
 
     /// The device-internal "bound slot" refcount.
     ///
-    /// `0` for wrappers that have none (queries, state blocks, swapchains).
+    /// `0` for wrappers that have none (queries, state blocks); an additional
+    /// swap chain counts its back buffer's references here.
     /// The wrapper is finalized only once both this and the public refcount
     /// reach zero.
     fn private_refcount(&self) -> u32 {
