@@ -227,10 +227,9 @@ impl Direct3DSurface9 {
         let inner = unsafe { &mut *self.inner };
         inner.implicit_kind = ImplicitKind::AdditionalBackbuffer;
         inner.container = chain as u64;
-        // SAFETY: the chain is live; balance the surface's existing public reference.
-        unsafe {
-            crate::com_ref::com_add_ref::<crate::swapchain::Direct3DSwapChain9>(chain.cast())
-        };
+        // SAFETY: the chain is live; balance the surface's existing public reference,
+        // whose release below drops the chain reference its 1-to-0 edge holds.
+        unsafe { &mut *chain }.private_refcount_inc();
         surface_release(core::ptr::from_mut(self).cast());
     }
 
@@ -1575,10 +1574,11 @@ extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
         // SAFETY: the cache owns the surface even while its public count is zero.
         let count = unsafe { crate::com_ref::com_add_ref::<Direct3DSurface9>(this) };
         if count == 1 && !chain.is_null() {
+            // The chain stays alive while its back buffer is referenced, but its
+            // public count is the application's alone (Wine's test_refcount reads
+            // it as 1 after GetBackBuffer), so the retain is a private one.
             // SAFETY: the cached surface names its live owning chain.
-            unsafe {
-                crate::com_ref::com_add_ref::<crate::swapchain::Direct3DSwapChain9>(chain.cast())
-            };
+            unsafe { &mut *chain }.private_refcount_inc();
         }
         return count;
     }
@@ -1615,10 +1615,11 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
         // SAFETY: the surface owns the public reference being released.
         let count = unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
         if count == 0 && !chain.is_null() {
-            // SAFETY: the 0-to-1 edge retained this chain. Releasing it can free
-            // the cached surface, so this call must not access the surface again.
+            // SAFETY: the 0-to-1 edge retained this chain privately. Releasing it
+            // can free the cached surface, so this call must not access the
+            // surface again.
             unsafe {
-                crate::com_ref::com_release::<crate::swapchain::Direct3DSwapChain9>(chain.cast())
+                crate::swapchain::Direct3DSwapChain9::private_refcount_dec_maybe_finalize(chain);
             };
         }
         return count;

@@ -169,8 +169,9 @@ struct SwapChainInner {
     /// This (app-owned) swapchain's cached backbuffer surface.
     ///
     /// Initialized before publication; unused on the implicit chain. Its
-    /// public references retain this chain on their 0-to-1 edge, and each
-    /// binding reference retains this chain privately. Only chain teardown
+    /// public references retain this chain privately on their 0-to-1 edge, as
+    /// each binding reference does, so the chain's public count stays the
+    /// application's. Only chain teardown
     /// frees the cached surface, preserving repeated getter identity.
     backbuffer_surface: u64,
 }
@@ -232,9 +233,10 @@ extern "system" fn swapchain_release(this: *mut c_void) -> u32 {
 /// Destroy an app-owned `Direct3DSwapChain9` wrapper once both refcounts reach zero.
 ///
 /// Its back buffer goes with it, so this runs only once the back buffer is
-/// referenced by nothing either: the back buffer's public references retain
-/// this chain publicly and its binding references retain it privately, so
-/// whichever of the two counts reaches zero last finalizes it. The
+/// referenced by nothing either: the back buffer's references, public or
+/// binding, retain this chain through its private count, which leaves the
+/// public count the application's own, so whichever of the two counts reaches
+/// zero last finalizes it. The
 /// device-owned implicit swapchain is never finalized (its shell is leaked at
 /// device teardown).
 ///
@@ -420,7 +422,8 @@ extern "system" fn swapchain_get_back_buffer(
         return D3D_OK;
     }
     // The chain owns one stable, independently allocated surface. Its public
-    // and binding references retain this chain until its last user releases it.
+    // and binding references retain this chain privately until its last user
+    // releases it; the chain's public count is not touched.
     let surf = obj.inner().backbuffer_surface as *mut Direct3DSurface9;
     // SAFETY: `surf` is the live cached backbuffer surface.
     let add_ref = unsafe { (*surf).vtbl().add_ref };
