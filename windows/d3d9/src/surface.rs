@@ -1575,8 +1575,8 @@ extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
         let count = unsafe { crate::com_ref::com_add_ref::<Direct3DSurface9>(this) };
         if count == 1 && !chain.is_null() {
             // The chain stays alive while its back buffer is referenced, but its
-            // public count is the application's alone (Wine's test_refcount reads
-            // it as 1 after GetBackBuffer), so the retain is a private one.
+            // public count is the application's alone (D3D9 leaves it unchanged
+            // by GetBackBuffer), so the retain is a private one.
             // SAFETY: the cached surface names its live owning chain.
             unsafe { &mut *chain }.private_refcount_inc();
         }
