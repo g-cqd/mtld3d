@@ -6,9 +6,9 @@ use std::{
 };
 
 use super::{
-    COMMAND_LINE_UNITS, FATAL_LINES, KEEP, LAYER_LOG_EXT, PROCESS_LOG_EXT, WineLauncher,
-    argument_units, binary_name, fitting_prefix, keep_layer_log, keep_process, keep_stderr,
-    layer_tail, stderr_tail, test_arguments,
+    COMMAND_LINE_UNITS, FATAL_LINES, KEEP, LAYER_LOG_EXT, PROCESS_LOG_EXT, WINE_START_EXE,
+    WINE_START_EXE_FLAG, WineLauncher, argument_units, binary_name, fitting_prefix, keep_layer_log,
+    keep_process, keep_stderr, layer_tail, stderr_tail, test_arguments,
 };
 use crate::{
     attribute::{BinaryOutcome, Launcher as _, ProcessEnd, Report, TestResult, run_binary},
@@ -40,6 +40,26 @@ fn dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("temp dir");
     path
+}
+
+/// The units `fitting_prefix` has spent once every fixed argument is in.
+///
+/// Counted the same way it counts them: whichever of Wine's two image
+/// spellings is larger, the fixed flags, and the one separator the first
+/// name's own units still need added to it.
+fn fixed_head_units(exe: &Path, threads: u32, ignored: bool) -> usize {
+    let image = format!(r"\\?\unix{}", exe.to_string_lossy().replace('/', "\\"));
+    let direct = argument_units(&image, true);
+    let via_start_exe = argument_units(WINE_START_EXE, true)
+        + 1
+        + argument_units(WINE_START_EXE_FLAG, false)
+        + 1
+        + argument_units(&exe.to_string_lossy(), false);
+    let mut units = direct.max(via_start_exe);
+    for arg in test_arguments(Some(&[]), threads, ignored) {
+        units += 1 + argument_units(&arg, false);
+    }
+    units + 1
 }
 
 /// Dozens of the `fixme:dbghelp` lines Wine prints around a backtrace.
@@ -319,12 +339,11 @@ fn command_size_counts_windows_quoting_and_utf16_units() {
 #[test]
 fn command_size_boundary_includes_path_flags_separators_and_nul() {
     let exe = Path::new("/test path/\u{1f680}/suite.exe");
-    let image = r"\\?\unix\test path\🚀\suite.exe";
-    let fixed = image.encode_utf16().count()
-        + 2
-        + 1
-        + " --test-threads=4294967295 --nocapture --exact ".len();
-    let maximum = "x".repeat(COMMAND_LINE_UNITS - fixed);
+    let fixed = fixed_head_units(exe, u32::MAX, false);
+    // Wine's own check fails once the built line reaches COMMAND_LINE_UNITS
+    // units (excluding the NUL), so the last unit that still fits is one
+    // short of it.
+    let maximum = "x".repeat(COMMAND_LINE_UNITS - 1 - fixed);
     assert_eq!(
         fitting_prefix(exe, std::slice::from_ref(&maximum), u32::MAX, false).unwrap(),
         1
@@ -334,7 +353,7 @@ fn command_size_boundary_includes_path_flags_separators_and_nul() {
     // A longer path consumes capacity rather than borrowing an arbitrary
     // reserve from every selection, and a surrogate pair consumes two units.
     let short = Path::new("/suite.exe");
-    let names = vec!["x".repeat(COMMAND_LINE_UNITS - fixed), "🚀".to_owned()];
+    let names = vec!["x".repeat(COMMAND_LINE_UNITS - 1 - fixed), "🚀".to_owned()];
     assert_eq!(fitting_prefix(exe, &names, u32::MAX, false).unwrap(), 1);
     assert_eq!(fitting_prefix(short, &names, u32::MAX, false).unwrap(), 2);
     assert_eq!(
@@ -360,12 +379,8 @@ fn an_ignored_run_asks_libtest_for_the_ignored_tests_and_sizes_the_flag() {
         ]
     );
     let exe = Path::new("/suite.exe");
-    let image = r"\\?\unix\suite.exe";
-    let fixed = image.encode_utf16().count()
-        + 2
-        + 1
-        + " --test-threads=1 --nocapture --ignored --exact ".len();
-    let name = "x".repeat(COMMAND_LINE_UNITS - fixed);
+    let fixed = fixed_head_units(exe, 1, true);
+    let name = "x".repeat(COMMAND_LINE_UNITS - 1 - fixed);
     assert_eq!(
         fitting_prefix(exe, std::slice::from_ref(&name), 1, true).unwrap(),
         1
@@ -607,4 +622,137 @@ fn completed_process_retention_error_preserves_the_verdict() {
     assert!(log.notes[0].contains("could not be kept"));
     assert!(log.notes[0].contains(".process-log"));
     std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// An oracle for Wine's `build_command_line`, independent of `fitting_prefix`.
+///
+/// `dlls/ntdll/unix/env.c`: every argument's quoted/escaped length, argv\[0\]
+/// always quoted, one separator between every pair of arguments and none at
+/// the ends (Wine's loop appends one after every argument, including the
+/// last, then drops it). Reuses [`argument_units`] for one argument's
+/// quoting, which `command_size_counts_windows_quoting_and_utf16_units`
+/// checks against literal encoded strings, but composes the arguments the
+/// way Wine's loop does rather than the way `fitting_prefix` does, so a
+/// composition mistake in `fitting_prefix` (there was one: an extra
+/// separator counted per argument) shows up as a mismatch against this
+/// oracle too.
+fn wine_command_line_units(wargv: &[String]) -> usize {
+    wargv
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| argument_units(arg, i == 0))
+        .sum::<usize>()
+        + wargv.len().saturating_sub(1)
+}
+
+/// The wargv Wine's loader builds when it can load `exe`'s architecture directly.
+///
+/// The mapped path, quoted, ahead of the chosen names.
+fn direct_wargv(exe: &Path, names: &[String], threads: u32, ignored: bool) -> Vec<String> {
+    let image = format!(r"\\?\unix{}", exe.to_string_lossy().replace('/', "\\"));
+    let mut wargv = vec![image];
+    wargv.extend(test_arguments(Some(names), threads, ignored));
+    wargv
+}
+
+/// The wargv Wine's loader builds when it falls back to `start.exe`.
+///
+/// Every i686 process, on a WOW64-only build: `exe`'s own path reappears
+/// unconverted, two arguments after the image Wine actually loaded.
+fn via_start_exe_wargv(exe: &Path, names: &[String], threads: u32, ignored: bool) -> Vec<String> {
+    let mut wargv = vec![
+        WINE_START_EXE.to_owned(),
+        WINE_START_EXE_FLAG.to_owned(),
+        exe.to_string_lossy().into_owned(),
+    ];
+    wargv.extend(test_arguments(Some(names), threads, ignored));
+    wargv
+}
+
+/// Realistic long test-id strings shaped like this project's own.
+///
+/// A module name, `::`, and a long descriptive `snake_case` sentence, 18 to
+/// 105 bytes (the shortest and longest this binary's own `--list` actually
+/// printed).
+fn long_test_ids(count: usize) -> Vec<String> {
+    const WORDS: [&str; 10] = [
+        "a", "draw", "into", "a", "target", "cleared", "every", "frame", "is", "built",
+    ];
+    (0..count)
+        .map(|i| {
+            let sentence: String = (0..6 + i % 8)
+                .map(|w| WORDS[(i + w) % WORDS.len()])
+                .collect::<Vec<_>>()
+                .join("_");
+            format!("module_{i:03}::{sentence}_before_its_frame_is_submitted_{i:03}")
+        })
+        .collect()
+}
+
+/// `long_test_ids`, each followed by two very short names a couple of units apart in length.
+///
+/// `fitting_prefix` selects names greedily, one at a time, and stops at the
+/// first one that does not fit: a batch of only long realistic names stops
+/// wherever their lengths happen to add up, tens of units short of a
+/// process's real capacity, as often as not, because the next one in line
+/// is too big to narrow the gap. The two models a selection has to fit
+/// under here differ by only a few dozen units, far narrower than that
+/// leftover slack usually is, so short names after every long one give the
+/// selection a way to keep creeping up to the real ceiling wherever it
+/// falls, rather than stopping well short of it.
+fn long_test_ids_with_fine_filler(count: usize) -> Vec<String> {
+    long_test_ids(count)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, long)| [long, format!("f{}", 2 * i), format!("f{}", 2 * i + 1)])
+        .collect()
+}
+
+/// `fitting_prefix`'s selection must fit under whichever command line a host builds.
+///
+/// Not just the one this run assumed.
+fn assert_selection_fits_either_way(exe: &Path, names: &[String], threads: u32, ignored: bool) {
+    let count = fitting_prefix(exe, names, threads, ignored).expect("at least the first name fits");
+    assert!(count >= 1, "nothing was selected for a non-empty batch");
+    let selected = &names[..count];
+    for (built_by, wargv) in [
+        (
+            "loading the binary directly",
+            direct_wargv(exe, selected, threads, ignored),
+        ),
+        (
+            "falling back to start.exe",
+            via_start_exe_wargv(exe, selected, threads, ignored),
+        ),
+    ] {
+        let units = wine_command_line_units(&wargv);
+        assert!(
+            units < COMMAND_LINE_UNITS,
+            "fitting_prefix chose {count} of {} names, but Wine's real command line when {built_by} \
+             would be {units} units, at or past the {COMMAND_LINE_UNITS}-unit limit",
+            names.len(),
+        );
+    }
+}
+
+#[test]
+fn fitting_prefix_fits_wines_real_command_line_including_its_start_exe_fallback() {
+    // Shaped like the run that actually failed: a long path under a cargo
+    // target's debug/deps, this project's own long test-id strings, the
+    // i686 target (every i686 process takes Wine's start.exe fallback on a
+    // WOW64-only build, so the direct-load spelling alone is not enough),
+    // one thread and no `--ignored`.
+    let exe = Path::new(
+        "/home/build/mtld3d/windows/target/i686-pc-windows-msvc/debug/deps/e2e-1030f4ab05278ecb.exe",
+    );
+    let names = long_test_ids_with_fine_filler(680);
+    assert_selection_fits_either_way(exe, &names, 1, false);
+
+    // A handful of other shapes: a short path and many threads, an ignored
+    // run, and a path containing a space (which the start.exe fallback's
+    // own, separate exe-path argument must quote on its own, since nothing
+    // upstream of it does).
+    assert_selection_fits_either_way(Path::new("/suite.exe"), &names, 8, false);
+    assert_selection_fits_either_way(exe, &names, 1, true);
+    assert_selection_fits_either_way(Path::new("/test path/suite.exe"), &names, 4, false);
 }

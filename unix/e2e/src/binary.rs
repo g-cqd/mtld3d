@@ -25,8 +25,29 @@ const KEEP: usize = 10;
 /// A completed abnormal process's captured streams and exit status.
 const PROCESS_LOG_EXT: &str = "process-log";
 
-/// Windows command-line capacity in UTF-16 units, including the terminating NUL.
+/// The UTF-16 length at which Wine's loader aborts rather than start a process.
+///
+/// `build_command_line` in Wine's `dlls/ntdll/unix/env.c` builds the whole
+/// command line, drops the one trailing separator its own loop adds, and
+/// then checks `p - ret >= 32767` — so a built string of exactly this many
+/// units (excluding the terminating NUL) already fails; only up to
+/// `COMMAND_LINE_UNITS - 1` units fit.
 const COMMAND_LINE_UNITS: usize = 32_767;
+
+/// The path Wine's loader always uses for its `start.exe` relaunch helper.
+///
+/// `build_initial_params` (same file) cannot load every test binary's
+/// architecture directly — on a WOW64-only Wine build this is every i686
+/// process — and when it cannot, it replaces argv\[0\] with this literal
+/// path (`load_start_exe`) and reinserts the test binary's own path,
+/// unconverted and in forward-slash form, two arguments later, ahead of
+/// [`WINE_START_EXE_FLAG`]. That changes the whole shape of the command line
+/// Wine actually builds, not just its image argument, so [`fitting_prefix`]
+/// has to bound both spellings and keep whichever is larger.
+const WINE_START_EXE: &str = r"C:\windows\system32\start.exe";
+
+/// The literal argument Wine's `start.exe` relaunch inserts before the exe path.
+const WINE_START_EXE_FLAG: &str = "/exec";
 
 /// The extension of a kept stderr: `<binary>-<pid>.stderr`.
 const STDERR_EXT: &str = "stderr";
@@ -460,26 +481,43 @@ fn test_arguments(names: Option<&[String]>, threads: u32, ignored: bool) -> Vec<
 }
 
 /// Fit a selection after allowing for Wine's executable-path mapping.
+///
+/// The image argv\[0\] Wine's loader actually builds is one of two shapes,
+/// and nothing here can tell which one a given host will pick, so both are
+/// sized and the larger bounds the rest of the command line:
+///   - the test binary's own path, quoted, with its leading mapped
+///     directory replaced by a drive prefix or (the bound used here, since
+///     either spelling is this length or shorter) the longer `\\?\unix`
+///     prefix; or
+///   - [`WINE_START_EXE`], when Wine cannot load the binary's architecture
+///     directly, with [`WINE_START_EXE_FLAG`] and the binary's own path
+///     (unconverted, forward slashes, quoted only if it needs it) inserted
+///     as two more arguments ahead of everything below.
+///
+/// Path separators become backslashes before quoting in the first shape, so
+/// a separator before a literal quote must be counted too; the second
+/// carries the path as Unix gave it, with no such substitution.
 fn fitting_prefix(
     exe: &Path,
     names: &[String],
     threads: u32,
     ignored: bool,
 ) -> Result<usize, String> {
-    // Wine replaces an absolute Unix path's leading mapped directory with a
-    // drive prefix, or uses the longer \\?\unix prefix. Keeping the whole
-    // absolute path plus that eight-unit prefix bounds either spelling.
-    // argv[0] is always quoted; path separators become backslashes before
-    // quoting, so a separator before a literal quote must be counted too.
     let image = format!(r"\\?\unix{}", exe.to_string_lossy().replace('/', "\\"));
-    let mut units = argument_units(&image, true).saturating_add(1);
+    let direct = argument_units(&image, true);
+    let via_start_exe = argument_units(WINE_START_EXE, true)
+        + 1
+        + argument_units(WINE_START_EXE_FLAG, false)
+        + 1
+        + argument_units(&exe.to_string_lossy(), false);
+    let mut units = direct.max(via_start_exe);
     for arg in test_arguments(Some(&[]), threads, ignored) {
         units = units.saturating_add(1 + argument_units(&arg, false));
     }
     let mut count = 0;
     for name in names {
         let next = units.saturating_add(1 + argument_units(name, false));
-        if next > COMMAND_LINE_UNITS {
+        if next >= COMMAND_LINE_UNITS {
             break;
         }
         units = next;
