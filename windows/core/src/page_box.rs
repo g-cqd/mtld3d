@@ -33,6 +33,16 @@ pub fn live_bytes() -> u64 {
     PAGEBOX_LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The counter [`live_bytes`] reads, for a reader in another linkage unit.
+///
+/// Each linkage unit has its own copy of this crate and of the counter, so
+/// the native encoder reads `d3d9.dll`'s through this address, which the
+/// device passes at encoder creation. The static lives as long as the image.
+#[must_use]
+pub const fn live_bytes_counter() -> &'static core::sync::atomic::AtomicU64 {
+    &PAGEBOX_LIVE_BYTES
+}
+
 /// Cumulative count of `PageBox` allocations served by the global allocator.
 #[cfg(perf_tracking)]
 static PAGEBOX_ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -291,12 +301,14 @@ impl PageBox {
     /// `panic = "abort"`, so this aborts either way, but panicking runs
     /// the panic hook first, which dumps the crumb ring
     /// (`std::alloc::handle_alloc_error` would abort straight away with no
-    /// trace). Every allocation is infallible this way except the system-memory
-    /// copy a resource gets at creation, which goes through
-    /// [`Self::try_new_uninit`] and [`Self::try_new_zeroed`] so the create can
-    /// answer `E_OUTOFMEMORY` as D3D9 does. Past creation there is no recovery
-    /// to attempt: retained VB/IB bytes are bounded proactively by the
-    /// retention cap long before the address space runs out.
+    /// trace). Every allocation is infallible this way except two, which go
+    /// through [`Self::try_new_uninit`] and [`Self::try_new_zeroed`]: the
+    /// system-memory copy a resource gets at creation, so the create can answer
+    /// `E_OUTOFMEMORY` as D3D9 does, and a chunk of the texture upload-snapshot
+    /// arena, whose refusal leaves the upload reading its staging. Otherwise
+    /// there is no recovery to attempt past creation: retained VB/IB bytes are
+    /// bounded proactively by the retention cap long before the address space
+    /// runs out.
     #[must_use]
     pub fn new_uninit(logical_len: usize) -> Self {
         Self::try_new_uninit(logical_len).expect("PageBox alloc failed")
@@ -318,9 +330,11 @@ impl PageBox {
 
     /// [`Self::new_uninit`] that answers `None` where that one panics.
     ///
-    /// For the creation of a resource only: a length whose page-rounded
+    /// For the two allocations with a fallback: a length whose page-rounded
     /// layout the platform cannot express, or an allocation the allocator
-    /// refuses, is `None`, which the create answers with `E_OUTOFMEMORY`.
+    /// refuses, is `None`, which a resource create answers with
+    /// `E_OUTOFMEMORY` and the upload-snapshot arena with an upload from the
+    /// staging.
     #[must_use]
     pub fn try_new_uninit(logical_len: usize) -> Option<Self> {
         let (len, layout) = Self::try_layout_for(logical_len)?;
@@ -331,7 +345,7 @@ impl PageBox {
 
     /// [`Self::new_zeroed`] that answers `None` where that one panics.
     ///
-    /// The same creation-only contract as [`Self::try_new_uninit`].
+    /// The same fallback-only contract as [`Self::try_new_uninit`].
     #[must_use]
     pub fn try_new_zeroed(logical_len: usize) -> Option<Self> {
         let (len, layout) = Self::try_layout_for(logical_len)?;

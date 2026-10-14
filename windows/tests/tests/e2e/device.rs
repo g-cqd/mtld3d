@@ -1731,6 +1731,26 @@ pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
 /// `entries` are `key=value` entries, `;`-separated, for every interface the
 /// child creates; empty adds none.
 pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, entries: &str) {
+    let (output, dir) = spawn_private_log_child(child_name, test, filter, entries);
+    assert!(
+        output.status.success(),
+        "workload child {child_name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
+}
+
+/// Run `test` as [`run_in_private_log_child_with`] does; hand back its output and its directory.
+///
+/// The child's log lands in the directory, which the caller removes. Nothing
+/// here judges the child's exit, so a test whose child is meant to die reads
+/// what it left behind.
+pub fn spawn_private_log_child(
+    child_name: &str,
+    test: &str,
+    filter: &str,
+    entries: &str,
+) -> (std::process::Output, std::path::PathBuf) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1762,12 +1782,7 @@ pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str,
         config = format!("{entries};{config}");
     }
     let output = run_child(&mut command, &config).expect("run the workload child");
-    assert!(
-        output.status.success(),
-        "workload child {child_name} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
+    (output, dir)
 }
 
 /// Flip `PresentationInterval` twice, one Present after each Reset.
@@ -3899,16 +3914,14 @@ fn set_cursor_properties_rejects_oversize() {
 
 #[test]
 fn show_cursor_previous_state_survives_wm_size() {
-    // A macdrv-posted WM_SIZE arms the cursor module's post-resize visibility
-    // pin (keeps the physical cursor up across WoW's bogus post-resize hide).
-    // The pin must not leak into ShowCursor's previous-state bookkeeping: the
-    // first ShowCursor(TRUE) after SetCursorProperties reports the cursor
-    // hidden.
+    // A WM_SIZE that arrives before the game ever showed the cursor must not
+    // leak into ShowCursor's previous-state bookkeeping: the first
+    // ShowCursor(TRUE) after SetCursorProperties reports the cursor hidden.
     const WM_SIZE: u32 = 0x0005;
     let h = Harness::new();
 
-    // Same-size WM_SIZE (lparam = client height << 16 | width): arms the pin
-    // without churning the backbuffer (apply_auto_resize no-ops on equal dims).
+    // Same-size WM_SIZE (lparam = client height << 16 | width), which leaves
+    // the back buffer alone (apply_auto_resize no-ops on equal dims).
     let (width, height): (isize, isize) = (640, 480);
     h.send_window_message(WM_SIZE, 0, (height << 16) | width);
 
@@ -3918,7 +3931,7 @@ fn show_cursor_previous_state_survives_wm_size() {
         h.show_cursor(true),
         0,
         "first ShowCursor(TRUE) must report the cursor previously hidden \
-         even after a WM_SIZE armed the post-resize pin",
+         even after a WM_SIZE",
     );
     assert_eq!(
         h.show_cursor(true),
@@ -3928,7 +3941,7 @@ fn show_cursor_previous_state_survives_wm_size() {
     assert_eq!(
         h.show_cursor(false),
         1,
-        "ShowCursor(FALSE) after the pin cleared reports previously shown",
+        "ShowCursor(FALSE) reports previously shown",
     );
 }
 

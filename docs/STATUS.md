@@ -39,8 +39,10 @@ unimplemented. Earlier Direct3D and DirectDraw APIs remain future work.
   texture-stage cascade (CURRENT/TEMP registers, per-stage constants,
   DOTPRODUCT3 color and alpha, MULTIPLYADD, LERP, MODULATEALPHA_ADDCOLOR,
   MODULATECOLOR_ADDALPHA, MODULATEINVALPHA_ADDCOLOR,
-  MODULATEINVCOLOR_ADDALPHA and premultiplied texture-alpha blending),
-  vertex blending and range-based
+  MODULATEINVCOLOR_ADDALPHA, premultiplied texture-alpha blending, and
+  BUMPENVMAP and BUMPENVMAPLUMINANCE bump-environment mapping, for which
+  `D3DUSAGE_QUERY_LEGACYBUMPMAP` accepts V8U8, V16U16 and Q8W8V8U8 2D
+  textures), vertex blending and range-based
   vertex fog. Table fog supports Z and W sources with LINEAR,
   EXP and EXP2; SM3 shaders own their fog.
 - Every draw call and primitive type, point sprites, user clip planes, all
@@ -118,6 +120,19 @@ unimplemented. Earlier Direct3D and DirectDraw APIs remain future work.
   `TWO`, `THREE` and `FOUR` at the reported mode's refresh rate over two,
   three and four, and `IMMEDIATE` runs free. `present.maxFps` lowers any of
   them.
+- A maximum frame latency: `Present` returns only once the frame the
+  device's latency counts back from has finished, so at most that many
+  presented frames are outstanding: 3 by default, what an extended device's
+  `SetMaximumFrameLatency` sets (1 to 30), or what `present.maxFrameLatency`
+  names in place of either. A frame finishes when the GPU has finished its
+  work and, when its present is paced (vsync, a divided interval or
+  `present.maxFps`), once that present was shown or discarded, waited for at
+  most a second after the GPU work, or three present durations under a
+  slower `present.maxFps`. A hidden, minimised or covered window shows
+  nothing, so the display does not pace it; mtld3d holds its paced presents
+  to the same pace itself, so such a window presents no faster than a shown
+  one. So it does for a window that reads visible while the display shows
+  none of its last paced presents, until it shows one.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.
@@ -199,11 +214,6 @@ unless its entry says otherwise.
 - The fixed-function texture operation `D3DTOP_PREMODULATE`: absent from
   `TextureOpCaps`, and a stage that names it is warned once and runs as
   `D3DTOP_SELECTARG1`.
-- Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
-  `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
-  `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
-  format to match. The SM1 `texbem` instruction and the `D3DTSS_BUMPENVMAT*`
-  matrix it reads are a separate surface and do work.
 - DEFAULT offscreen cross-format `StretchRect` outside the narrow normalized
   codecs and A16B16G16R16/A32B32G32R32F into A8R8G8B8 returns
   `D3DERR_INVALIDCALL`. Wide-to-wide conversion and offscreen scaling remain
@@ -312,16 +322,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   undefined values. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
-- A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
-  `D3DLOCK_READONLY` returns a pointer an upload may still read. Under an
-  upload from an earlier frame, or one a GPU operation has seen, only two
-  writes land in place: this partial lock, and any write into a level the game
-  holds mapped by a lock or a device context. Every other CPU writer renames
-  the level's staging first. Under an upload of the frame being recorded that
-  no draw or other GPU operation has seen, it writes in place, which no draw
-  can tell apart. Writes into a render-target or depth texture
-  and read-backs from the GPU always rename when an upload still reads the
-  level. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.
@@ -388,8 +388,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   `S_PRESENT_OCCLUDED` or `S_PRESENT_MODE_CHANGED`: no exclusive mode is
   taken, and a present into a covered window already skips the drawable.
   No knob.
-- `SetMaximumFrameLatency` is stored and reported but not enforced; the
-  encoder's queue bounds the frames in flight. No knob.
 - The `D3DPRESENT_*` flags of `PresentEx` and `IDirect3DSwapChain9::Present`
   are logged and not honoured: `DONOTWAIT` waits and `FORCEIMMEDIATE`
   follows the presentation interval. No knob.

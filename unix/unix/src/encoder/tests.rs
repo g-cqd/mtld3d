@@ -33,19 +33,22 @@ struct NativeObjects {
 }
 
 impl NativeObjects {
-    fn new() -> Self {
+    /// Compiles a vertex function named `entry` and a pipeline that uses it.
+    ///
+    /// Each test passes its own `entry`. Metal returns the same `MTLFunction`
+    /// object for two libraries compiled from identical source, so tests that
+    /// shared one source would change each other's retain counts when they run
+    /// in parallel.
+    fn new(entry: &str) -> Self {
         let device = MTLCreateSystemDefaultDevice().expect("Metal device for ownership test");
-        // Metal returns one cached library for identical source, which concurrent tests would
-        // then share and count each other's retains in; the thread id keeps each test's own.
         let source = NSString::from_str(&format!(
-            "#include <metal_stdlib>\nusing namespace metal;\n// {:?}\nvertex void ownership_probe(uint id [[vertex_id]]) {{}}",
-            std::thread::current().id()
+            "#include <metal_stdlib>\nusing namespace metal;\nvertex void {entry}(uint id [[vertex_id]]) {{}}",
         ));
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .expect("library");
         let function = library
-            .newFunctionWithName(&NSString::from_str("ownership_probe"))
+            .newFunctionWithName(&NSString::from_str(entry))
             .expect("function");
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&function));
@@ -105,7 +108,7 @@ impl NativeObjects {
 #[test]
 fn failed_prewarm_send_releases_native_payload() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("failed_send_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);
@@ -123,7 +126,7 @@ fn failed_prewarm_send_releases_native_payload() {
 #[test]
 fn unread_prewarm_payload_releases_native_objects() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("unread_payload_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
         assert!(sender.send(objects.warm()).is_ok());
@@ -139,7 +142,7 @@ fn unread_prewarm_payload_releases_native_objects() {
 #[test]
 fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
     objc2::rc::autoreleasepool(|_| {
-        let objects = NativeObjects::new();
+        let objects = NativeObjects::new("adopted_prewarm_probe");
         let baseline = objects.counts();
         let mut source = objects.warm();
         let retained = objects.counts();
@@ -181,7 +184,7 @@ fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
 
 #[test]
 fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain() {
-    use mtld3d_shared::{mtl::StageTag, perf::ShaderTimings};
+    use mtld3d_shared::perf::ShaderTimings;
 
     use crate::metal::handle::IntoRetained;
 
@@ -193,14 +196,8 @@ fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain(
                 function_ns: u64::MAX,
             };
             assert!(
-                super::compile_stage_library(
-                    MetalHandle::NULL,
-                    StageTag::Vertex,
-                    source,
-                    entry,
-                    &mut timings,
-                )
-                .is_none()
+                super::compile_stage_library(MetalHandle::NULL, source, entry, &mut timings)
+                    .is_none()
             );
             assert_eq!(
                 (
@@ -217,14 +214,9 @@ fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain(
         // SAFETY: device owns this live Metal device until the build completes.
         let device_handle = unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) };
         let source = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 probe(uint id [[vertex_id]]) { return float4(float(id), 0, 0, 1); }";
-        let handles = super::compile_stage_library(
-            device_handle,
-            StageTag::Vertex,
-            source,
-            "probe",
-            &mut ShaderTimings::new(),
-        )
-        .expect("native shader build succeeds");
+        let handles =
+            super::compile_stage_library(device_handle, source, "probe", &mut ShaderTimings::new())
+                .expect("native shader build succeeds");
         // The build's inner pool has drained; only canonical output retains remain.
         let library = handles
             .library
@@ -672,4 +664,169 @@ fn a_release_retires_a_levels_wrapper_once_per_backing() {
         );
     }
     drop(first);
+}
+
+/// A submission that fails on the CPU ends the frame-latency wait of a `Present` behind it.
+///
+/// The failed frame publishes its sequence as retired, but it was never noted
+/// as submitted and never presents; the failure is what has to end the wait,
+/// and it reaches the device's mailbox too.
+#[test]
+fn a_failed_submission_ends_the_frame_latency_wait() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+
+    use mtld3d_shared::mtl::PresentDebugFlags;
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+
+    use crate::metal::{
+        DeviceRecord, FrameWait,
+        submission::{RetirementCounter, SubmitDescription},
+    };
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = device
+        .newCommandQueue()
+        .expect("a queue on the default device");
+    // SAFETY: the raw address carries this retain, which the record adopts and
+    // releases when it drops at the end of this test.
+    let handle = unsafe { MetalHandle::new(Retained::into_raw(queue) as u64) };
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
+    let failure = AtomicU32::new(0);
+    let floor = AtomicU64::new(0);
+    let draw = Arc::new(AtomicU64::new(0));
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    let floor_counter =
+        unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) };
+    record.present().frame_signal().attach(floor_counter);
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(record.present().frame_signal());
+        let draw = Arc::clone(&draw);
+        std::thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) };
+            let _ = sender.send(signal.wait(draw, 3, crate::metal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    // An upload prefix longer than the pass list fails the encode on the CPU.
+    let description = SubmitDescription {
+        blit_commands_need_encoder: false,
+        upload_pass_count: 1,
+        present_layer: MetalHandle::NULL,
+        present_texture: MetalHandle::NULL,
+        present_view: MetalHandle::NULL,
+        submit_seq: 3,
+        // SAFETY: the waiter's own reference keeps this atomic alive past the submission.
+        draw_retirement: unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) },
+        upload_retirement: RetirementCounter::NONE,
+        failed_submission: RetirementCounter::NONE,
+    };
+    let (_payload, outcome) = super::execute_submit(
+        Some(&record),
+        &description,
+        super::FramePayload::default(),
+        core::ptr::from_ref(&failure) as u64,
+    );
+    assert_ne!(outcome.status, 0, "the submission failed");
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Ended)
+    );
+    waiter.join().unwrap();
+    assert_eq!(
+        failure.load(Ordering::Acquire),
+        1,
+        "the mailbox holds the failure"
+    );
+}
+
+/// A grown-out fan index pattern counts in the retained bytes while it waits, and leaves them.
+///
+/// The retained-bytes counter is the API thread's retention-cap input and the
+/// HUD's in-flight figure; a box the drain subtracts without having added it
+/// wraps the counter to near `u64::MAX`. Shutdown, like a reset, drains the
+/// queue without waiting for the gate, and has to subtract what it takes too.
+#[test]
+fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use mtld3d_core::{
+        config::Mtld3dConfig, convert::fan_pattern_bytes, gpu_caps::GpuCaps, page_box::PageBox,
+    };
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    // Nothing is submitted, so every queued entry's sequence (0) has retired.
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+
+    assert_ne!(enc.fan_index_buffer(300), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the live pattern is not retention"
+    );
+    assert_ne!(enc.fan_index_buffer(1000), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        PageBox::padded_len(fan_pattern_bytes(300)) as u64,
+        "the grown-out pattern waits in retention"
+    );
+    enc.drain_retired_resource_retention();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the drain takes back exactly what was added"
+    );
+
+    assert_ne!(enc.fan_index_buffer(5000), 0);
+    assert_ne!(retained.load(Ordering::Relaxed), 0);
+    enc.shutdown_cleanup();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "shutdown's drain takes back what it empties"
+    );
+    drop(enc);
 }

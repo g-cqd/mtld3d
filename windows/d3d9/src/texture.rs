@@ -238,11 +238,12 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
-    /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
-    /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
-    /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
-    /// same primitive READONLY uses) and `FreshBox` (allocate + swap).
+    /// pointer returned by `lock_region_ptr`. The bind-time flush hands the
+    /// upload a read of the `Arc` (a refcount bump, no memcpy), unless the
+    /// level is in `snapshot_staging` and the box is copied out instead.
+    /// `lock_region_ptr` decides between `WriteInPlace` (cast `as_ptr()` to
+    /// `*mut u8`, the primitive READONLY uses) when no upload can see the
+    /// write, and `FreshBox` (allocate + swap) otherwise.
     staging: Vec<Arc<PageBox>>,
     mip_widths: Vec<u32>,
     mip_heights: Vec<u32>,
@@ -325,11 +326,11 @@ pub struct TextureInner {
     /// Bit `face * levels + level` for a cube, bit `level` otherwise.
     /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
     /// texture is recorded, after it flushes the texture's dirty levels. A CPU
-    /// write clears its subresource's bit once it lands on pages no upload
-    /// reads, fresh or renamed. Scheduling an upload onto pages an earlier
-    /// frame's upload still reads sets the bit too. So a clear bit over pages
-    /// uploads still read means no GPU operation on the texture was recorded
-    /// since those uploads were scheduled.
+    /// write, a `LockRect` included, clears its subresource's bit once it
+    /// lands on pages no upload reads, fresh or renamed. Scheduling an upload
+    /// onto pages an earlier frame's upload still reads sets the bit too. So
+    /// a clear bit over pages uploads still read means no GPU operation on
+    /// the texture was recorded since those uploads were scheduled.
     ///
     /// That holds only while every path that schedules an upload of the
     /// texture either marks the device's snapshot dirty, so the next draw
@@ -338,6 +339,18 @@ pub struct TextureInner {
     /// upload scheduled without either would let such a draw sample pages a
     /// later write changes in place.
     observed_staging: u128,
+    /// Subresources whose partial uploads copy their box instead of reading the staging.
+    ///
+    /// Indexed like `observed_staging`. Set, and never cleared, when a write
+    /// moves the subresource's staging to fresh pages carrying the old
+    /// contents: the write landed while an upload still read the pages, which
+    /// a level the game rewrites in part between draws does on every lock.
+    /// From then on each partial upload of it snapshots its box into the
+    /// device's arena when it is scheduled, so it no longer reads the
+    /// staging and the next lock writes in place instead of copying the
+    /// whole level again. Every other subresource keeps reading its staging
+    /// with no copy at all.
+    snapshot_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -2382,13 +2395,13 @@ impl TextureInner {
             return 0;
         }
         let device = DeviceInner::from_ptr(self.device_inner);
-        let takes_upload_pass =
-            mtld3d_core::upload_pass::upload_decode(self.d3d_format, self.metal_pixel_format)
-                .is_some_and(|decode| {
-                    mtld3d_core::upload_pass::is_expansion(decode)
-                        || self.mip_bytes_per_row[level]
-                            < device.gpu_caps().min_linear_texture_align
-                });
+        let takes_upload_pass = mtld3d_core::upload_pass::upload_pass_decode(
+            self.d3d_format,
+            self.metal_pixel_format,
+            self.mip_bytes_per_row[level],
+            device.gpu_caps().min_linear_texture_align,
+        )
+        .is_some();
         let seq = if takes_upload_pass {
             device.coherent_seq_arc()
         } else {
@@ -2437,14 +2450,6 @@ impl TextureInner {
             swizzle: self.swizzle.unwrap_or([Swizzle::Zero; 4]),
             usage_flags: self.usage_flags,
         }
-    }
-
-    /// Clone the staging `Arc` for this mip.
-    ///
-    /// The upload retains these bytes through encoding and GPU retirement. A cached
-    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
-    pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
-        Arc::clone(&self.staging[level])
     }
 
     /// Base, page-aligned length and row stride of one subresource's staging.
@@ -2578,24 +2583,40 @@ impl TextureInner {
 
         let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
         let contended = is_in_flight(last_submit_seq, coherent_seq)
             || self.cube.as_deref()?.staging[index].has_readers();
-        let action =
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
+        let action = if contended {
+            let mut write = self.staging_write_facts(face, level)?;
+            write.insert(StagingWrite::HAS_READERS);
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
+        } else {
+            LockAction::WriteInPlace
+        };
         let device_inner = self.device_inner;
         let base = match action {
             LockAction::WriteInPlace => {
-                // The kept divergence, counted like its VB/IB twin: a
-                // contended partial Lock handed back over bytes an upload
-                // may still be reading (`docs/STATUS.md#kept-divergences`).
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
+                // In place over a reader only when every upload reading the
+                // pages is this frame's and no GPU operation on the cube was
+                // recorded since, which is counted (see `lock_region_ptr`).
+                if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
+                    self.note_unread_staging(face, level);
+                } else if device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.cube.as_deref()?.staging[index].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_cube_staging(face, level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_cube_staging(face, level, preserve);
+                self.note_unread_staging(face, level);
+                base
+            }
         };
         // SAFETY: `offset` was checked against the logical staging length.
         Some((unsafe { base.add(offset) }, pitch))
@@ -2613,6 +2634,9 @@ impl TextureInner {
             .expect("validated cube subresource");
         let device_inner = self.device_inner;
         let texture_id = self.texture_id;
+        if preserve == PreserveKind::Cpu {
+            self.snapshot_staging |= self.observed_bit(face, level);
+        }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET,
             key: (texture_id.raw() << 8)
@@ -2713,21 +2737,19 @@ impl TextureInner {
         self.observed_staging = u128::MAX;
     }
 
-    fn move_staging_off_readers(
-        &mut self,
-        face: u32,
-        level: usize,
-        whole_level: bool,
-        always: bool,
-    ) {
-        if self.dc_in_use() {
-            return;
-        }
+    /// What a CPU write of `(face, level)` would find on its staging pages right now.
+    ///
+    /// Every fact [`decide_staging_write`] reads except the two the writer
+    /// knows itself, `WHOLE_LEVEL` and a read back's `ALWAYS_RENAME`: whether
+    /// the game holds the subresource mapped, whether an upload still reads
+    /// the pages, whether the latest upload belongs to the frame being
+    /// recorded, whether a GPU operation on the texture was recorded since,
+    /// and whether passes the texture is attached to use it unrecorded.
+    /// `None` for a cube face past the chain.
+    fn staging_write_facts(&self, face: u32, level: usize) -> Option<StagingWrite> {
         let (mapped, has_readers, last_upload_seq) = match self.cube.as_deref() {
             Some(cube) => {
-                let Some(index) = self.cube_subresource_index(face, level) else {
-                    return;
-                };
+                let index = self.cube_subresource_index(face, level)?;
                 (
                     cube.locked.get(index).copied().unwrap_or(false),
                     cube.staging
@@ -2745,11 +2767,6 @@ impl TextureInner {
             ),
         };
         let bit = self.observed_bit(face, level);
-        if !mapped && !has_readers {
-            // Nothing reads these pages, so the next GPU use is the first
-            // that can see what lands in them.
-            self.observed_staging &= !bit;
-        }
         let same_frame = self.device_inner != 0
             && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
         // A render target or depth texture is read and written by the passes
@@ -2765,7 +2782,38 @@ impl TextureInner {
             StagingWrite::OBSERVED,
             bit == 0 || self.observed_staging & bit != 0,
         );
-        write.set(StagingWrite::ALWAYS_RENAME, always || attached);
+        write.set(StagingWrite::ALWAYS_RENAME, attached);
+        Some(write)
+    }
+
+    /// Note that a write of `(face, level)` landed on pages no upload reads.
+    ///
+    /// The next GPU use of the texture is then the first that can see what
+    /// lands in them, so the subresource's observed bit starts over.
+    fn note_unread_staging(&mut self, face: u32, level: usize) {
+        let bit = self.observed_bit(face, level);
+        self.observed_staging &= !bit;
+    }
+
+    fn move_staging_off_readers(
+        &mut self,
+        face: u32,
+        level: usize,
+        whole_level: bool,
+        always: bool,
+    ) {
+        if self.dc_in_use() {
+            return;
+        }
+        let Some(mut write) = self.staging_write_facts(face, level) else {
+            return;
+        };
+        if !write.intersects(StagingWrite::MAPPED.union(StagingWrite::HAS_READERS)) {
+            self.note_unread_staging(face, level);
+        }
+        if always {
+            write.insert(StagingWrite::ALWAYS_RENAME);
+        }
         write.set(StagingWrite::WHOLE_LEVEL, whole_level);
         let LockAction::FreshBox { preserve } = decide_staging_write(&write) else {
             return;
@@ -2775,7 +2823,7 @@ impl TextureInner {
         } else {
             self.rename_staging(level, preserve);
         }
-        self.observed_staging &= !bit;
+        self.note_unread_staging(face, level);
     }
 
     fn cube_stash_lock(
@@ -2879,23 +2927,20 @@ impl TextureInner {
     /// READONLY is a fast-path: the game promised it won't write, so
     /// two readers (the game + any in-flight GPU blit sourcing from
     /// `pending_blit_retention`'s Arc clone) can share the same
-    /// backing Box with no race. Return `as_ptr()` directly — no
+    /// backing Box with no race. Return `as_ptr()` directly: no
     /// rename, no allocation, no preserve memcpy. The pointer is cast
     /// to `*mut u8` only to satisfy the shared signature; the lock
     /// contract forbids writes through it.
     ///
     /// Writable locks delegate the policy decision to
-    /// `decide_lock_action` in `mtld3d-core` — same shape as
-    /// `vertex_buffer::vb_lock` consumes `buffer_rename::plan_lock`.
-    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast
-    /// READONLY uses) and trusts the well-behaved-game no-overlap
-    /// contract for partial sub-rects. `FreshBox { preserve }`
-    /// allocates a fresh uninit Box and applies the requested preserve
-    /// (CPU memcpy when the game might read outside the locked rect
-    /// through the Lock pointer, or when the encoder's compressed
-    /// full-mip-fallback would read outside-rect bytes; otherwise no
-    /// preserve). The old `Arc<PageBox>` stays alive via
-    /// `pending_blit_retention` until GPU retire.
+    /// `decide_lock_action` in `mtld3d-core`, fed the same facts every
+    /// other CPU write of the level gathers (`staging_write_facts`).
+    /// `WriteInPlace` returns `as_ptr() as *mut u8` (the same cast READONLY
+    /// uses): either no upload reads the pages, or every upload reading them
+    /// is this frame's and nothing recorded since can see the version the
+    /// write replaces. `FreshBox { preserve }` allocates a fresh Box and
+    /// applies the requested preserve, and the old `Arc<PageBox>` stays with
+    /// the uploads that read it until they retire.
     fn lock_region_ptr(
         &mut self,
         level: usize,
@@ -2962,9 +3007,14 @@ impl TextureInner {
         // command buffer that upload rides decides which retirement counter
         // frees it. See `staging_coherent_seq`.
         let coherent_seq = self.staging_coherent_seq(level);
+        // Pages no upload reads take the lock in place whatever the flags
+        // (`decide_lock_action` answers `WriteInPlace` without a reader), so
+        // the full write facts are gathered only for pages one still reads.
         let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
             || self.staging[level].has_readers();
-        let action = if contended && self.flags.contains(TextureFlags::DEPTH_FORMAT) {
+        let action = if !contended {
+            LockAction::WriteInPlace
+        } else if self.flags.contains(TextureFlags::DEPTH_FORMAT) {
             LockAction::FreshBox {
                 preserve: if flags & D3DLOCK_DISCARD == 0 {
                     PreserveKind::Cpu
@@ -2973,37 +3023,39 @@ impl TextureInner {
                 },
             }
         } else {
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level))
+            let mut write = self.staging_write_facts(0, level)?;
+            write.insert(StagingWrite::HAS_READERS);
+            decide_lock_action(&write, flags, self.d3d_pool, rect, self.mip_shape(level))
         };
 
         let base: *mut u8 = match action {
             LockAction::WriteInPlace => {
-                // No rename, no preserve — same primitive as the
-                // READONLY fast-path above. `PageBox` exposes only
-                // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder operations
-                // hold Arc clones to keep the staging alive while
-                // they construct `newBufferWithBytesNoCopy:` MTLBuffer
-                // wrappers; they never borrow the bytes themselves.
-                // The GPU read happens at command-buffer execution
-                // time, after the next submit retires; under the
-                // well-behaved-game no-overlap contract the locked
-                // sub-rect doesn't overlap any in-flight read range.
-                // Same model `vb_lock` now uses (see `plan_lock` doc).
+                // No rename, no preserve: the same primitive as the
+                // READONLY fast path above. `PageBox` exposes only
+                // raw-pointer accessors, so no Rust `&[u8]` borrow of the
+                // bytes lives across this cast. Encoder operations hold Arc
+                // clones to keep the staging alive while they wrap it; they
+                // never borrow the bytes themselves.
                 //
-                // Counted when it is the kept divergence: a contended
-                // partial Lock without NOOVERWRITE handed back over
-                // bytes an upload may still be reading
-                // (`docs/STATUS.md#kept-divergences`). READONLY returned
-                // above and an uncontended Lock is the specified behaviour.
-                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
+                // With a reader this is an upload of this frame no GPU
+                // operation has seen: counted, since each one is a write
+                // that lands in pages an upload will carry.
+                if !contended {
+                    // The write lands on pages no upload reads, so the next
+                    // GPU use is the first that can see it, as for any writer.
+                    self.note_unread_staging(0, level);
+                } else if self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
-                        .bump_texture_write_in_place_contended();
+                        .bump_texture_write_in_place_unseen();
                 }
                 self.staging[level].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => self.rename_staging(level, preserve),
+            LockAction::FreshBox { preserve } => {
+                let base = self.rename_staging(level, preserve);
+                self.note_unread_staging(0, level);
+                base
+            }
         };
 
         // SAFETY: `offset` is the byte offset of the locked sub-rect
@@ -3050,6 +3102,7 @@ impl TextureInner {
                 // A later lock or whole-mip upload can read bytes outside
                 // the write region, so preserve every logical byte across
                 // all depth slices. The old Arc keeps the source live.
+                self.snapshot_staging |= self.observed_bit(0, level);
                 if perf_attached {
                     DeviceInner::from_ptr(dev_inner_raw)
                         .perf_mut()
@@ -3105,13 +3158,23 @@ impl TextureInner {
 
     /// The `D3DLOCK_*` bits a Lock of `level` is served with.
     ///
-    /// See `honoured_lock_flags`. A dropped `D3DLOCK_DISCARD` is logged once
-    /// per texture: the game asked for a discard it does not get, which is
-    /// what D3D9 gives it too, but the line is where to look when its writes
-    /// come out wrong.
+    /// See `honoured_lock_flags`. A dropped `D3DLOCK_DISCARD` or
+    /// `D3DLOCK_NOOVERWRITE` is logged once per texture: the game asked for a
+    /// flag it does not get, which is what D3D9 gives it too, but the line is
+    /// where to look when its writes come out wrong.
     fn served_lock_flags(&self, level: usize, rect: Option<DirtyRect>, flags: u32) -> u32 {
         let served = honoured_lock_flags(flags, self.d3d_pool, rect, self.mip_shape(level));
-        if served != flags {
+        let dropped = flags & !served;
+        if dropped & D3DLOCK_NOOVERWRITE != 0 {
+            mtld3d_shared::log_once_info_by!(
+                target: TEX_TRACE_TARGET,
+                key: self.texture_id.raw(),
+                "tex {:#x}: D3DLOCK_NOOVERWRITE is not a texture lock flag and is ignored, the \
+                 lock is served as a plain one",
+                self.texture_id.raw()
+            );
+        }
+        if dropped & D3DLOCK_DISCARD != 0 {
             let shape = if self.d3d_pool == D3DPOOL_DEFAULT {
                 "partial"
             } else {
@@ -3490,6 +3553,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         upload_generation: Vec::new(),
         dc_open: 0,
         observed_staging: 0,
+        snapshot_staging: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -3903,8 +3967,9 @@ extern "system" fn texture_set_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI (shared by the
@@ -3925,8 +3990,9 @@ extern "system" fn texture_get_private_data(
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI.
@@ -3940,8 +4006,9 @@ extern "system" fn texture_get_private_data(
 extern "system" fn texture_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI; alignment is not
+    // assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per ABI.
@@ -4171,20 +4238,22 @@ extern "system" fn texture_get_level_desc(
     if level >= ti.app_level_count() || desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI
-    // points to a writable `D3DSURFACE_DESC` slot owned by the caller.
-    let out = unsafe { &mut *desc };
-    out.format = ti.d3d_format;
-    // A texture level is itself a surface, so its `D3DSURFACE_DESC.Type`
-    // reports `D3DRTYPE_SURFACE` even though `GetType` on the container texture
-    // returns `D3DRTYPE_TEXTURE`. Mirrors `surface_get_desc`.
-    out.resource_type = D3DRTYPE_SURFACE;
-    out.usage = ti.d3d_usage;
-    out.pool = ti.d3d_pool;
-    out.multi_sample_type = 0;
-    out.multi_sample_quality = 0;
-    out.width = ti.mip_width(level as usize);
-    out.height = ti.mip_height(level as usize);
+    let level_desc = D3DSURFACE_DESC {
+        format: ti.d3d_format,
+        // A texture level is itself a surface, so its `D3DSURFACE_DESC.Type`
+        // reports `D3DRTYPE_SURFACE` even though `GetType` on the container texture
+        // returns `D3DRTYPE_TEXTURE`. Mirrors `surface_get_desc`.
+        resource_type: D3DRTYPE_SURFACE,
+        usage: ti.d3d_usage,
+        pool: ti.d3d_pool,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        width: ti.mip_width(level as usize),
+        height: ti.mip_height(level as usize),
+    };
+    // SAFETY: `desc` is non-null (checked above) and per the D3D9 ABI points to
+    // a writable `D3DSURFACE_DESC` slot owned by the caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(desc, level_desc) };
     0 // S_OK
 }
 
@@ -4618,9 +4687,9 @@ extern "system" fn texture_lock_rect(
         }
     }
     let dirty_rect = parse_rect(rect, mip_w, mip_h);
-    // A `D3DLOCK_DISCARD` the lock cannot honour (partial rect, CPU pool) is
-    // dropped here, so every consumer below sees the flags the lock is served
-    // with.
+    // A `D3DLOCK_DISCARD` the lock cannot honour (partial rect, CPU pool) and
+    // a `D3DLOCK_NOOVERWRITE` (not a texture lock flag) are dropped here, so
+    // every consumer below sees the flags the lock is served with.
     let flags = ti.served_lock_flags(level_u, dirty_rect, flags);
     // A level the GPU wrote with no CPU mirror has to be read back before the
     // Lock hands out a pointer into staging, and before `lock_region_ptr` may
@@ -4642,14 +4711,16 @@ extern "system" fn texture_lock_rect(
     ti.level_authority.staging_wrote(0, level_u);
     ti.stash_lock(level_u, read_only, no_dirty, dirty_rect);
 
-    // SAFETY: `out_locked_rect` is non-null (checked above) and per the
-    // D3D9 ABI points to a writable `D3DLOCKED_RECT` slot owned by the
-    // caller.
-    let out = unsafe { &mut *out_locked_rect };
     // D3DLOCKED_RECT.pitch is i32 by D3D9 spec but always non-negative —
     // bit-preserving cast.
-    out.pitch = pitch.cast_signed();
-    out.bits = ptr.cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: ptr.cast::<c_void>(),
+    };
+    // SAFETY: `out_locked_rect` is non-null (checked above) and per the
+    // D3D9 ABI points to a writable `D3DLOCKED_RECT` slot owned by the
+    // caller; alignment is not assumed.
+    unsafe { OutPtr::write_opt(out_locked_rect, locked) };
 
     mtld3d_shared::crumb!(
         "api:tex_lock",
@@ -4941,6 +5012,208 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
+/// What an upload of one subresource reads: its staging, or a snapshot of its box.
+struct UploadSource {
+    staging: PageBoxRead,
+    /// Row stride of `staging`: the level's, or the snapshot's.
+    src_pitch: u32,
+    /// Slice stride of `staging`: the level's, or the snapshot's whole span.
+    slice_pitch: u32,
+    /// Byte offset of the box in a snapshot chunk; `None` for the staging.
+    snapshot_offset: Option<u32>,
+}
+
+impl UploadSource {
+    /// A read of the subresource's own staging pages.
+    fn staging(pages: &Arc<PageBox>, src_pitch: u32, slice_pitch: u32) -> Self {
+        Self {
+            staging: PageBoxRead::new(Arc::clone(pages)),
+            src_pitch,
+            slice_pitch,
+            snapshot_offset: None,
+        }
+    }
+}
+
+/// The source an upload of `rect` of `(face, level)` reads.
+///
+/// A subresource marked in `snapshot_staging` copies a partial box into the
+/// device's snapshot arena, so the upload leaves its staging pages alone; any
+/// other upload, and one the arena cannot take, reads the staging at
+/// `slice_pitch`. A volume level, a depth format and a planar YUV level always
+/// read the staging: their uploads take paths that address the whole level.
+fn upload_source(
+    ti: &TextureInner,
+    dev: &mut DeviceInner,
+    (face, level): (u32, usize),
+    rect: DirtyRect,
+    slice_pitch: u32,
+) -> UploadSource {
+    use mtld3d_core::texture_staging::SnapshotBox;
+    let pages = ti.cube.as_deref().map_or_else(
+        || &ti.staging[level],
+        |cube| {
+            &cube.staging[ti
+                .cube_subresource_index(face, level)
+                .expect("validated cube subresource")]
+        },
+    );
+    let src_pitch = ti.mip_bytes_per_row(level);
+    if ti.snapshot_staging & ti.observed_bit(face, level) == 0
+        || ti.depth > 1
+        || ti.flags.contains(TextureFlags::DEPTH_FORMAT)
+        || ti.planar_storage_extent().is_some()
+    {
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    }
+    // The upload pass addresses its source by texel and takes any 16-byte
+    // aligned pitch; a blit needs the device's linear texture alignment, so
+    // a snapshot never falls into the encoder's repack.
+    let expansion =
+        mtld3d_core::upload_pass::is_expanded_upload(ti.d3d_format, ti.metal_pixel_format);
+    let align = u32::try_from(mtld3d_core::upload_snapshot::SNAPSHOT_ALIGN).expect("16 fits u32");
+    let pitch_align = if expansion {
+        align
+    } else {
+        align.max(dev.gpu_caps().min_linear_texture_align)
+    };
+    let layout = match mtld3d_core::texture_staging::snapshot_box(
+        rect,
+        ti.mip_shape(level),
+        ti.block_bytes,
+        src_pitch,
+        pitch_align,
+    ) {
+        SnapshotBox::Copy(layout) => layout,
+        // A whole-level upload reads the staging by design: a whole-level
+        // write already moves to bare pages.
+        SnapshotBox::WholeLevel => return UploadSource::staging(pages, src_pitch, slice_pitch),
+        SnapshotBox::Declined => {
+            mtld3d_shared::log_once_info!(
+                target: crate::LOG_TARGET,
+                "texture upload snapshot: a box off the compressed block grid or larger than an \
+                 arena chunk reads the staging, so the next partial lock of its level renames it \
+                 again"
+            );
+            dev.perf_mut().bump_texture_snapshot_declined();
+            return UploadSource::staging(pages, src_pitch, slice_pitch);
+        }
+    };
+    if !layout.fits_source(src_pitch, pages.logical_len()) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the box's rows reach past the level's staging \
+             ({} bytes) → the upload reads the staging",
+            pages.logical_len()
+        );
+        dev.perf_mut().bump_texture_snapshot_declined();
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    }
+    let source = &pages.as_slice()[..pages.logical_len()];
+    let mut written = write_snapshot(dev, source, src_pitch, &layout);
+    if written.is_none() {
+        match wait_for_snapshot_room(dev) {
+            SnapshotRoom::Waited => written = write_snapshot(dev, source, src_pitch, &layout),
+            SnapshotRoom::Recording => {
+                return UploadSource::staging(pages, src_pitch, slice_pitch);
+            }
+            SnapshotRoom::NoWait => {}
+        }
+    }
+    let Some(snapshot) = written else {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: every arena chunk is still read and the arena is at its \
+             cap after a wait for the oldest chunk, or one already covered it, or a new chunk \
+             could not be allocated → the upload reads the staging and the next partial lock \
+             of its level may rename it"
+        );
+        dev.perf_mut().bump_texture_snapshot_full();
+        return UploadSource::staging(pages, src_pitch, slice_pitch);
+    };
+    dev.perf_mut().bump_texture_snapshot(layout.len);
+    UploadSource {
+        staging: snapshot.read,
+        src_pitch: layout.pitch,
+        slice_pitch: layout.len,
+        snapshot_offset: Some(snapshot.offset),
+    }
+}
+
+/// Copy the box `layout` describes out of `source` into the device's snapshot arena.
+///
+/// The snapshot is stamped with the submit sequence of the frame being
+/// recorded, the one whose upload reads it.
+fn write_snapshot(
+    dev: &mut DeviceInner,
+    source: &[u8],
+    src_pitch: u32,
+    layout: &mtld3d_core::texture_staging::SnapshotLayout,
+) -> Option<mtld3d_core::upload_snapshot::UploadSnapshot> {
+    let seq = dev.current_seq();
+    dev.upload_snapshots_mut()
+        .write(layout.len as usize, seq, |destination| {
+            mtld3d_core::texture_staging::copy_rows(
+                source,
+                layout.src_offset,
+                src_pitch as usize,
+                destination,
+                layout.pitch as usize,
+                layout.row_bytes as usize,
+                layout.rows as usize,
+            )
+        })
+}
+
+/// What a full snapshot arena's wait for its oldest chunk came to.
+enum SnapshotRoom {
+    /// The wait ran; the write may find room now.
+    Waited,
+    /// The frame being recorded reads the oldest chunk, which no wait can free.
+    Recording,
+    /// No wait applies, or the wait failed.
+    ///
+    /// The arena is not at its cap with its oldest chunk read, or an earlier
+    /// wait already covered that chunk's sequence.
+    NoWait,
+}
+
+/// Wait for a full snapshot arena's oldest chunk to lose its readers.
+///
+/// The arena is at its cap and its oldest chunk still read, so a write can
+/// only find room once the submission that recorded that chunk's newest
+/// snapshot has retired and the encoder has dropped the reads. One wait frees
+/// a whole chunk, where reading the staging instead costs a whole-level copy
+/// at each later partial lock of the level. A chunk the frame being recorded
+/// still reads cannot come free, since that frame has not been submitted:
+/// that is counted as `recording` and the upload reads the staging. The wait
+/// does not prove the chunk free (a replay after an aborted submit keeps its
+/// read), so the caller writes again and falls back as a full arena does,
+/// and the arena does not ask for a second wait on the same sequence.
+fn wait_for_snapshot_room(dev: &mut DeviceInner) -> SnapshotRoom {
+    let Some(seq) = dev.upload_snapshots_mut().wait_target() else {
+        return SnapshotRoom::NoWait;
+    };
+    if seq >= dev.current_seq() {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "texture upload snapshot: the arena is full and its oldest chunk is read by the frame \
+             being recorded, which no wait can retire → the upload reads the staging"
+        );
+        dev.perf_mut().bump_texture_snapshot_wait_recording();
+        return SnapshotRoom::Recording;
+    }
+    dev.upload_snapshots_mut().note_wait(seq);
+    dev.perf_mut().bump_texture_snapshot_wait();
+    let _wait =
+        mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().texture_snapshot_wait_cycles_ptr());
+    if dev.retire_uploads_through(seq).is_ok() {
+        SnapshotRoom::Waited
+    } else {
+        SnapshotRoom::NoWait
+    }
+}
+
 /// Build the upload operation and push it onto the current frame's op list.
 ///
 /// The operation holds an `Arc` clone of the staging mip plus a snapshot of
@@ -5013,9 +5286,11 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
         ti.observed_staging |= ti.observed_bit(0, level_u);
     }
+    let source = upload_source(ti, dev, (0, level_u), rect, slice_pitch);
+    let snapshot_offset = source.snapshot_offset;
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging: PageBoxRead::new(ti.staging_arc(level_u)),
+        staging: source.staging,
         level,
         destination_slice: 0,
         staging_index: level_u,
@@ -5024,17 +5299,22 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: (ti.depth >> level).max(1),
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         release_staging,
         upload_generation,
+        snapshot_offset,
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
-    ti.last_submit_seq[level as usize] = dev.current_seq();
+    // A snapshot leaves the staging unread, so the level's in-flight stamp
+    // stays as it was, as for a resampled upload.
+    if snapshot_offset.is_none() {
+        ti.last_submit_seq[level as usize] = dev.current_seq();
+    }
     ti.was_uploaded[level as usize] = true;
     // Once per (texture, level, whole-or-partial), so a log shows which levels
     // publish sub-rects and which always go whole.
@@ -5088,17 +5368,18 @@ fn schedule_resampled_upload(
     let bpp = ti.bytes_per_pixel as usize;
     let pitch = ti.mip_bytes_per_row(level_u) as usize;
     let row_bytes = rect.w as usize * bpp;
-    let staging = ti.staging[level_u].as_slice();
-    let mut rows = Vec::with_capacity(row_bytes * rect.h as usize);
-    for row in rect.y as usize..(rect.y + rect.h) as usize {
-        let start = row * pitch + rect.x as usize * bpp;
-        let Some(src) = staging.get(start..start + row_bytes) else {
-            rows.clear();
-            break;
-        };
-        rows.extend_from_slice(src);
-    }
-    if rows.is_empty() {
+    let staging = &ti.staging[level_u];
+    let mut rows = vec![0; row_bytes * rect.h as usize];
+    let copied = mtld3d_core::texture_staging::copy_rows(
+        &staging.as_slice()[..staging.logical_len()],
+        rect.y as usize * pitch + rect.x as usize * bpp,
+        pitch,
+        &mut rows,
+        row_bytes,
+        row_bytes,
+        rect.h as usize,
+    );
+    if !copied || rows.is_empty() {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: texture_id.raw(),
@@ -5178,18 +5459,22 @@ fn schedule_cube_upload<const ORDERED: bool>(
         rect.h
     );
     let bit = ti.observed_bit(face, level_u);
+    let source = upload_source(ti, dev, (face, level_u), rect, slice_pitch);
+    let snapshot_offset = source.snapshot_offset;
     let cube = ti.cube.as_deref_mut().expect("cube storage");
     let older_reader =
         cube.staging[index].has_readers() && cube.last_submit_seq[index] != dev.current_seq();
-    let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
-    cube.last_submit_seq[index] = dev.current_seq();
+    // A snapshot leaves the staging unread, so its in-flight stamp stays.
+    if snapshot_offset.is_none() {
+        cube.last_submit_seq[index] = dev.current_seq();
+    }
     cube.was_uploaded[index] = true;
     if older_reader {
         ti.observed_staging |= bit;
     }
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        staging,
+        staging: source.staging,
         level,
         destination_slice: face,
         staging_index: index,
@@ -5198,15 +5483,16 @@ fn schedule_cube_upload<const ORDERED: bool>(
         region_w: rect.w,
         region_h: rect.h,
         src_d3d_format: ti.d3d_format,
-        src_pitch: ti.mip_bytes_per_row(level_u),
+        src_pitch: source.src_pitch,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: 1,
-        slice_pitch,
+        slice_pitch: source.slice_pitch,
         redirty: dev.upload_redirty(),
         // A cube is outside the staging-droppable class: its faces are
         // written and uploaded by paths that expect the level to be there.
         release_staging: false,
         upload_generation: 0,
+        snapshot_offset,
     };
     if ORDERED {
         // The ordered placement rides the flags only the mip-carrying form
@@ -5689,8 +5975,9 @@ extern "system" fn volume_get_level_desc(this: *mut c_void, level: u32, desc: *m
         height: inner.mip_height(lvl),
         depth: (inner.depth >> level).max(1),
     };
-    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI.
-    unsafe { desc.cast::<D3DVOLUME_DESC>().write(volume_desc) };
+    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(desc.cast::<D3DVOLUME_DESC>(), volume_desc) };
     D3D_OK
 }
 
@@ -5721,8 +6008,9 @@ extern "system" fn volume_get_volume_level(
         // creating call reported. The `obj` borrow ended above, so that forward
         // does not alias it.
         volume9_add_ref(vol);
-        // SAFETY: `volume` is non-null per the check at entry; the app owns the slot.
-        unsafe { *volume = vol };
+        // SAFETY: `volume` is non-null per the check at entry; the app owns the slot; alignment is
+        // not assumed.
+        unsafe { OutPtr::write_opt(volume, vol) };
         return D3D_OK;
     }
     let vol = Direct3DVolume9::new(this, level);
@@ -5730,8 +6018,9 @@ extern "system" fn volume_get_volume_level(
     // hands the same pointer back, and `finalize_texture` frees it.
     obj.inner_mut().cache_subresource(index, vol as u64); // last use of `obj`
     texture_add_ref(this);
-    // SAFETY: `volume` is non-null per the check above; the app owns the slot.
-    unsafe { *volume = vol.cast::<c_void>() };
+    // SAFETY: `volume` is non-null per the check above; the app owns the slot; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(volume, vol.cast::<c_void>()) };
     D3D_OK
 }
 
@@ -5758,13 +6047,17 @@ extern "system" fn volume_lock_box(
     }
     // A rejected lock hands back a null `pBits` (the caller may have seeded
     // the struct with garbage); the success path overwrites this.
-    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
+    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI; alignment is
+    // not assumed.
     unsafe {
-        locked_box.write(D3DLOCKED_BOX {
-            row_pitch: 0,
-            slice_pitch: 0,
-            bits: core::ptr::null_mut(),
-        });
+        OutPtr::write_opt(
+            locked_box,
+            D3DLOCKED_BOX {
+                row_pitch: 0,
+                slice_pitch: 0,
+                bits: core::ptr::null_mut(),
+            },
+        );
     }
     // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`, so the
     // cast reads the shared `inner` correctly. InPtrMut so we can record the
@@ -5859,13 +6152,17 @@ extern "system" fn volume_lock_box(
     // validated above against the level dimensions and `lock_box` sized the
     // backing as `slice_pitch * depth`.
     let ptr = unsafe { ptr.add(offset) };
-    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
+    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI; alignment is
+    // not assumed.
     unsafe {
-        locked_box.write(D3DLOCKED_BOX {
-            row_pitch,
-            slice_pitch,
-            bits: ptr.cast::<c_void>(),
-        });
+        OutPtr::write_opt(
+            locked_box,
+            D3DLOCKED_BOX {
+                row_pitch,
+                slice_pitch,
+                bits: ptr.cast::<c_void>(),
+            },
+        );
     }
     D3D_OK
 }
@@ -6139,8 +6436,8 @@ extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_voi
         return D3DERR_INVALIDCALL;
     }
     crate::device::device_wrapper_add_ref(wrapper);
-    // SAFETY: non-null (checked at entry) and writable per the ABI.
-    unsafe { *device = wrapper };
+    // SAFETY: non-null (checked at entry) and writable per the ABI; alignment is not assumed.
+    unsafe { OutPtr::write_opt(device, wrapper) };
     D3D_OK
 }
 
@@ -6152,8 +6449,8 @@ extern "system" fn volume9_set_private_data(
     flags: u32,
 ) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 SetPrivateData thunk; `this` is the live wrapper.
@@ -6171,8 +6468,8 @@ extern "system" fn volume9_get_private_data(
     size: *mut u32,
 ) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 GetPrivateData thunk; `this` is the live wrapper.
@@ -6185,8 +6482,8 @@ extern "system" fn volume9_get_private_data(
 
 extern "system" fn volume9_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _api = volume9_api_lock(this);
-    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
-    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI; alignment is not assumed.
+    let Some(guid) = (unsafe { ValueIn::<Guid>::read_opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: IDirect3DVolume9 FreePrivateData thunk; `this` is the live wrapper.
@@ -6214,9 +6511,8 @@ extern "system" fn volume9_get_container(
     // so it answers the texture's own interface IIDs with an owned reference
     // and `E_NOINTERFACE` for anything else (a volume is not its own
     // container).
-    // SAFETY: `riid` is a *const Guid per the QueryInterface ABI.
-    let matches_texture = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).is_some_and(|g| {
-        let g = *g;
+    // SAFETY: `riid` is a *const Guid per the QueryInterface ABI; alignment is not assumed.
+    let matches_texture = (unsafe { ValueIn::<Guid>::read_opt(riid.cast()) }).is_some_and(|g| {
         g == IID_IUNKNOWN
             || g == IID_IDIRECT3DRESOURCE9
             || g == IID_IDIRECT3DBASETEXTURE9
@@ -6230,8 +6526,9 @@ extern "system" fn volume9_get_container(
     // by the reference this volume forwards; the returned reference is the
     // caller's to release.
     texture_add_ref(obj.parent_texture);
-    // SAFETY: `container` is non-null (checked) and a writable out-pointer.
-    unsafe { *container = obj.parent_texture };
+    // SAFETY: `container` is non-null (checked) and a writable out-pointer; alignment is not
+    // assumed.
+    unsafe { OutPtr::write_opt(container, obj.parent_texture) };
     D3D_OK
 }
 
@@ -6246,17 +6543,21 @@ extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC
     };
     let inner = obj.parent().inner();
     let lvl = obj.level as usize;
-    // SAFETY: `desc` is non-null per the check above; D3DVOLUME_DESC is plain data.
+    // SAFETY: `desc` is non-null per the check above; D3DVOLUME_DESC is plain data, and
+    // alignment is not assumed.
     unsafe {
-        desc.write(D3DVOLUME_DESC {
-            format: inner.d3d_format,
-            resource_type: D3DRTYPE_VOLUME,
-            usage: inner.d3d_usage,
-            pool: inner.d3d_pool,
-            width: inner.mip_widths[lvl],
-            height: inner.mip_heights[lvl],
-            depth: (inner.depth >> obj.level).max(1),
-        });
+        OutPtr::write_opt(
+            desc,
+            D3DVOLUME_DESC {
+                format: inner.d3d_format,
+                resource_type: D3DRTYPE_VOLUME,
+                usage: inner.d3d_usage,
+                pool: inner.d3d_pool,
+                width: inner.mip_widths[lvl],
+                height: inner.mip_heights[lvl],
+                depth: (inner.depth >> obj.level).max(1),
+            },
+        );
     }
     D3D_OK
 }
@@ -6477,10 +6778,12 @@ pub extern "system" fn cube_lock_rect(
         flags & D3DLOCK_NO_DIRTY_UPDATE != 0,
         dirty_rect,
     );
-    // SAFETY: checked non-null and points to a writable ABI out-param.
-    let out = unsafe { &mut *locked_rect };
-    out.pitch = pitch.cast_signed();
-    out.bits = ptr.cast::<c_void>();
+    let locked = D3DLOCKED_RECT {
+        pitch: pitch.cast_signed(),
+        bits: ptr.cast::<c_void>(),
+    };
+    // SAFETY: checked non-null and points to a writable ABI out-param; alignment is not assumed.
+    unsafe { OutPtr::write_opt(locked_rect, locked) };
     D3D_OK
 }
 

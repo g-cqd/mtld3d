@@ -41,9 +41,10 @@ use crate::{
 /// whose build failed is recorded too: the same key yields the same source,
 /// so its later draws are dropped on the probe instead of compiling again. A
 /// library a worker is building is in the encoder's `pending_libs` until its
-/// outcome lands here. A device reset forgets the failures (a Reset at
-/// unchanged back-buffer dimensions never reaches it), shutdown forgets
-/// everything. The indexes do not own the libraries: `lib_cache` does.
+/// outcome lands here. The encoder's reset cleanup forgets the failures (it
+/// runs when the device replaces its implicit surfaces or moves its window,
+/// not on every Reset), shutdown forgets everything. The indexes do not own
+/// the libraries: `lib_cache` does.
 #[derive(Default)]
 pub struct StageLibraries {
     ff_vs: BuildIndex<FfVsKey, StageLibHandles>,
@@ -209,6 +210,15 @@ impl StageLibraries {
         self.prog_vs.clear();
         self.ff_ps.clear();
         self.prog_ps.clear();
+    }
+
+    /// How many fixed-function libraries are built or failed, both stages.
+    ///
+    /// One per distinct fixed-function vertex shader key and one per distinct
+    /// pixel shader key, whose variants count once. A key whose build failed
+    /// counts too.
+    pub fn ff_count(&self) -> usize {
+        self.ff_vs.len() + self.ff_ps.len()
     }
 
     /// Forget the memo before a packet whose records may reuse the previous packet's addresses.

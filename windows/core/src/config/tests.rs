@@ -82,13 +82,13 @@ fn defaults_match_documented_values() {
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
-    assert_eq!(d.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(d.cursor_software, SoftwareCursorPolicy::Off);
     assert!(d.shader_cache_enable);
     assert!(d.shader_async_compile);
-    assert!(d.log_dir.is_empty());
-    assert!(d.bytecode_dump_dir.is_empty());
-    assert!(d.skip_shaders.is_empty());
-    assert!(d.present_gate_file.is_empty());
+    assert_eq!(d.log_dir, "");
+    assert_eq!(d.bytecode_dump_dir, "");
+    assert_eq!(d.skip_shaders, [] as [u64; 0]);
+    assert_eq!(d.present_gate_file, "");
     assert!(!d.present_occluded);
     assert!(!d.query_flush_immediate);
     assert!(!d.query_event_immediate);
@@ -96,6 +96,7 @@ fn defaults_match_documented_values() {
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     assert_eq!(d.present_max_fps, 0);
+    assert_eq!(d.present_max_frame_latency, 0, "auto");
     assert_eq!(d.render_scale_percent, 100);
     assert!(!d.preserve_discard_backbuffer);
 }
@@ -168,6 +169,40 @@ fn present_max_fps_zero_means_uncapped() {
 fn present_max_fps_garbage_keeps_default() {
     let cfg = parse(None, "present.maxFps = fast\n", None);
     assert_eq!(cfg.present_max_fps, 0);
+}
+
+#[test]
+fn present_max_frame_latency_takes_a_frame_count() {
+    assert_eq!(
+        parse(None, "present.maxFrameLatency = 1\n", None).present_max_frame_latency,
+        1
+    );
+    assert_eq!(
+        parse(None, "present.maxFrameLatency = 30\n", None).present_max_frame_latency,
+        30
+    );
+}
+
+#[test]
+fn present_max_frame_latency_auto_follows_the_game() {
+    let cfg = parse(
+        None,
+        "present.maxFrameLatency = 2\npresent.maxFrameLatency = AUTO\n",
+        None,
+    );
+    assert_eq!(cfg.present_max_frame_latency, 0);
+}
+
+#[test]
+fn present_max_frame_latency_out_of_range_or_garbage_keeps_the_value() {
+    for invalid in ["0", "31", "-1", "low"] {
+        let body = format!("present.maxFrameLatency = 4\npresent.maxFrameLatency = {invalid}\n");
+        assert_eq!(
+            parse(None, &body, None).present_max_frame_latency,
+            4,
+            "{invalid} is refused"
+        );
+    }
 }
 
 #[test]
@@ -314,21 +349,21 @@ fn cursor_software_accepts_all_three_values_case_insensitive() {
     let cfg = parse(None, "cursor.software = TRUE\n", None);
     assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::On);
 
-    let cfg = parse(None, "cursor.software = False\n", None);
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
+    let cfg = parse(None, "cursor.software = Auto\n", None);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
 
     let cfg = parse(
         None,
-        "cursor.software = true\ncursor.software = auto\n",
+        "cursor.software = true\ncursor.software = False\n",
         None,
     );
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
 }
 
 #[test]
 fn cursor_software_garbage_keeps_default() {
     let cfg = parse(None, "cursor.software = maybe\n", None);
-    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
 }
 
 #[test]
@@ -525,7 +560,7 @@ fn present_occluded_defaults_off_and_parses_on() {
 #[test]
 fn empty_string_disables_bytecode_dump() {
     let cfg = parse(None, "debug.bytecodeDumpDir =\n", None);
-    assert!(cfg.bytecode_dump_dir.is_empty());
+    assert_eq!(cfg.bytecode_dump_dir, "");
 }
 
 #[test]

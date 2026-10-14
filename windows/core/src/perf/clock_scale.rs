@@ -6,6 +6,8 @@ impl FrameCounters {
     pub(super) fn rescale_durations(&mut self, source_hz: u64, target_hz: u64) {
         self.api_cycles_by_category.rescale(source_hz, target_hz);
         self.query_wait_cycles.rescale(source_hz, target_hz);
+        self.texture_snapshot_wait_cycles
+            .rescale(source_hz, target_hz);
         self.device_sub_cycles.rescale(source_hz, target_hz);
         self.bind_sub_cycles.rescale(source_hz, target_hz);
         self.surface_sub_cycles.rescale(source_hz, target_hz);
@@ -25,6 +27,7 @@ impl FrameTiming {
     pub(super) fn rescale_durations(&mut self, source_hz: u64, target_hz: u64) {
         self.present_block_cycles.rescale(source_hz, target_hz);
         self.frame_total_cycles.rescale(source_hz, target_hz);
+        self.latency_wait_cycles.rescale(source_hz, target_hz);
     }
 }
 

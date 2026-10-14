@@ -12,7 +12,7 @@
 //! own.
 //!
 //! Liveness. A record is live exactly while it is in [`ATTACHMENTS`]. The
-//! `view` and `layer` addresses and the two PE-side sink addresses a record
+//! `view` and `layer` addresses and the three PE-side sink addresses a record
 //! holds are valid only while it is live: `DestroyCommandQueue` unregisters
 //! the record before it releases the view, and the PE side drops the box
 //! behind the sinks after that thunk returns. So every dereference of one of
@@ -35,10 +35,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::{
     sync::{Arc, LazyLock, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::ColorSpacePolicy;
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -53,6 +53,15 @@ use crate::metal::command::{GeometryStreak, PresentGeometry};
 /// the interval is measured in frames, which at 30 to 300 fps puts the
 /// refresh somewhere between one second and a tenth of one.
 pub const HEADROOM_REFRESH_PRESENTS: u64 = 32;
+
+/// Paced presents in a row the display did not show before a visible window counts as unshown.
+///
+/// A window that has just come on screen leaves its first four or five
+/// drawables undisplayed on a 120 Hz panel, and one being covered a few
+/// until the occlusion notification lands, so the run has to be longer than
+/// those. A window that never shows a drawable reaches it in about 130 ms at
+/// that panel's rate, the most it presents unpaced.
+pub const UNDISPLAYED_PACED_LIMIT: u32 = 16;
 
 /// The live records, keyed by the raw `NSView*` address attach created.
 ///
@@ -98,6 +107,8 @@ pub struct AttachLatches {
     pub backing_scale_sink: usize,
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
+    /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
+    pub client_surface_request_sink: usize,
     /// Wine's client surface the view sits in, `0` = none.
     ///
     /// The record owns one reference on it, taken at attach and given back
@@ -122,8 +133,16 @@ pub struct Attachment {
     backing_scale_sink: usize,
     /// See [`AttachLatches::cursor_kick_sink`].
     cursor_kick_sink: usize,
+    /// See [`AttachLatches::client_surface_request_sink`].
+    client_surface_request_sink: usize,
     /// See [`AttachLatches::client_surface`].
     client_surface: usize,
+    /// The main-thread watch on the hidden state of the view's client view, `0` = none.
+    ///
+    /// An address `client_view_watch` hands out and takes back, dereferenced
+    /// on the main thread alone; the record only carries it from the attach
+    /// that installs the watch to the teardown that removes it.
+    client_view_watch: AtomicUsize,
     /// When the record was registered, which orders the devices on one window.
     attached_at: Instant,
     flags: AttachFlags,
@@ -182,6 +201,23 @@ pub struct Attachment {
     /// reconciliation, which re-derives it for the panel the window is on
     /// now whenever the display or the pacing a Reset latched moved.
     min_present_duration_bits: AtomicU64,
+    /// When the presenter last released a paced present the compositor did not show.
+    ///
+    /// Nanoseconds after `attached_at`, `0` = none yet. The display paces a
+    /// shown window per layer, so the presenter's own pace for an unshown one
+    /// lives on the record too, and two swap chains presenting into two
+    /// hidden windows keep a pace each. Written only by the presenter of the
+    /// device that owns the view.
+    unshown_release_ns: AtomicU64,
+    /// Paced presents in a row whose drawable the display did not show.
+    ///
+    /// Counted by the drawables' presented handlers, which Metal runs on a
+    /// thread of its own, for presents into the window while it reads
+    /// visible: a drawable whose `presentedTime` is 0 adds one, a displayed
+    /// one sets it back to 0. At [`UNDISPLAYED_PACED_LIMIT`] the
+    /// window counts as unshown although it reads visible
+    /// ([`Attachment::displays_nothing`]).
+    undisplayed_paced: AtomicU32,
     /// Present pacing latched from the PE side, encoded by `pack_pacing`.
     ///
     /// Attach and the D3D9 Reset path both write it, and the display-follow
@@ -215,7 +251,9 @@ impl Attachment {
             hwnd: latches.hwnd,
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
+            client_surface_request_sink: latches.client_surface_request_sink,
             client_surface: latches.client_surface,
+            client_view_watch: AtomicUsize::new(0),
             attached_at: Instant::now(),
             flags: latches.flags,
             color_space: latches.color_space,
@@ -227,6 +265,8 @@ impl Attachment {
             headroom_refresh_pending: AtomicBool::new(false),
             presents_since_headroom_refresh: AtomicU64::new(HEADROOM_REFRESH_PRESENTS),
             min_present_duration_bits: AtomicU64::new(0),
+            unshown_release_ns: AtomicU64::new(0),
+            undisplayed_paced: AtomicU32::new(0),
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
@@ -271,6 +311,16 @@ impl Attachment {
     #[must_use]
     pub const fn client_surface(&self) -> usize {
         self.client_surface
+    }
+
+    /// Hand the record the address of its client view watch, giving back any it held.
+    pub fn replace_client_view_watch(&self, watch: usize) -> usize {
+        self.client_view_watch.swap(watch, Ordering::AcqRel)
+    }
+
+    /// Take the client view watch address out of the record, `0` when it holds none.
+    pub fn take_client_view_watch(&self) -> usize {
+        self.client_view_watch.swap(0, Ordering::AcqRel)
     }
 
     /// `color.hdr.enable` as the attach carried it.
@@ -420,6 +470,54 @@ impl Attachment {
             .store(seconds.to_bits(), Ordering::Relaxed);
     }
 
+    /// When the next paced present into this window may go while the compositor shows none of it.
+    ///
+    /// What [`next_unshown_release`] answers for the previous release and the
+    /// time the frame was `ready`; the answer then replaces the previous one.
+    pub fn unshown_release_at(&self, ready: Instant, duration: Duration) -> Instant {
+        let last = match self.unshown_release_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => self.attached_at.checked_add(Duration::from_nanos(ns)),
+        };
+        let at = next_unshown_release(last, ready, duration);
+        let ns = at.saturating_duration_since(self.attached_at).as_nanos();
+        self.unshown_release_ns.store(
+            u64::try_from(ns).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
+        at
+    }
+
+    /// Count one paced present the display showed (`displayed`) or let go unshown.
+    ///
+    /// Returns the change it made to [`Self::displays_nothing`]: `Some(true)`
+    /// when this present completed the run of undisplayed ones, `Some(false)`
+    /// when a displayed one ended such a run, `None` otherwise.
+    pub fn note_paced_present(&self, displayed: bool) -> Option<bool> {
+        let before = if displayed {
+            self.undisplayed_paced.swap(0, Ordering::Relaxed)
+        } else {
+            let (Ok(run) | Err(run)) =
+                self.undisplayed_paced
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
+                        Some(run.saturating_add(1))
+                    });
+            run
+        };
+        undisplayed_run_edge(before, displayed)
+    }
+
+    /// Whether the window displays nothing although it reads visible.
+    ///
+    /// True once [`UNDISPLAYED_PACED_LIMIT`] paced presents in a row came
+    /// back with `presentedTime` 0, until a displayed one: nothing enforces
+    /// such a window's present duration, so the presenter holds its paced
+    /// presents to it as it does an occluded window's.
+    #[must_use]
+    pub fn displays_nothing(&self) -> bool {
+        self.undisplayed_paced.load(Ordering::Relaxed) >= UNDISPLAYED_PACED_LIMIT
+    }
+
     /// The pacing word `pack_pacing` produced.
     #[must_use]
     pub fn pacing_bits(&self) -> u64 {
@@ -461,6 +559,46 @@ fn is_live(map: &FxHashMap<usize, Arc<Attachment>>, att: &Arc<Attachment>) -> bo
         .is_some_and(|live| Arc::ptr_eq(live, att))
 }
 
+/// When a paced present into a window the compositor does not show may go.
+///
+/// `presentDrawable:afterMinimumDuration:` counts a present's minimum
+/// duration from the time the previous drawable was displayed, so in a window
+/// that displays nothing the duration has no reference, and the presenter
+/// keeps the pace itself: one `duration` after the previous release `last`,
+/// or when the frame was `ready` if that is later.
+///
+/// Counting from readiness rather than from when the presenter got to the
+/// frame matters when its timed wait wakes late. A process macOS runs in the
+/// background (a minimised game; a test launched from a service) has its
+/// timers coalesced, and a hold can end a hundred milliseconds past its
+/// deadline. The frames that became ready meanwhile then go at once, on the
+/// schedule they missed, so the pace holds on average. A game slower than the
+/// pace has its frames ready after the deadline and goes at its own rate,
+/// with no burst.
+pub fn next_unshown_release(last: Option<Instant>, ready: Instant, duration: Duration) -> Instant {
+    last.and_then(|last| last.checked_add(duration))
+        .map_or(ready, |at| at.max(ready))
+}
+
+/// How one paced present moves a run of undisplayed ones that stood at `before`.
+///
+/// `Some(true)` when an undisplayed present makes the run reach
+/// [`UNDISPLAYED_PACED_LIMIT`], `Some(false)` when a displayed one ends a run
+/// that had reached it, `None` when the window's state does not change.
+pub const fn undisplayed_run_edge(before: u32, displayed: bool) -> Option<bool> {
+    if displayed {
+        if before >= UNDISPLAYED_PACED_LIMIT {
+            Some(false)
+        } else {
+            None
+        }
+    } else if before.saturating_add(1) == UNDISPLAYED_PACED_LIMIT {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Create the record for a freshly attached view and make it live.
 ///
 /// Attach unregisters a record whose teardown never ran before it registers
@@ -480,6 +618,23 @@ pub fn register(view: usize, layer: usize, latches: &AttachLatches) -> Arc<Attac
 /// like.
 pub fn unregister(view: usize) -> Option<Arc<Attachment>> {
     lock().remove(&view)
+}
+
+/// A block of `0x1_0000` addresses that no other caller in this process is handed.
+///
+/// The registry is one map for the process and the unit tests that fill it
+/// run in parallel, so a test takes the view and layer addresses it
+/// registers, and any window it looks records up by, from a block of its own
+/// rather than from a constant another test may pick too. Block `0` is never
+/// handed out: address `0` is what a device that never attached carries.
+#[cfg(test)]
+pub fn test_address_block() -> usize {
+    /// The next block to hand out.
+    ///
+    /// A static because the resource is process-wide: the blocks partition
+    /// the key space of the one registry map, which every test shares.
+    static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(1);
+    NEXT_BLOCK.fetch_add(1, Ordering::Relaxed) << 16
 }
 
 /// The live record for `view`, if any.
@@ -506,13 +661,50 @@ pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
 /// back. `None` when no live record on `hwnd` holds a surface.
 pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> Option<usize> {
     let map = lock();
-    let retained = map
-        .values()
-        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
-        .max_by_key(|att| att.attached_at)
-        .map(|newest| retain(newest.client_surface));
+    let retained = newest_with_surface_on(&map, hwnd).map(|newest| retain(newest.client_surface));
     drop(map);
     retained.filter(|&surface| surface != 0)
+}
+
+/// Ask the device that owns `view` to have Wine show its window's client surface again.
+///
+/// ORs `reason` into the record's PE-side request word, which the device
+/// takes at its next `Present` and answers with `PresentClientSurface`. Only
+/// the newest record on its window that holds a surface asks: Wine shows one
+/// client surface per window, the newest device's, so an older device's view
+/// is hidden on purpose and asking for it would change nothing. `false`, and
+/// nothing written, for a view no live record names, a record without a
+/// surface or a request word, or one a newer device on its window outranks.
+pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool {
+    let map = lock();
+    let Some(att) = map.get(&view) else {
+        return false;
+    };
+    if att.client_surface_request_sink == 0
+        || !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att))
+    {
+        return false;
+    }
+    // SAFETY: as in `publish_backing_scale`: the PE side backs this address
+    // with an `AtomicU32` in a box it keeps until after the teardown thunk
+    // that unregisters the record has returned, and the record is live under
+    // the registry lock.
+    let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU32) };
+    sink.fetch_or(reason.bits(), Ordering::Release);
+    // The write above is what the lock guards: the record's teardown
+    // unregisters it under the same lock before the PE side drops the word.
+    drop(map);
+    true
+}
+
+/// The newest live record on `hwnd` that holds a client surface; `map` is the locked registry.
+fn newest_with_surface_on(
+    map: &FxHashMap<usize, Arc<Attachment>>,
+    hwnd: u64,
+) -> Option<&Arc<Attachment>> {
+    map.values()
+        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
+        .max_by_key(|att| att.attached_at)
 }
 
 /// A snapshot of every live record, for a main-thread observer to walk.

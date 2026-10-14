@@ -489,20 +489,6 @@ pub enum BorderColor {
     OpaqueWhite = 2,
 }
 
-/// Shader stage selector for the native shader compiler.
-///
-/// Selects the MSL compile options for the stage: the Unix side compiles the
-/// vertex path with `MTLMathMode::Safe` (FP reassociation would defeat
-/// `[[position, invariant]]` across pipelines) and the fragment path with
-/// `MTLMathMode::Fast`. The entry-point name is carried separately in
-/// the native compiler entry name.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
-pub enum StageTag {
-    Vertex = 0,
-    Fragment = 1,
-}
-
 /// Resource kind for `DestroyResourcesBulkParams`.
 ///
 /// The Unix side dispatches on this to release the matching MTL protocol type
@@ -861,11 +847,12 @@ pub enum ColorSpacePolicy {
 
 /// `cursor.software` policy crossing PE→Unix on `AttachMetalLayerParams`.
 ///
-/// Picked from `mtld3d.conf` (`cursor.software = auto | true | false`). The
-/// unix side resolves it against the layer mode it just configured and answers
-/// with `software_cursor_active`: `Auto` follows the HDR present path, because
-/// the overlay window sends the game window through the compositor, a cost an
-/// EDR layer already pays and an SDR direct-to-display window does not.
+/// Picked from `mtld3d.conf` (`cursor.software = auto | true | false`, default
+/// `false`). The unix side resolves it against the layer mode it just
+/// configured and answers with `software_cursor_active`. The overlay window
+/// sends the game window through the compositor in both modes, so it is off
+/// unless asked for. `Auto` turns it on under HDR, where the hardware cursor
+/// reads dim because macOS has no HDR cursor; `On` forces it.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
 pub enum SoftwareCursorPolicy {
@@ -908,6 +895,23 @@ bitflags! {
         const HARDWARE = 1 << 1;
         /// Win32 requests a hidden native cursor, including games drawing their own sprite.
         const NATIVE_HIDDEN = 1 << 2;
+    }
+}
+
+bitflags! {
+    /// Why a device asks Wine to show its window's client surface again.
+    ///
+    /// Written into the PE-side word `AttachMetalLayerParams::client_surface_request_ptr`
+    /// names, from the unix side's main thread and from the window procedure,
+    /// and carried by `PresentClientSurfaceParams` when the next `Present`
+    /// takes it. A `u32` for two bits because it is that `AtomicU32` word's
+    /// value and a 4-byte field of the thunk.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ClientSurfaceRequest: u32 {
+        /// The client view the device's metal view sits in was hidden.
+        const VIEW_HIDDEN = 1 << 0;
+        /// The window was resized, re-framed or shown, which can move its client area.
+        const CLIENT_AREA_CHANGED = 1 << 1;
     }
 }
 

@@ -18,12 +18,14 @@ use objc2::{
     runtime::{AnyClass, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{NSView, NSWindow};
+use objc2_core_foundation::CGRect;
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 pub mod attachment;
 mod client_surface;
+mod client_view_watch;
 mod cursor_overlay;
 mod delegate_forward;
 
@@ -55,6 +57,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
     let att = attachment::unregister(view_addr)?;
+    client_view_watch::unwatch(&att);
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
     // Another device still presenting into this window gets its surface
@@ -75,6 +78,41 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
         att.layer(),
     );
     Some(att)
+}
+
+/// Have Wine show and size the client surface of the newest device on a view's window.
+///
+/// The device whose metal view is `view_handle` asks at its `Present` after
+/// its client view was hidden or its window's client area changed
+/// (`reasons`). win32u's `client_surface_present` updates the surface's
+/// cocoa view to the window's client rect and makes it the one Wine shows,
+/// the two things winemac's `nextDrawable` override did on every present.
+/// The surface is the newest device's on the record's window, as at a
+/// teardown. Runs on the API thread, a Wine thread, which win32u's calls
+/// need; a view no record names asks for nothing, logged once.
+pub fn present_client_surface(
+    view_handle: MetalHandle<NSViewKind>,
+    reasons: mtld3d_shared::mtl::ClientSurfaceRequest,
+) {
+    let view_addr =
+        usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
+    let Some(att) = attachment::find(view_addr) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: a client surface request names view {view_addr:#x}, which has no \
+             attachment record → ignored",
+        );
+        return;
+    };
+    let Some(calls) = client_surface::SurfaceCalls::load() else {
+        return;
+    };
+    if let Some(surface) =
+        attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
+    {
+        calls.present_requested(surface, reasons);
+        calls.release(surface);
+    }
 }
 
 /// Tell macOS this process is doing continuous, latency-critical, user-interactive work.
@@ -114,7 +152,7 @@ pub fn declare_latency_critical_activity() {
     });
 }
 
-/// Begin tracking the record's window occlusion so presents can skip `nextDrawable`.
+/// Begin tracking the record's window occlusion and its client view's `hidden`.
 ///
 /// `submit_frame` skips the present while the window is fully
 /// covered/minimised. When a window is occluded the compositor stops
@@ -122,19 +160,24 @@ pub fn declare_latency_critical_activity() {
 /// `allowsNextDrawableTimeout` for nothing on screen and back-pressure the
 /// whole pipeline up to the guest's render loop. Records the window pointer
 /// on `att` and seeds its occlusion from the current state, then installs
-/// the (process-lifetime) observer once. Runs the `AppKit` work on the main
-/// thread: `NSView`/`NSWindow` access and the notification center are
-/// main-thread affairs, mirroring [`configure_metal_layer`]'s posture. The
-/// record is registered before this runs, so the observer can already find
-/// it.
-fn install_occlusion_tracking(att: &Arc<Attachment>) {
+/// the (process-lifetime) observer once. The client view the metal view sits
+/// in gets a watch of its own ([`client_view_watch::watch`]), which asks the
+/// device to have Wine show its surface again when Wine hides it. Runs the
+/// `AppKit` work on the main thread: `NSView`/`NSWindow` access and the
+/// notification center are main-thread affairs, mirroring
+/// [`configure_metal_layer`]'s posture. The record is registered before this
+/// runs, so the observers can already find it.
+fn install_window_tracking(att: &Arc<Attachment>) {
     use objc2_app_kit::NSWindowOcclusionState;
 
     let att = Arc::clone(att);
     run_on_main_thread_sync(move || {
-        let mtm =
-            MainThreadMarker::new().expect("install_occlusion_tracking runs on the main thread");
-        let window = attachment::retain_view(&att, mtm).and_then(|view| view.window());
+        let mtm = MainThreadMarker::new().expect("install_window_tracking runs on the main thread");
+        let view = attachment::retain_view(&att, mtm);
+        if let Some(view) = &view {
+            client_view_watch::watch(&att, view, mtm);
+        }
+        let window = view.and_then(|view| view.window());
         let Some(window) = window else {
             // No host window yet: assume visible so a present is never
             // wrongly suppressed; the observer corrects it on the first
@@ -645,6 +688,8 @@ pub struct LayerAttachRequest {
     pub backing_scale_sink_ptr: u64,
     /// Where a cursor re-apply request is written on the PE side, `0` = nowhere.
     pub cursor_kick_sink_ptr: u64,
+    /// Where a client surface present request is written on the PE side, `0` = nowhere.
+    pub client_surface_request_sink_ptr: u64,
     /// `cursor.software`, resolved here against the layer mode attach picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
@@ -999,6 +1044,7 @@ pub fn attach_metal_layer(
         color_space,
         backing_scale_sink_ptr,
         cursor_kick_sink_ptr,
+        client_surface_request_sink_ptr,
         software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
@@ -1037,15 +1083,25 @@ pub fn attach_metal_layer(
     // AppKit owns the view's window and screen relationships on the main
     // thread; the view is retained for as long as the device holds it. The
     // same hop takes the layer off winemac's `nextDrawable` override, which
-    // walks the view from the presenter thread, and reads a hosted view's
-    // client surface, which the override would have presented.
+    // walks the view from the presenter thread, reads a hosted view's
+    // client surface, which the override would have presented, and takes
+    // the fade out of the window's order-out, so the layer can move on at
+    // once when the window goes.
     let mut hint = None;
     let mut layer_class = client_surface::LayerClass::Plain;
     let mut surface = 0;
+    let can_present = surface_calls.is_some();
     run_on_main_thread_sync(|| {
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
-        layer_class = client_surface::bypass_present_hook(layer, mtm);
+        layer_class = client_surface::bypass_present_hook(layer, can_present, mtm);
+        if !order_out_without_fade(view, mtm) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: a metal view is in no window at attach; the window it joins later \
+                 keeps its order-out fade until the view is parked",
+            );
+        }
         if retained.is_none() {
             surface = client_surface::client_surface_of(view, mtm);
         }
@@ -1106,6 +1162,7 @@ pub fn attach_metal_layer(
              record is dropped",
             view as usize,
         );
+        client_view_watch::unwatch(&stale);
         if let Some(calls) = &surface_calls {
             calls.release(stale.client_surface());
         }
@@ -1123,6 +1180,8 @@ pub fn attach_metal_layer(
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            client_surface_request_sink: usize::try_from(client_surface_request_sink_ptr)
+                .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             client_surface: surface,
         },
     );
@@ -1132,8 +1191,9 @@ pub fn attach_metal_layer(
         calls.present(surface);
     }
     attachment::publish_backing_scale(&att, backing_scale);
-    // The software cursor rides the same decision: the overlay window
-    // is a compositing cost an EDR layer already pays.
+    // `Auto` turns the software cursor on under HDR, where the hardware
+    // cursor reads dim. The overlay window costs the game window its
+    // direct-to-display path in either mode.
     let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
     info!(
         target: LOG_TARGET,
@@ -1156,9 +1216,17 @@ pub fn attach_metal_layer(
         },
     );
     att.set_min_present_duration(min_present_duration);
+    // One line per attach: the pace a present into this window is held to,
+    // by the display when the window is shown and by the presenter when not.
+    info!(
+        target: LOG_TARGET,
+        "present: minimum present duration {min_present_duration:.5}s (panel {:.0} Hz)",
+        hint.panel_max_hz,
+    );
     // Start occlusion tracking for this window so presents skip the
-    // `nextDrawable` timeout while it is fully covered/minimised.
-    install_occlusion_tracking(&att);
+    // `nextDrawable` timeout while it is fully covered/minimised, and watch
+    // the client view for Wine hiding it.
+    install_window_tracking(&att);
     // SAFETY: the view is the one `macdrv_view_create_metal_view` handed
     // out retained, either just now or for this window's previous device,
     // kept since. The PE side holds the handle until the matching retire.
@@ -1391,6 +1459,40 @@ fn window_did_draw_content(window: &NSWindow, _mtm: MainThreadMarker) {
              has content",
         );
     }
+}
+
+/// Have the window `view` sits in order out without `AppKit`'s fade. **Main thread only.**
+///
+/// A window with the default animation behaviour fades when it is ordered
+/// out or closed, and `AppKit` finishes ordering it out only when the fade
+/// ends, about a quarter of a second later. A layer the window showed that
+/// moves into another window before then, as a kept view does when an
+/// application destroys its device window and creates the next one at once
+/// ([`adopt_metal_view`]), never has a drawable displayed in its new window:
+/// every presented handler reports a `presentedTime` of 0 while the window
+/// reads visible. Without the fade the order-out is immediate and the moved
+/// layer displays. Attach sets it, and the park again for a view that was in
+/// no window then; the window keeps it after its device leaves, since it
+/// still holds the kept view. `false` when the view is in no window.
+fn order_out_without_fade(view: *mut c_void, _mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::NSWindowAnimationBehavior;
+
+    if view.is_null() {
+        return false;
+    }
+    // SAFETY: the view is a retained one attach or the park holds, created
+    // by Wine or kept since; the retain taken here covers the walk to its
+    // window.
+    let Some(view) = (unsafe { Retained::retain(view.cast::<NSView>()) }) else {
+        return false;
+    };
+    let Some(window) = view.window() else {
+        return false;
+    };
+    if window.animationBehavior() != NSWindowAnimationBehavior::None {
+        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    }
+    true
 }
 
 /// Wine's record for `hwnd`, with a client surface created for the window on every call.
@@ -1775,7 +1877,7 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
     // Before the park publishes the view, not after: a device that took it
     // back in between would present into the shrunk drawable until its own
     // attach put the layer's geometry back.
-    shrink_parked_layer(record.layer());
+    shrink_parked_layer(view, record.layer());
     let displaced = PARKED_METAL_VIEW
         .lock()
         .expect("metal view park mutex poisoned")
@@ -1806,10 +1908,15 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
 ///
 /// Synchronous, because the caller is about to publish the view to the park:
 /// the write has to land before another device can take the view back.
-fn shrink_parked_layer(layer: usize) {
+///
+/// The same hop takes the fade out of the order-out of the window the view
+/// still sits in ([`order_out_without_fade`]), for a view attach found in no
+/// window.
+fn shrink_parked_layer(view: usize, layer: usize) {
     run_on_main_thread_sync(|| {
         let mtm = MainThreadMarker::new().expect("the parked layer is shrunk on the main thread");
         shrink_layer_drawable(layer, mtm);
+        order_out_without_fade(view as *mut c_void, mtm);
     });
 }
 
@@ -2322,9 +2429,10 @@ fn refresh_all_on_main() {
 /// where everything the display decides is reconciled against that screen
 /// for this record: the layer's own configuration
 /// ([`follow_screen_layer_mode`]), the present throttle
-/// ([`follow_screen_present_throttle`]) and the backing scale the PE side
-/// consumes ([`follow_layer_backing_scale`]). A record that was retired
-/// between the queueing and the run finds no view and does nothing.
+/// ([`follow_screen_present_throttle`]), the backing scale the PE side
+/// consumes ([`follow_layer_backing_scale`]) and the window layers a covering
+/// metal view hides ([`clear_covered_window_layers`]). A record that was
+/// retired between the queueing and the run finds no view and does nothing.
 fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     use objc2_app_kit::NSScreen;
 
@@ -2362,6 +2470,7 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
         follow_screen_layer_mode(att, screen, mtm);
         follow_screen_present_throttle(att, screen);
         follow_layer_backing_scale(att, mtm);
+        clear_covered_window_layers(&view_obj, mtm);
     }
     log_headroom_change_if_any(att, headroom, &view_obj, mtm);
     cursor_overlay::reconcile_on_main();
@@ -2517,10 +2626,13 @@ fn configure_metal_layer_inner(
     layer.setContentsGravity(gravity);
     let backdrop = CGColor::new_generic_gray(0.0, 1.0);
     layer.setBackgroundColor(Some(&backdrop));
-    // `framebufferOnly = false` is slower than `true`, but required for
-    // guest compat: D3D9 games commonly GetBackBuffer + StretchRect,
-    // lock, or read the backbuffer.
-    layer.setFramebufferOnly(false);
+    // Nothing reads the drawable. Every guest read of the frame (a lock,
+    // `GetRenderTargetData`, `StretchRect`, `GetFrontBufferData`) goes to the
+    // persistent back-buffer texture, and present only writes the drawable,
+    // through render passes. A framebuffer-only drawable stays compressible
+    // and eligible for direct-to-display; one that is not keeps an EDR layer
+    // in the compositor.
+    layer.setFramebufferOnly(true);
     // We always disable Metal-side vsync and instead throttle presents
     // via `presentDrawable:afterMinimumDuration:` set to `1/panel_max_hz`
     // when the guest asked for vsync. On a fixed-Hz panel that matches
@@ -2872,6 +2984,102 @@ fn follow_layer_backing_scale(att: &Arc<Attachment>, mtm: MainThreadMarker) {
         target: LOG_TARGET,
         "present: the Wine layer's contents scale is {scale}x (was {applied}x), cursor scale republished to the guest",
     );
+}
+
+/// Clear what the window's layers paint under a metal view that covers it. **Main thread only.**
+///
+/// Two layers of a winemac window paint beneath the metal view. The frame
+/// view's layer carries the window's background colour, which `AppKit` puts
+/// there because Wine's content view is not opaque, and the content view's
+/// layer holds Wine's window surface image as its `contents`, set again on
+/// every surface flush. Either one can keep the game's layer in the
+/// compositor instead of going direct to the display, as seen on an M1 Max
+/// (an M5 Max goes direct with both in place). When the metal view is shown
+/// and its visible rectangle covers the frame view to within a sixty-fourth
+/// of a point, far below a device pixel, both are entirely hidden under its
+/// opaque layer, so clearing them changes no pixel on screen. A window the
+/// view does not cover shows them and keeps them, and so does a window whose
+/// metal view is hidden, as Wine hides the client view when another client
+/// surface takes over or, on some Wines, on every surface flush: the surface
+/// image is then all the window shows. Nothing is restored: Wine sets the
+/// surface image again on its next flush, which a resize makes, and the
+/// background colour on the window's next show, and the next refresh clears
+/// whichever property `AppKit` or Wine has set again while the cover holds.
+fn clear_covered_window_layers(view: &NSView, _mtm: MainThreadMarker) {
+    // A view between windows has none; the next pass finds the new one.
+    let Some(window) = view.window() else {
+        return;
+    };
+    // A hidden view leaves the surface image as all the window shows, so it
+    // stays; the next pass after Wine shows the view again clears it.
+    if view.isHiddenOrHasHiddenAncestor() {
+        return;
+    }
+    let content = window.contentView();
+    // SAFETY: objc2 typed binding; `superview` is unsafe only because the
+    // view hierarchy may change under a caller off the main thread, and the
+    // marker puts this read on the main thread, where that hierarchy changes.
+    let frame_view = content
+        .as_deref()
+        .and_then(|content| unsafe { content.superview() });
+    let (Some(content), Some(frame_view)) = (content, frame_view) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the metal view's window has no content view or frame view; what the \
+             window paints under the game's layer is left as it is",
+        );
+        return;
+    };
+    let covered = rect_covers(
+        view.convertRect_toView(view.visibleRect(), None),
+        frame_view.convertRect_toView(frame_view.bounds(), None),
+    );
+    if !covered {
+        return;
+    }
+    let (Some(content_layer), Some(frame_layer)) = (content.layer(), frame_view.layer()) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the metal view's window has a content or frame view without a layer; what \
+             the window paints under the game's layer is left as it is",
+        );
+        return;
+    };
+    if frame_layer.backgroundColor().is_some() {
+        frame_layer.setBackgroundColor(None);
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: the metal view covers its window; cleared the frame view's background \
+             colour beneath it so the game's layer can go direct to the display",
+        );
+    }
+    // SAFETY: objc2 typed binding; `contents` is unsafe only because the
+    // object it returns is untyped, and it is only tested for presence here.
+    if unsafe { content_layer.contents() }.is_some() {
+        // SAFETY: `nil` is a valid `contents` for any layer and means no image.
+        unsafe { content_layer.setContents(None) };
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: the metal view covers its window; cleared the content view's surface \
+             image beneath it so the game's layer can go direct to the display",
+        );
+    }
+}
+
+/// Whether `inner` covers `outer`, both in one coordinate space, to 1/64 point on every edge.
+///
+/// Wine's view frames come from integer Win32 rectangles, at most halved,
+/// so the conversion between view spaces is exact in `f64`; the tolerance
+/// only absorbs float noise and stays far below a device pixel, so no
+/// visible strip of the window counts as covered.
+fn rect_covers(inner: CGRect, outer: CGRect) -> bool {
+    const SLACK: f64 = 1.0 / 64.0;
+    let (inner_min, inner_max) = (inner.min(), inner.max());
+    let (outer_min, outer_max) = (outer.min(), outer.max());
+    inner_min.x <= outer_min.x + SLACK
+        && inner_min.y <= outer_min.y + SLACK
+        && inner_max.x >= outer_max.x - SLACK
+        && inner_max.y >= outer_max.y - SLACK
 }
 
 /// Set the SDR layer colorspace under the `Passthrough` policy.

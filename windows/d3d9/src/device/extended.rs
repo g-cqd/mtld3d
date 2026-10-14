@@ -15,7 +15,7 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{InPtr, InPtrMut, OutPtr};
 use mtld3d_types::{
-    D3DDISPLAYMODEEX, D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
+    D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER,
     D3DUSAGE_RESTRICTED_CONTENT,
 };
 
@@ -147,11 +147,12 @@ pub extern "system" fn check_resource_residency(
     D3D_OK
 }
 
-/// `SetMaximumFrameLatency`: stored for `GetMaximumFrameLatency`, not enforced.
+/// `SetMaximumFrameLatency`: the frame-latency bound `Present` enforces from the next frame on.
 ///
-/// Zero restores the default and a value past the limit is invalid. A value
-/// below the default is logged once: the encoder's own queue depth bounds
-/// how far the application runs ahead, so a lower latency is not reached.
+/// Zero restores the default and a value past the limit is invalid; 1 to 30
+/// are enforced as given unless `present.maxFrameLatency` names a number,
+/// which replaces it. The first request on a device is logged at info with
+/// the configured value and what the device enforces.
 pub extern "system" fn set_maximum_frame_latency(this: *mut c_void, latency: u32) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
@@ -167,14 +168,23 @@ pub extern "system" fn set_maximum_frame_latency(this: *mut c_void, latency: u32
         );
         return D3DERR_INVALIDCALL;
     };
-    if stored < mtld3d_core::extended::DEFAULT_FRAME_LATENCY {
-        mtld3d_shared::log_once_info!(
+    let bound = obj.inner().frame_latency_mut();
+    let first = bound.set(stored);
+    let enforced = bound.enforced();
+    let configured = mtld3d_core::config::frame_latency_label(bound.configured());
+    if first {
+        log::info!(
             target: LOG_TARGET,
-            "IDirect3DDevice9Ex::SetMaximumFrameLatency({stored}): stored and reported, not \
-             enforced; the encoder's queue depth bounds the frames in flight"
+            "IDirect3DDevice9Ex::SetMaximumFrameLatency({latency}): present.maxFrameLatency = \
+             {configured}, enforcing {enforced} frames"
+        );
+    } else {
+        log::debug!(
+            target: LOG_TARGET,
+            "IDirect3DDevice9Ex::SetMaximumFrameLatency({latency}): present.maxFrameLatency = \
+             {configured}, enforcing {enforced} frames"
         );
     }
-    obj.inner().set_max_frame_latency(stored);
     D3D_OK
 }
 
@@ -195,7 +205,7 @@ pub extern "system" fn get_maximum_frame_latency(this: *mut c_void, latency: *mu
     }
     // SAFETY: vtable out-param; `latency` is non-null (checked) and points to a
     // writable UINT per the IDirect3DDevice9Ex ABI.
-    unsafe { OutPtr::write_opt(latency, obj.inner().max_frame_latency()) };
+    unsafe { OutPtr::write_opt(latency, obj.inner().frame_latency().reported()) };
     D3D_OK
 }
 
@@ -336,8 +346,8 @@ pub extern "system" fn reset_ex(
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
-    // per the IDirect3DDevice9Ex ABI.
-    let mode = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode) }.map(|m| (m.width, m.height));
+    // per the IDirect3DDevice9Ex ABI; alignment is not assumed.
+    let mode = unsafe { crate::direct3d9::read_display_mode_ex_size(mode.cast_const()) };
     let hr = reset_impl(this, present_params, ResetCall::ResetEx { mode });
     reported_state_code(this, hr)
 }

@@ -7,19 +7,19 @@
 //! `debug.capsAll` fill is pinned as a superset that leaves shader versions and SM2.x caps alone.
 //! The texture-operation caps are also checked against the fixed-function emitter's output for
 //! every operation value, through the unimplemented-operation answer the stage-state setter warns
-//! from.
+//! from. `build`, the value the `GetDeviceCaps` entry points copy out, is pinned to `fill`.
 
 use mtld3d_types::{
     AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, D3DTA_CURRENT, D3DTA_DIFFUSE,
-    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_LERP, D3DTOP_PREMODULATE,
-    D3DTOP_SELECTARG1, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps, LineCaps,
-    PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps, VtxpCaps,
-    d3dps_version, d3dvs_version,
+    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_LERP, D3DTOP_MULTIPLYADD,
+    D3DTOP_PREMODULATE, D3DTOP_SELECTARG1, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps,
+    LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps,
+    VtxpCaps, d3dps_version, d3dvs_version,
 };
 
 use super::{
-    FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, fill_default, texture_extent_fits,
-    texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
+    FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, build, fill, fill_default,
+    texture_extent_fits, texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
 };
 use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
 
@@ -253,6 +253,8 @@ fn texture_op_caps_match_emitter() {
         | TexOpCaps::BLENDTEXTUREALPHAPM
         | TexOpCaps::BLENDFACTORALPHA
         | TexOpCaps::BLENDCURRENTALPHA
+        | TexOpCaps::BUMPENVMAP
+        | TexOpCaps::BUMPENVMAPLUMINANCE
         | TexOpCaps::DOTPRODUCT3
         | TexOpCaps::MULTIPLYADD
         | TexOpCaps::LERP;
@@ -319,14 +321,20 @@ fn unimplemented_texture_ops_are_the_ones_the_emitter_renders_as_selectarg1() {
 
 #[test]
 fn unimplemented_texture_op_names_the_operation() {
-    for (op, name) in [
-        (D3DTOP_PREMODULATE, "PREMODULATE"),
-        (D3DTOP_BUMPENVMAP, "BUMPENVMAP"),
-        (D3DTOP_BUMPENVMAPLUMINANCE, "BUMPENVMAPLUMINANCE"),
-    ] {
+    {
+        let (op, name) = (D3DTOP_PREMODULATE, "PREMODULATE");
         assert_eq!(unimplemented_texture_op(op), Some(name), "D3DTOP {op}");
     }
-    for op in [0, D3DTOP_LERP + 1, 33, u32::MAX] {
+    for op in [
+        0,
+        D3DTOP_BUMPENVMAP,
+        D3DTOP_BUMPENVMAPLUMINANCE,
+        D3DTOP_MULTIPLYADD,
+        D3DTOP_LERP,
+        D3DTOP_LERP + 1,
+        33,
+        u32::MAX,
+    ] {
         assert_eq!(unimplemented_texture_op(op), None, "D3DTOP {op}");
     }
 }
@@ -780,6 +788,28 @@ fn volume_extent_fits_the_3d_limit_unless_one_slice_deep() {
         assert!(
             !volume_extent_fits(extent[0], extent[1], extent[2]),
             "{extent:?}"
+        );
+    }
+}
+
+/// `build` answers exactly what `fill` writes into a zeroed struct, for each flag combination.
+#[test]
+fn build_matches_fill() {
+    for (caps_all, sampler_border) in [(false, false), (false, true), (true, false), (true, true)] {
+        // SAFETY: D3DCAPS9 is POD (integer and float fields, no Drop); zero is a valid state.
+        let mut filled: D3DCAPS9 = unsafe { core::mem::zeroed() };
+        fill(&mut filled, caps_all, sampler_border);
+        let built = build(caps_all, sampler_border);
+        let bytes = |c: &D3DCAPS9| -> Vec<u8> {
+            let start = core::ptr::from_ref(c).cast::<u8>();
+            // SAFETY: `c` is a live `D3DCAPS9`, viewed as its bytes.
+            let view = unsafe { core::slice::from_raw_parts(start, size_of::<D3DCAPS9>()) };
+            view.to_vec()
+        };
+        assert_eq!(
+            bytes(&built),
+            bytes(&filled),
+            "caps_all={caps_all} border={sampler_border}"
         );
     }
 }

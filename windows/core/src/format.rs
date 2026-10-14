@@ -137,6 +137,30 @@ impl FormatMapping {
     pub const fn block_bytes(&self) -> u32 {
         self.block_bytes
     }
+
+    /// Whether a rectangle of a level is on the format's block grid.
+    ///
+    /// The rectangle is `size` texels at `origin` in a level `extent` texels
+    /// in size. Its origin must be a whole number of blocks in, and each
+    /// side a whole number of blocks long unless it ends at the level's
+    /// edge. Only such a rectangle of a compressed format can be copied as
+    /// itself; every rectangle of an uncompressed format (1x1 blocks) is on
+    /// the grid.
+    #[must_use]
+    pub const fn rect_on_block_grid(
+        &self,
+        origin: (u32, u32),
+        size: (u32, u32),
+        extent: (u32, u32),
+    ) -> bool {
+        let (bw, bh) = (self.block_width, self.block_height);
+        origin.0.is_multiple_of(bw)
+            && origin.1.is_multiple_of(bh)
+            && (size.0.is_multiple_of(bw)
+                || matches!(origin.0.checked_add(size.0), Some(end) if end == extent.0))
+            && (size.1.is_multiple_of(bh)
+                || matches!(origin.1.checked_add(size.1), Some(end) if end == extent.1))
+    }
 }
 
 /// Friendly name for a D3DFMT_* code.
@@ -525,14 +549,21 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// read side's question rather than this one. A format that is no colour
 /// attachment has nothing to encode into and answers no.
 ///
-/// `D3DUSAGE_QUERY_LEGACYBUMPMAP` asks for the fixed-function
-/// bump-environment operations, which `D3DCAPS9::TextureOpCaps` does not
-/// advertise, so no format answers it. The SM1 `texbem` instruction and its
-/// `D3DTSS_BUMPENVMAT*` uniforms are a different surface and unaffected.
+/// `D3DUSAGE_QUERY_LEGACYBUMPMAP` asks whether the format can be the source
+/// texture of the fixed-function bump-environment operations, which
+/// `D3DCAPS9::TextureOpCaps` advertises. The signed formats carrying a
+/// `(du, dv)` pair answer yes: V8U8, V16U16 and Q8W8V8U8. Every other format,
+/// Q16W16V16U16 included, answers no. The resource-type rule
+/// (`usage_allowed_for_rtype`) confines the question to 2D textures.
 ///
-/// Both are answered before the filter arm, so neither can turn into the
-/// `D3DOK_NOAUTOGEN` success of a combined `D3DUSAGE_AUTOGENMIPMAP` query.
-/// Other usage policy stays with the caller; the float family is
+/// A format that answers no to the bump query, and one that answers no to the
+/// sRGB-write query, is refused before the filter arm, so neither refusal can
+/// turn into the `D3DOK_NOAUTOGEN` success of a combined
+/// `D3DUSAGE_AUTOGENMIPMAP` query. A bump format passes the bump query
+/// through: the rest of the usage decides the answer, so beside
+/// `D3DUSAGE_AUTOGENMIPMAP` it gets the answer that usage alone gets, which
+/// is `D3DOK_NOAUTOGEN` for all three bump formats, since none is a render
+/// target. Other usage policy stays with the caller; the float family is
 /// colour-renderable on both GPU families.
 #[must_use]
 pub const fn supports_usage_query(
@@ -541,7 +572,9 @@ pub const fn supports_usage_query(
     float32_filtering: bool,
     native_packed16: bool,
 ) -> bool {
-    if usage & D3DUSAGE_QUERY_LEGACYBUMPMAP != 0 {
+    if usage & D3DUSAGE_QUERY_LEGACYBUMPMAP != 0
+        && !matches!(d3d_format, D3DFMT_V8U8 | D3DFMT_V16U16 | D3DFMT_Q8W8V8U8)
+    {
         return false;
     }
     if usage & D3DUSAGE_QUERY_SRGBWRITE != 0

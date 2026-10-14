@@ -44,6 +44,14 @@ pub struct EncoderCounters {
     upload_coherent_seq: Arc<AtomicU64>,
     failed_submit_seq: Arc<AtomicU64>,
     retained_bytes: Arc<AtomicU64>,
+    /// The frame-latency floor: no display-paced present at or below it is outstanding.
+    paced_present_seq: Arc<AtomicU64>,
+    /// The watch's last walk, as `mtld3d_core::hud_stats::largest_free_word` stores it.
+    ///
+    /// Stored by the device's watch thread, read by the encoder for the Metal
+    /// HUD rows; zero means no walk yet, and it stays zero in a 64-bit build,
+    /// which walks nothing.
+    largest_free_word: Arc<AtomicU64>,
 }
 
 impl EncoderCounters {
@@ -63,12 +71,18 @@ impl EncoderCounters {
         Arc::clone(&self.retained_bytes)
     }
 
+    pub fn largest_free_word(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.largest_free_word)
+    }
+
     fn new() -> Self {
         Self {
             coherent_seq: Arc::new(AtomicU64::new(0)),
             upload_coherent_seq: Arc::new(AtomicU64::new(0)),
             failed_submit_seq: Arc::new(AtomicU64::new(0)),
             retained_bytes: Arc::new(AtomicU64::new(0)),
+            paced_present_seq: Arc::new(AtomicU64::new(0)),
+            largest_free_word: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -78,6 +92,8 @@ impl EncoderCounters {
         let _upload = Arc::into_raw(Arc::clone(&self.upload_coherent_seq));
         let _failed = Arc::into_raw(Arc::clone(&self.failed_submit_seq));
         let _retained = Arc::into_raw(Arc::clone(&self.retained_bytes));
+        let _paced = Arc::into_raw(Arc::clone(&self.paced_present_seq));
+        let _largest = Arc::into_raw(Arc::clone(&self.largest_free_word));
     }
 }
 
@@ -139,6 +155,15 @@ impl EncoderThread {
             upload_coherent_seq_ptr: Arc::as_ptr(&counters.upload_coherent_seq) as u64,
             failed_submit_seq_ptr: Arc::as_ptr(&counters.failed_submit_seq) as u64,
             retained_bytes_ptr: Arc::as_ptr(&counters.retained_bytes) as u64,
+            paced_present_seq_ptr: Arc::as_ptr(&counters.paced_present_seq) as u64,
+            largest_free_word_ptr: Arc::as_ptr(&counters.largest_free_word) as u64,
+            // Process-lifetime statics of this image: native code may read
+            // them for as long as it runs.
+            guest_page_bytes_ptr: core::ptr::from_ref(mtld3d_core::page_box::live_bytes_counter())
+                as u64,
+            guest_pool_bytes_ptr: core::ptr::from_ref(
+                crate::page_box_pool::PAGEBOX_POOL.pooled_bytes_counter(),
+            ) as u64,
             config_ptr: settings.as_bytes().as_ptr() as u64,
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,
@@ -386,11 +411,38 @@ impl EncoderThread {
         self.status()
     }
 
+    /// Whether the frame submitted at `target` finished for the frame-latency bound.
+    ///
+    /// Its draw buffer has ended and, when its present waits for the display,
+    /// that present reached the screen: both counters stand at or past it.
+    /// Two atomic loads, so a `Present` whose target finished long ago, the
+    /// usual case for a CPU-bound game, never crosses into native code.
+    pub fn frame_finished(&self, target: u64) -> bool {
+        mtld3d_core::frame_latency::frame_finished(
+            target,
+            self.counters.coherent_seq.load(Ordering::Acquire),
+            self.counters.paced_present_seq.load(Ordering::Acquire),
+        )
+    }
+
+    /// Wait until the frame submitted at `target` finished, or the encoder failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the latched HRESULT when the device has failed, before or
+    /// during the wait.
+    pub fn await_frame(&self, target: u64) -> Result<(), i32> {
+        self.control(EncoderControl::AwaitFrame, target, &[])
+    }
+
     pub fn drain_retired_now(&self) -> Result<(), i32> {
         self.control(EncoderControl::DrainRetention, 0, &[])
     }
     pub fn intake_visibility_for(&self, seq: u64) -> Result<(), i32> {
         self.control(EncoderControl::IntakeVisibility, seq, &[])
+    }
+    pub fn retire_uploads_through(&self, seq: u64) -> Result<(), i32> {
+        self.control(EncoderControl::RetireUploads, seq, &[])
     }
     pub fn reset(&self, textures: &[u64]) -> Result<(), i32> {
         self.control(EncoderControl::Reset, 0, textures)

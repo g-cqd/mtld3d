@@ -77,16 +77,17 @@ concurrency:
 # MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
 # the xwin call that consumes them.
 env:
-  # cx-26.3.0-2 is the first bundle without MoltenVK. The one before it
-  # shipped the library, and win32u's display-device enumeration created a
-  # Vulkan instance through it at every prefix boot; on the Intel image's
-  # paravirtual device that made Metal abort inside explorer.exe, so no prefix
-  # ever booted there.
-  WINE_RELEASE: cx-26.3.0-5
+  # The wine-build release has two bounds. It is cx-26.3.0-2 or later, the
+  # first bundle without MoltenVK: with the library, win32u's display-device
+  # enumeration created a Vulkan instance at every prefix boot, and on the
+  # Intel image's paravirtual device Metal aborted inside explorer.exe, so no
+  # prefix booted there. It is older than cx-26.3.0-8, which needs macOS 26
+  # and so would not run on the macos-15 and Intel images.
+  WINE_RELEASE: cx-26.3.0-7
   RUST_STABLE: 1.99.0
-  RUST_NIGHTLY: nightly-2026-10-02
+  RUST_NIGHTLY: nightly-2026-10-11
   CARGO_TOOLS: xwin@0.10.0
-  NEXTEST_VERSION: 0.9.146
+  NEXTEST_VERSION: 0.9.148
 
 # The shape: two machines compile, everything else replays. `build` makes the
 # stage every test leg installs and runs from, so the suites fan out over
@@ -532,12 +533,9 @@ jobs:
       contents: write
       actions: read
     steps:
-      # No fetch-tags here: a tag run's checkout creates the tag's ref from
-      # the commit it fetches, which is the one tag `git describe` needs for
-      # the stamp, and asking for every tag on top makes git 2.48 and later
-      # refuse to fetch one ref from two sources ("Cannot fetch both <sha>
-      # and refs/tags/<tag> to refs/tags/<tag>"), which failed every tag run
-      # since the macos-26 image.
+      # No fetch-tags here: a tag run's checkout fetches the tag it runs for,
+      # which is the one tag `git describe` needs for the stamp, so every
+      # other tag would only add to the fetch.
       - uses: actions/checkout@v7
       # The toolchain first, since every make target needs the WINE_SDK the
       # prepare action sets; then the version check, so a tag that disagrees

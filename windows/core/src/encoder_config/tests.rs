@@ -29,7 +29,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.hdr_enable = !value.hdr_enable;
     value.color_space = ColorSpacePolicy::Accurate;
     value.cursor_scale = CursorScale::Fixed(7);
-    value.cursor_software = SoftwareCursorPolicy::Off;
+    value.cursor_software = SoftwareCursorPolicy::On;
     value.shader_cache_enable = !value.shader_cache_enable;
     value.shader_async_compile = !value.shader_async_compile;
     value.log_dir = "log_dir/utf8-ä".into();
@@ -45,6 +45,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.vram_budget_cap_bytes = u64::MAX - 123;
     value.pagebox_pool_cap_bytes = u64::MAX - 123;
     value.present_max_fps = 123;
+    value.present_max_frame_latency = 17;
     value.render_scale_percent = 123;
     value.render_lod_bias = !value.render_lod_bias;
     value.adapter_spoof = AdapterSpoof::Amd;

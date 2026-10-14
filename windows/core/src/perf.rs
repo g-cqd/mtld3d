@@ -214,6 +214,13 @@ const FRAME_SAMPLE_PERIOD: u8 = 16;
 #[cfg(perf_tracking)]
 const FIXED_FRAME_SEED: u32 = 0x2545_f491;
 
+/// Presents the frames-in-flight gauge looks back over, the one just handed over included.
+///
+/// Deeper than any bound the device enforces, so the gauge also measures a
+/// pipeline that nothing bounds.
+#[cfg(perf_tracking)]
+const IN_FLIGHT_WINDOW: usize = 64;
+
 /// A seed for the frame picks from the time-stamp counter, never 0.
 ///
 /// Xorshift stays at 0 once there, so the low bit is set.
@@ -1317,17 +1324,18 @@ struct FrameCounters {
     /// rename, so there's nothing for a `copyFromTexture:toTexture:`
     /// path to preserve.
     texture_preserve_cpu: u32,
-    /// Contended partial texture Locks this frame that were handed back in place.
+    /// Partial texture Locks this frame handed back in place over an upload no GPU use has seen.
     ///
-    /// The texture twin of `vbib_write_in_place_contended`: a plain (no
-    /// `DISCARD`, no `NOOVERWRITE`) partial Lock of a level whose upload
-    /// the GPU may still be reading, served over the same staging on the
-    /// strength of the no-overlap contract rather than renamed. The arm
-    /// has no other side effect, so this count is the only signal that a
-    /// game leans on it. `NOOVERWRITE` / `READONLY` and uncontended Locks
-    /// are excluded: handing those back in place is the specified
-    /// behaviour.
-    texture_write_in_place_contended: u32,
+    /// A plain (no honoured `DISCARD`) partial Lock of a level whose pages an
+    /// upload of the frame being recorded still reads, with no GPU operation
+    /// on the texture recorded since that upload: nothing recorded can see the
+    /// version the write replaces, so the upload carries the newer bytes. Only
+    /// `READONLY` Locks and Locks of pages no upload reads are excluded;
+    /// `NOOVERWRITE` is not a texture lock flag and is dropped before the
+    /// decision, so a Lock carrying it counts like a plain one. A Lock that
+    /// finds an upload a GPU operation has seen, or one of an earlier frame,
+    /// renames and counts as a preserve.
+    texture_write_in_place_unseen: u32,
     /// Count of `AddDirtyRect` calls this frame (`texture_add_dirty_rect` thunk).
     ///
     /// With `texture_add_dirty_partial` and
@@ -1410,6 +1418,45 @@ struct FrameCounters {
     /// pool; the encoder's own pool counts its parks in
     /// `EncoderFrameCounters::pagebox_pool_recycled`.
     pool_recycled: u32,
+    /// Bytes behind `texture_snapshot_uploads`, the snapshots' rows at their padded pitch.
+    ///
+    /// Bounded by the arena's 16 MiB, since a chunk is reused only after the
+    /// GPU has read it, so a frame's snapshots always fit a `u32`.
+    texture_snapshot_bytes: u32,
+    /// Partial texture uploads this frame that copied their box into the snapshot arena.
+    ///
+    /// Only a level a partial lock has had to move to fresh pages snapshots
+    /// its partial uploads, so a texture rewritten in part between draws
+    /// pays a box-sized copy per upload here instead of a level-sized one per
+    /// lock in `texture_preserve_cpu`.
+    texture_snapshot_uploads: u32,
+    /// Snapshots the arena could not take: every chunk read and at its cap, or no memory.
+    ///
+    /// Each such upload read the level's staging instead, so the next
+    /// partial lock of the level may rename it again. An arena whose oldest
+    /// chunk the frame being recorded reads counts in
+    /// `texture_snapshot_wait_recording` instead, never in both.
+    texture_snapshot_full: u32,
+    /// Partial uploads of a level marked for snapshots whose box the arena cannot take.
+    ///
+    /// A compressed box off the block grid, a box over a chunk, or one whose
+    /// rows the staging does not hold. Each read the staging, so the next
+    /// partial lock of the level renames it again.
+    texture_snapshot_declined: u32,
+    /// Times a full arena waited for the GPU to retire the uploads that read its oldest chunk.
+    ///
+    /// Each wait is one encoder round trip that blocks the API thread until
+    /// the submission the chunk's last snapshot rode in has retired; the
+    /// snapshot that asked for it is then taken again.
+    texture_snapshot_waits: u32,
+    /// Full arenas whose oldest chunk is read by the frame being recorded, so no wait can free it.
+    ///
+    /// The frame has not been submitted, so nothing would retire those
+    /// uploads; the snapshot reads the staging as a full arena's does, but
+    /// counts here and not in `texture_snapshot_full`.
+    texture_snapshot_wait_recording: u32,
+    /// TSC cycles the API thread spent blocked in `texture_snapshot_waits`.
+    texture_snapshot_wait_cycles: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -1432,6 +1479,13 @@ impl FrameCounters {
             pagebox_frees: 0,
             pagebox_uncached_allocs: 0,
             pool_recycled: 0,
+            texture_snapshot_bytes: 0,
+            texture_snapshot_uploads: 0,
+            texture_snapshot_full: 0,
+            texture_snapshot_declined: 0,
+            texture_snapshot_waits: 0,
+            texture_snapshot_wait_recording: 0,
+            texture_snapshot_wait_cycles: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1454,7 +1508,7 @@ impl FrameCounters {
             texture_renames: 0,
             texture_discards: 0,
             texture_preserve_cpu: 0,
-            texture_write_in_place_contended: 0,
+            texture_write_in_place_unseen: 0,
             texture_add_dirty_calls: 0,
             texture_add_dirty_partial: 0,
             texture_add_dirty_area_bp: 0,
@@ -1510,6 +1564,18 @@ struct FrameTiming {
     ///
     /// Bytes Rust's `Vec::push` memcpy'd when `FrameData.ops` doubled.
     op_vec_realloc_bytes: u64,
+    /// TSC cycles the API thread spent in `Present` waiting for the frame-latency bound.
+    ///
+    /// Zero when the frame the bound names had already finished.
+    latency_wait_cycles: u64,
+    /// One when that `Present` had to wait for the bound, zero otherwise.
+    latency_waits: u32,
+    /// Presented frames whose draw work had not completed when `Present` handed this one over.
+    ///
+    /// Counts the frame just presented and, of the 64 presents before it,
+    /// every one whose sequence the draw counter had not reached: the
+    /// frames the CPU ran ahead of the GPU, read before any wait.
+    frames_in_flight: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1527,7 +1593,16 @@ impl FrameTiming {
             frame_total_cycles: 0,
             op_vec_capacity_bytes: 0,
             op_vec_realloc_bytes: 0,
+            latency_wait_cycles: 0,
+            latency_waits: 0,
+            frames_in_flight: 0,
         }
+    }
+
+    /// The API thread's blocked time in `Present`: encoder backpressure and the latency bound.
+    const fn present_stall_cycles(&self) -> u64 {
+        self.present_block_cycles
+            .saturating_add(self.latency_wait_cycles)
     }
 }
 
@@ -1874,6 +1949,11 @@ pub struct ApiPerfState {
     ///
     /// 0 before the first line.
     pool_logged_tsc: u64,
+    /// Submit sequences of the last [`IN_FLIGHT_WINDOW`] presents, for the frames-in-flight gauge.
+    ///
+    /// A ring written at `presented_next`; zero in a slot no present has used.
+    presented_seqs: [u64; IN_FLIGHT_WINDOW],
+    presented_next: u8,
 }
 
 #[cfg(perf_tracking)]
@@ -1906,7 +1986,31 @@ impl ApiPerfState {
             untimed_frames: 0,
             pagebox_baseline: None,
             pool_logged_tsc: 0,
+            presented_seqs: [0; IN_FLIGHT_WINDOW],
+            presented_next: 0,
         }
+    }
+
+    /// Record the present of `seq` and count the presents whose draw work has not retired.
+    ///
+    /// `retired` is the draw counter's value: every draw command buffer up
+    /// to it has ended. The count covers this present and the ones the ring
+    /// still holds, so it reads how far the CPU runs ahead of the GPU, up to
+    /// `IN_FLIGHT_WINDOW`.
+    ///
+    /// # Panics
+    /// Never: the ring index and the count stay below `IN_FLIGHT_WINDOW` + 1.
+    pub fn note_present_in_flight(&mut self, seq: u64, retired: u64) -> u32 {
+        let next = usize::from(self.presented_next);
+        self.presented_seqs[next] = seq;
+        self.presented_next = u8::try_from((next + 1) % IN_FLIGHT_WINDOW)
+            .expect("the ring index stays below its length");
+        let outstanding = self
+            .presented_seqs
+            .iter()
+            .filter(|&&presented| presented > retired)
+            .count();
+        u32::try_from(outstanding).expect("the ring holds 64 presents")
     }
 
     /// Count only consumed uniform builds, without a timer or another key read.
@@ -1926,6 +2030,107 @@ impl ApiPerfState {
     pub const fn advance_reset_epoch(&mut self) {
         self.reset_epoch_saturated |= self.reset_epoch == u64::MAX;
         self.reset_epoch = self.reset_epoch.saturating_add(1);
+    }
+
+    /// Pointer the `CycleAddTimer` writes into.
+    ///
+    /// Naming mirrors the `present_block_cycles_ptr` accessor — d3d9
+    /// query.rs is the only consumer. Null in an untimed frame, like the
+    /// `Query` timer around it.
+    pub const fn query_wait_cycles_ptr(&mut self) -> *mut u64 {
+        if self.untimed_frames == 0 {
+            &raw mut self.counters.query_wait_cycles
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    /// Pointer the `CycleAddTimer` around a full snapshot arena's wait writes into.
+    ///
+    /// Null in an untimed frame, like [`Self::query_wait_cycles_ptr`].
+    pub const fn texture_snapshot_wait_cycles_ptr(&mut self) -> *mut u64 {
+        if self.untimed_frames == 0 {
+            &raw mut self.counters.texture_snapshot_wait_cycles
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the Draw-internal snapshot phase.
+    ///
+    /// Accumulated (multiple calls per frame), one shared bucket for all
+    /// Draw methods.
+    pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the Draw-internal push-op phase.
+    ///
+    /// `Box::new` + `push_op`.
+    pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_push_op_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for `snapshot_shared`'s per-stage binding walk.
+    ///
+    /// Sub-component of `draw_snapshot_cycles_ptr`; both timers are live
+    /// simultaneously — the stage walk's cycles are double-counted into
+    /// the outer `snapshot` total, which is the desired display semantic
+    /// (`snapshot` is the parent, `stages` is shown nested under it).
+    pub const fn draw_snapshot_stages_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_stages_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the const-snapshot block on FF draws.
+    ///
+    /// Peer of `draw_snapshot_stages_cycles_ptr` under the parent
+    /// `snapshot` total. Selected at draw-classification time alongside
+    /// its programmable sibling [`Self::draw_snapshot_c_pr_cycles_ptr`].
+    pub const fn draw_snapshot_c_ff_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_c_ff_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the const-snapshot block.
+    ///
+    /// Selected when both VS and PS are programmable. Peer of
+    /// [`Self::draw_snapshot_c_ff_cycles_ptr`].
+    pub const fn draw_snapshot_c_pr_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_c_pr_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the shader-key resolution block.
+    ///
+    /// The block lives in `snapshot_shared`. Peer of `stages`/`consts`
+    /// under the parent `snapshot` total.
+    pub const fn draw_snapshot_keys_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_keys_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for the post-consts block in `snapshot_shared`.
+    ///
+    /// The scratch-bump + cache-assignment work. Peer of
+    /// `stages`/`consts`/`keys` under the parent `snapshot` total.
+    pub const fn draw_snapshot_bumps_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_bumps_cycles
+    }
+
+    /// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
+    ///
+    /// A child of `draw_snapshot_keys_cycles_ptr` for the six sections
+    /// inside the `keys` scope. The timer runs only inside the section's
+    /// dirty branch, so the slot over the section's rebuild count is its
+    /// cost per rebuild.
+    pub const fn draw_snapshot_section_cycles_ptr(&mut self, section: SnapshotSection) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_section_cycles[section as usize]
+    }
+
+    /// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
+    ///
+    /// The parent of [`Self::draw_snapshot_section_cycles_ptr`] on the same
+    /// draws, so the part of `keys` outside the six sections is measured on
+    /// the draws the sections are.
+    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_keys_sampled_cycles
     }
 
     /// Add cycles + one call to the per-category accumulator.
@@ -2125,16 +2330,14 @@ impl ApiPerfState {
         self.counters.texture_preserve_cpu = self.counters.texture_preserve_cpu.saturating_add(1);
     }
 
-    /// Contended partial Lock of a texture level handed back in place.
+    /// Partial Lock of a texture level handed back in place over an unseen upload of this frame.
     ///
-    /// The kept divergence, counted like its VB/IB twin: no rename, no
-    /// preserve, no stall, so the count is the only trace the arm leaves.
-    /// Texels wrong for a frame with nothing in the log is its symptom,
-    /// and this row is where to look for whether it fired.
-    pub const fn bump_texture_write_in_place_contended(&mut self) {
-        self.counters.texture_write_in_place_contended = self
+    /// No rename, no preserve, no stall, so the count is the only trace the
+    /// arm leaves.
+    pub const fn bump_texture_write_in_place_unseen(&mut self) {
+        self.counters.texture_write_in_place_unseen = self
             .counters
-            .texture_write_in_place_contended
+            .texture_write_in_place_unseen
             .saturating_add(1);
     }
 
@@ -2159,6 +2362,39 @@ impl ApiPerfState {
 
     pub const fn bump_texture_rename(&mut self) {
         self.counters.texture_renames = self.counters.texture_renames.saturating_add(1);
+    }
+
+    /// One partial upload copied `bytes` of its box into the snapshot arena.
+    pub const fn bump_texture_snapshot(&mut self, bytes: u32) {
+        self.counters.texture_snapshot_uploads =
+            self.counters.texture_snapshot_uploads.saturating_add(1);
+        self.counters.texture_snapshot_bytes =
+            self.counters.texture_snapshot_bytes.saturating_add(bytes);
+    }
+
+    /// One snapshot the arena could not take; the upload read the staging.
+    pub const fn bump_texture_snapshot_full(&mut self) {
+        self.counters.texture_snapshot_full = self.counters.texture_snapshot_full.saturating_add(1);
+    }
+
+    /// One upload of a marked level whose box cannot be snapshotted; it read the staging.
+    pub const fn bump_texture_snapshot_declined(&mut self) {
+        self.counters.texture_snapshot_declined =
+            self.counters.texture_snapshot_declined.saturating_add(1);
+    }
+
+    /// One wait of a full arena for its oldest chunk's uploads to retire.
+    pub const fn bump_texture_snapshot_wait(&mut self) {
+        self.counters.texture_snapshot_waits =
+            self.counters.texture_snapshot_waits.saturating_add(1);
+    }
+
+    /// One full arena whose oldest chunk the frame being recorded still reads.
+    pub const fn bump_texture_snapshot_wait_recording(&mut self) {
+        self.counters.texture_snapshot_wait_recording = self
+            .counters
+            .texture_snapshot_wait_recording
+            .saturating_add(1);
     }
 
     /// Subset of `bump_texture_rename` that took the no-preserve branch.
@@ -2292,6 +2528,54 @@ impl ApiPerfState {
     }
 
     #[inline]
+    pub const fn query_wait_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn texture_snapshot_wait_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_push_op_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_stages_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_c_ff_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_c_pr_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_keys_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_bumps_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_section_cycles_ptr(
+        &mut self,
+        _section: SnapshotSection,
+    ) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+
+    #[inline]
     pub const fn add_api_cycles(&mut self, _category: ApiCategory, _cycles: u64) {}
     #[inline]
     pub const fn add_device_cycles(&mut self, _sub: DeviceSubCategory, _cycles: u64) {}
@@ -2330,11 +2614,21 @@ impl ApiPerfState {
     #[inline]
     pub const fn bump_texture_preserve_cpu(&mut self) {}
     #[inline]
-    pub const fn bump_texture_write_in_place_contended(&mut self) {}
+    pub const fn bump_texture_write_in_place_unseen(&mut self) {}
     #[inline]
     pub const fn bump_texture_add_dirty_rect(&mut self, _partial: bool, _area_bp: u32) {}
     #[inline]
     pub const fn bump_texture_rename(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot(&mut self, _bytes: u32) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_full(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_declined(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_wait(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_snapshot_wait_recording(&mut self) {}
     #[inline]
     pub const fn bump_texture_discard(&mut self) {}
     #[inline]
@@ -2402,6 +2696,21 @@ impl FramePerfPayload {
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.timing.present_block_cycles
     }
+
+    /// Pointer the API thread's `CycleSetTimer` writes the frame-latency wait into.
+    pub const fn latency_wait_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.timing.latency_wait_cycles
+    }
+
+    /// Mark that the `Present` before this frame waited for the frame-latency bound.
+    pub const fn note_latency_wait(&mut self) {
+        self.timing.latency_waits = 1;
+    }
+
+    /// The presented frames whose draw work was outstanding at the `Present` before this frame.
+    pub const fn set_frames_in_flight(&mut self, frames: u32) {
+        self.timing.frames_in_flight = frames;
+    }
 }
 
 /// ZST twin of [`FramePerfPayload`] for `cfg(not(perf_tracking))`.
@@ -2425,6 +2734,12 @@ impl FramePerfPayload {
     pub const fn present_block_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
+    #[inline]
+    pub const fn latency_wait_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn note_latency_wait(&mut self) {}
 }
 
 /// Identity tag for a shader at the encoder side.
@@ -3112,7 +3427,7 @@ impl EncoderPerfState {
         let api_by = self.counters.api_cycles_by_category;
         let api_total: u64 = api_by.iter().sum();
         let outside_d3d9 = self.timing.frame_total_cycles.saturating_sub(api_total);
-        let api_work_cyc = api_total.saturating_sub(self.timing.present_block_cycles);
+        let api_work_cyc = api_total.saturating_sub(self.timing.present_stall_cycles());
 
         // Per-frame PageBox allocator traffic: delta of this runtime's
         // cumulative counters against the previous frame's snapshot. The
@@ -3660,6 +3975,12 @@ struct PerfWindow {
     api_cyc: Stat,
     api_work: Stat,
     present_block: Stat,
+    /// The `Present` wait for the frame-latency bound, per frame.
+    latency_wait: Stat,
+    /// Frames whose `Present` waited for the bound (sum only).
+    latency_waits: Stat,
+    /// Presented frames outstanding on the GPU at each `Present` (sum for the mean, and peak).
+    frames_in_flight: Stat,
     query_wait: Stat,
     enc_cyc: Stat,
     enc_work: Stat,
@@ -3799,17 +4120,29 @@ struct PerfWindow {
     texture_pool_misses: Stat,
     /// No GPU analog (texture staging is PE-side, `MTLTexture` handles aren't swapped on rename).
     texture_preserve_cpu: Stat,
-    /// Contended partial texture Locks handed back in place (sum only).
+    /// Partial texture Locks handed back in place over an unseen upload (sum only).
     ///
-    /// Counts the kept divergence firing, not work done: the arm
-    /// allocates nothing and stalls nothing.
-    texture_write_in_place_contended: Stat,
+    /// Counts the arm firing, not work done: it allocates nothing and
+    /// stalls nothing.
+    texture_write_in_place_unseen: Stat,
     /// `AddDirtyRect` probe (see `FrameCounters::texture_add_dirty_*`).
     ///
     /// `area_bp` sum / `calls` sum at render gives average mip coverage.
     texture_add_dirty_calls: Stat,
     texture_add_dirty_partial: Stat,
     texture_add_dirty_area_bp: Stat,
+    /// Partial uploads that read a snapshot of their box, and the bytes copied.
+    texture_snapshot_uploads: Stat,
+    texture_snapshot_bytes: Stat,
+    /// Snapshots the arena had no room for; their uploads read the staging.
+    texture_snapshot_full: Stat,
+    /// Uploads of marked levels whose box cannot be snapshotted.
+    texture_snapshot_declined: Stat,
+    /// Waits of a full arena for its oldest chunk, and the cycles they blocked.
+    texture_snapshot_waits: Stat,
+    texture_snapshot_wait: Stat,
+    /// Full arenas whose oldest chunk the frame being recorded still read.
+    texture_snapshot_wait_recording: Stat,
     texture_destroys: Stat,
     texture_blit_uploads: Stat,
     texture_blit_padded_uploads: Stat,
@@ -3947,6 +4280,10 @@ impl PerfWindow {
         self.api_cyc.add(s.api_cyc);
         self.api_work.add(s.api_work);
         self.present_block.add(s.timing.present_block_cycles);
+        self.latency_wait.add(s.timing.latency_wait_cycles);
+        self.latency_waits.add(u64::from(s.timing.latency_waits));
+        self.frames_in_flight
+            .add(u64::from(s.timing.frames_in_flight));
         self.query_wait.add(s.counters.query_wait_cycles);
         self.enc_cyc.add(s.enc_cyc);
         // Encoder-thread CPU = op + finalize. `enc_cyc` (= op + submit_cyc)
@@ -4074,14 +4411,28 @@ impl PerfWindow {
             .add(u64::from(s.counters.texture_pool_misses));
         self.texture_preserve_cpu
             .add(u64::from(s.counters.texture_preserve_cpu));
-        self.texture_write_in_place_contended
-            .add(u64::from(s.counters.texture_write_in_place_contended));
+        self.texture_write_in_place_unseen
+            .add(u64::from(s.counters.texture_write_in_place_unseen));
         self.texture_add_dirty_calls
             .add(u64::from(s.counters.texture_add_dirty_calls));
         self.texture_add_dirty_partial
             .add(u64::from(s.counters.texture_add_dirty_partial));
         self.texture_add_dirty_area_bp
             .add(u64::from(s.counters.texture_add_dirty_area_bp));
+        self.texture_snapshot_uploads
+            .add(u64::from(s.counters.texture_snapshot_uploads));
+        self.texture_snapshot_bytes
+            .add(u64::from(s.counters.texture_snapshot_bytes));
+        self.texture_snapshot_full
+            .add(u64::from(s.counters.texture_snapshot_full));
+        self.texture_snapshot_declined
+            .add(u64::from(s.counters.texture_snapshot_declined));
+        self.texture_snapshot_waits
+            .add(u64::from(s.counters.texture_snapshot_waits));
+        self.texture_snapshot_wait
+            .add(s.counters.texture_snapshot_wait_cycles);
+        self.texture_snapshot_wait_recording
+            .add(u64::from(s.counters.texture_snapshot_wait_recording));
         self.texture_destroys.add(u64::from(s.enc.texture_destroys));
         self.texture_blit_uploads
             .add(u64::from(s.enc.texture_blit_uploads));
@@ -4168,7 +4519,7 @@ impl PerfWindow {
         );
         self.draw_snapshot_keys_leftover.peak(keys_leftover);
         let frame_other = s.counters.device_sub_cycles[DeviceSubCategory::Frame as usize]
-            .saturating_sub(s.timing.present_block_cycles);
+            .saturating_sub(s.timing.present_stall_cycles());
         self.frame_other.peak(frame_other);
         self.finalize.peak(
             s.enc
@@ -4195,11 +4546,12 @@ impl PerfWindow {
         *self = Self::new();
     }
 
-    /// Window sum of the `Frame` device sub-bucket less the present stall nested inside it.
+    /// Window sum of the `Frame` device sub-bucket less the two `Present` waits nested inside it.
     const fn frame_other_sum(&self) -> u64 {
         self.device_sub_by[DeviceSubCategory::Frame as usize]
             .sum
             .saturating_sub(self.present_block.sum)
+            .saturating_sub(self.latency_wait.sum)
     }
 
     /// Window sum of `draw_snapshot` less its five named sub-timers.
@@ -5155,8 +5507,20 @@ impl<'a> Summary<'a> {
                         peak: Some(cycles_to_ms(self.c.present_block.max)),
                     },
                 );
+                write_row(
+                    out,
+                    s,
+                    &Row {
+                        label: "│  │  │  ├─ GPU behind",
+                        bold_label: false,
+                        ms: Some(cycles_to_ms(w.latency_wait.sum / f)),
+                        aux: None,
+                        desc: Some("frame-latency bound"),
+                        peak: Some(cycles_to_ms(self.c.latency_wait.max)),
+                    },
+                );
                 // Make Frame's children sum to Frame: the remainder
-                // (Frame total − Send stall) is the non-blocking body
+                // (Frame total − Send stall − GPU behind) is the non-blocking body
                 // work of Present + Clear + BeginScene/EndScene +
                 // ColorFill. Derived by subtraction; peak tracked
                 // per-frame in `accumulate`.
@@ -6116,16 +6480,16 @@ impl<'a> Summary<'a> {
                 "peak/frame {pk_cpu}",
                 pk_cpu = w.texture_preserve_cpu.max,
             )),
-            "API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)",
+            "API: rename + sync memcpy (whole-level Lock over a reader, partial over a seen or older upload)",
         );
         // Not a rename child: this arm allocates nothing, so it stays
         // outside the `rename = discards + preserve` partition.
         self.res_row(
             out,
             "in-place",
-            &format!("{c}", c = w.texture_write_in_place_contended.sum),
+            &format!("{c}", c = w.texture_write_in_place_unseen.sum),
             None,
-            "API: contended partial Lock handed back live (kept divergence; no rename, no stall)",
+            "API: partial Lock over an upload of this frame no GPU use has seen, handed back live",
         );
         // Staging-lane effectiveness; all-zero while the pool is off.
         let tex_pool_hits = w.texture_pool_hits.sum;
@@ -6142,6 +6506,24 @@ impl<'a> Summary<'a> {
             &format!("hit={tex_pool_hits} miss={tex_pool_misses} ({tex_pool_hit_pct:.1}%)"),
             None,
             "API: staging pops a warm same-size PageBox; last owners park retired staging",
+        );
+        self.res_row(
+            out,
+            "snapshot",
+            &format!(
+                "{n} {kb} KB",
+                n = w.texture_snapshot_uploads.sum,
+                kb = w.texture_snapshot_bytes.sum / 1024,
+            ),
+            Some(&format!(
+                "full={f} declined={d} waits={n} ({ms:.2} ms) recording={r}",
+                f = w.texture_snapshot_full.sum,
+                d = w.texture_snapshot_declined.sum,
+                n = w.texture_snapshot_waits.sum,
+                ms = cycles_to_ms(w.texture_snapshot_wait.sum),
+                r = w.texture_snapshot_wait_recording.sum,
+            )),
+            "API: partial uploads copying their box, for levels a partial Lock renamed (full = no arena room, declined = box shape, waits = a full arena waiting for its oldest chunk, recording = one the frame being recorded reads)",
         );
         // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
@@ -6863,6 +7245,10 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         kv.total(format_args!("{base}_calls"), c.device_sub_calls_by[i].sum);
     }
     kv.every_frame_cycles("present_stall", &w.present_block, &c.present_block);
+    kv.every_frame_cycles("latency_wait", &w.latency_wait, &c.latency_wait);
+    kv.total("latency_waits", c.latency_waits.sum);
+    kv.total("frames_in_flight", c.frames_in_flight.sum);
+    kv.count("frames_in_flight_peak", c.frames_in_flight.max);
     kv.per_frame_ms("dev_frame_other", cycles_to_ms(w.frame_other_sum()));
     kv.peak_ms("dev_frame_other", cycles_to_ms(c.frame_other.max));
     kv.cycles("draw_snapshot", &w.draw_snapshot);
@@ -7007,7 +7393,17 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("tex_pool_hit", c.texture_pool_hits.sum);
     kv.total("tex_pool_miss", c.texture_pool_misses.sum);
     kv.total("tex_preserve_cpu", c.texture_preserve_cpu.sum);
-    kv.total("tex_in_place", c.texture_write_in_place_contended.sum);
+    kv.total("tex_in_place", c.texture_write_in_place_unseen.sum);
+    kv.total("tex_snapshot", c.texture_snapshot_uploads.sum);
+    kv.total("tex_snapshot_bytes", c.texture_snapshot_bytes.sum);
+    kv.total("tex_snapshot_full", c.texture_snapshot_full.sum);
+    kv.total("tex_snapshot_declined", c.texture_snapshot_declined.sum);
+    kv.total("tex_snapshot_waits", c.texture_snapshot_waits.sum);
+    kv.cycles("tex_snapshot_wait", &w.texture_snapshot_wait);
+    kv.total(
+        "tex_snapshot_wait_recording",
+        c.texture_snapshot_wait_recording.sum,
+    );
     kv.total("tex_uploads", c.texture_blit_uploads.sum);
     kv.total("tex_uploads_raw", c.raw_texture_uploads());
     kv.total("tex_uploads_padded", c.texture_blit_padded_uploads.sum);
@@ -7120,7 +7516,7 @@ const _: () = {
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 976);
+    assert!(size_of::<FrameCounters>() == 1008);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -7155,7 +7551,7 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_renames) == 584);
     assert!(core::mem::offset_of!(FrameCounters, texture_discards) == 588);
     assert!(core::mem::offset_of!(FrameCounters, texture_preserve_cpu) == 592);
-    assert!(core::mem::offset_of!(FrameCounters, texture_write_in_place_contended) == 596);
+    assert!(core::mem::offset_of!(FrameCounters, texture_write_in_place_unseen) == 596);
     assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_calls) == 600);
     assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_partial) == 604);
     assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_area_bp) == 608);
@@ -7179,14 +7575,24 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, pagebox_frees) == 964);
     assert!(core::mem::offset_of!(FrameCounters, pagebox_uncached_allocs) == 968);
     assert!(core::mem::offset_of!(FrameCounters, pool_recycled) == 972);
-    assert!(size_of::<FrameTiming>() == 32);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_bytes) == 976);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_uploads) == 980);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_full) == 984);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_declined) == 988);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_waits) == 992);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_recording) == 996);
+    assert!(core::mem::offset_of!(FrameCounters, texture_snapshot_wait_cycles) == 1000);
+    assert!(size_of::<FrameTiming>() == 48);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 1008);
+    assert!(core::mem::offset_of!(FrameTiming, latency_wait_cycles) == 32);
+    assert!(core::mem::offset_of!(FrameTiming, latency_waits) == 40);
+    assert!(core::mem::offset_of!(FrameTiming, frames_in_flight) == 44);
+    assert!(size_of::<FramePerfPayload>() == 1056);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 976);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 1008);
 };

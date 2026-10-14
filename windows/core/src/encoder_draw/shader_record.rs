@@ -87,11 +87,12 @@ pub(super) fn write_ps(
             unsafe { capture(value, writer) }
         }
         PsSourceView::FixedFunction(value) => {
-            if value.reserved != [0; 3] {
+            if value.reserved != [0; 2] {
                 return Err(WireError::InvalidValue);
             }
             header(writer, SourceKind::FixedFunction)?;
-            // SAFETY: key scalar fields, including its bool, and explicit padding are initialized.
+            // SAFETY: key scalar fields, the key's bool and the source's bool, and explicit
+            // padding are initialized.
             unsafe { capture(value, writer) }
         }
     }
@@ -154,14 +155,15 @@ pub(super) fn read_ps(reader: &mut SnapshotReader<'_>) -> Result<PsSourcePtr, Wi
         let bytes = super::read_aligned_bytes(reader, 80, 8)?;
         #[cfg(debug_assertions)]
         if bytes[72] > 1
-            || bytes[77..].iter().any(|&b| b != 0)
+            || bytes[77] > 1
+            || bytes[78..].iter().any(|&b| b != 0)
             || (0..8)
                 .any(|stage| crate::dxso::FfStageFlags::from_bits(bytes[stage * 9 + 8]).is_none())
         {
             return Err(WireError::InvalidValue);
         }
-        // SAFETY: the paired typed producer initialized the bool and flags; debug validation
-        // occurs before this reference, and size/alignment are checked in every build.
+        // SAFETY: the paired typed producer initialized both bools and the flags; debug
+        // validation occurs before this reference, and size/alignment are checked in every build.
         PsSourceView::FixedFunction(unsafe { borrow::<FixedPsSource>(bytes) })
     } else {
         let bytes = super::read_aligned_bytes(reader, 16, 8)?;
@@ -242,5 +244,6 @@ const _: () = {
     assert!(offset_of!(FixedPsSource, key) == 0);
     assert!(offset_of!(FixedPsSource, sampled_stage_mask) == 74);
     assert!(offset_of!(FixedPsSource, constant_rows) == 76);
-    assert!(offset_of!(FixedPsSource, reserved) == 77);
+    assert!(offset_of!(FixedPsSource, bump_env) == 77);
+    assert!(offset_of!(FixedPsSource, reserved) == 78);
 };

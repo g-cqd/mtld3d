@@ -339,6 +339,8 @@ const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::BLENDTEXTUREALPHAPM)
     .union(TexOpCaps::BLENDFACTORALPHA)
     .union(TexOpCaps::BLENDCURRENTALPHA)
+    .union(TexOpCaps::BUMPENVMAP)
+    .union(TexOpCaps::BUMPENVMAPLUMINANCE)
     .union(TexOpCaps::DOTPRODUCT3)
     .union(TexOpCaps::MULTIPLYADD)
     .union(TexOpCaps::LERP);
@@ -463,6 +465,20 @@ pub fn fill(caps: &mut D3DCAPS9, caps_all: bool, sampler_border: bool) {
             "debug.capsAll=true: advertising spec-max caps for bring-up diagnostic — visual rendering may degrade"
         );
     }
+}
+
+/// The caps [`fill`] reports, built as a value for the caller to copy out.
+///
+/// The `GetDeviceCaps` entry points write the result into the caller's struct
+/// in one copy that assumes no alignment, rather than filling the caller's
+/// memory field by field through a reference.
+#[must_use]
+pub fn build(caps_all: bool, sampler_border: bool) -> D3DCAPS9 {
+    // SAFETY: every field of `D3DCAPS9` is an integer or a float, for which
+    // all-zero bytes are a valid value.
+    let mut caps: D3DCAPS9 = unsafe { core::mem::zeroed() };
+    fill(&mut caps, caps_all, sampler_border);
+    caps
 }
 
 /// Whether `op` is a `D3DTOP_*` operation the fixed-function emitter lacks.
