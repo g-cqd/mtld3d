@@ -12,10 +12,7 @@ of that one Wine process, each test with its own device and window;
 are their own binaries because each needs a process of its own. With `ARM64=1`,
 `make test` runs both arches' binaries once more, under the arm64 Wine that
 `WINE_ARM64` names, and with `EC=1` the x86_64 binaries against the ARM64X
-DLLs there; those legs skip
-`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`,
-which deadlocks in that Wine's winemac, and the reason stands beside the skip
-in the Makefile. The runner is `unix/e2e`, and the
+DLLs there. The runner is `unix/e2e`, and the
 host-native `mtld3d-core`/`mtld3d-shared` unit tests run too.
 
 Three things follow from sharing a process. A test that needs a non-default
@@ -244,7 +241,7 @@ hidden-window test suite. Build and install with an isolated SDK first, then bui
 the example for either PE architecture. For example, from the repository root:
 
 ```sh
-WINE_SDK=/path/to/wine make ISOLATED=1 test
+WINE_X86_64=/path/to/wine make ISOLATED=1 test
 (cd windows && WINE_SDK="$PWD/../.wine-isolated/sdk" cargo +stable build -p mtld3d-tests --target i686-pc-windows-msvc --example cursor_capture)
 WINEPREFIX="$PWD/.wine-isolated/prefix" RUST_LOG=mtld3d::unix::cursor=trace,mtld3d::d3d9::cursor=debug .wine-isolated/sdk/bin/wine windows/target/i686-pc-windows-msvc/debug/examples/cursor_capture.exe
 ```
