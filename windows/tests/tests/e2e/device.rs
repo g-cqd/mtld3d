@@ -4529,15 +4529,37 @@ fn a_second_device_renders_after_the_first_is_destroyed() {
     );
 }
 
+/// The name the workload child of the kept-view reuse test runs under.
+const KEPT_VIEW_REUSE_CHILD_NAME: &str = "kept-view-reuse.exe";
+
 #[test]
 fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
-    // Releasing a device keeps its window's metal view for the next device
-    // on that window, and Wine hands the kept view back to that device's
-    // attach, so the second device here presents through the first one's
-    // layer rather than through a layer of its own. Both present past the
-    // display-reconciliation interval and read back their own colour; the
-    // first device's reference goes while its window stays, and the second
-    // device is created on that window.
+    if running_as(KEPT_VIEW_REUSE_CHILD_NAME) {
+        kept_view_reuse_workload();
+        return;
+    }
+    // The reuse is read out of the process log, which in the suite's process
+    // carries every other test's attaches, so the workload runs in a process
+    // of its own.
+    run_in_private_log_child(
+        KEPT_VIEW_REUSE_CHILD_NAME,
+        "device::a_second_device_on_the_same_window_presents_through_the_kept_metal_view",
+        PRIVATE_LOG_FILTER,
+    );
+}
+
+/// A device released, and a second device created on its window, which takes its metal view.
+///
+/// Releasing a device keeps (and hides) its window's metal view for the next
+/// device on that window, and that device's attach takes the kept view back
+/// and shows it, so the second device here presents through the first one's
+/// layer rather than through a layer of its own. Both present past the
+/// display-reconciliation interval and read back their own colour; the
+/// first device's reference goes while its window stays, and the second
+/// device is created on that window. The layer log names the reuse exactly
+/// once, for that window, so an attach that fell back to a view of its own
+/// fails here rather than passing on the colour alone.
+fn kept_view_reuse_workload() {
     const PRESENTS: u32 = 40;
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
@@ -4564,6 +4586,20 @@ fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
         second.read_pixel(1, 1),
         BLUE,
         "second device on the first device's window",
+    );
+    let reused = logged_lines("is attached again, layer and all");
+    assert_eq!(
+        reused.len(),
+        1,
+        "the kept view is attached again once: {reused:?}"
+    );
+    assert!(
+        reused[0].contains(&format!(
+            "kept from the previous device on window {:#x} is attached again",
+            first.hwnd()
+        )),
+        "the reuse names the first device's window: {}",
+        reused[0]
     );
     // The window is the first harness's to destroy, after the device on it.
     drop(second);
@@ -4631,12 +4667,18 @@ fn shared_window_workload() {
         "the attach read the first device's client surface"
     );
     assert_eq!(second.release_device(), 0, "release the later device");
-    let needle = format!("Wine shows client surface {surface}");
+    // The attach and the handback each log their cause in parentheses; the
+    // present at a device's own first frame says `again` instead.
+    let needle = format!("Wine shows client surface {surface} (");
     let shown = await_logged_lines(&needle, 2);
     assert_eq!(
         shown.len(),
         2,
         "the first device's surface shown at its attach and after the release: {shown:?}"
+    );
+    assert!(
+        shown[1].contains("(the device left on the window)"),
+        "the second one is the handback: {shown:?}"
     );
     let last = logged_lines("Wine shows client surface");
     assert_eq!(

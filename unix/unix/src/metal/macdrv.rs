@@ -51,8 +51,9 @@ pub use cursor_overlay::{poll_from_present, set_cursor_overlay};
 /// view's retirement knows the window it served. A device that never
 /// attached finds no record, and another device's record is untouched,
 /// except that Wine is told to show the client surface of the newest device
-/// still attached to the same window. Runs on the API thread, a Wine thread,
-/// which win32u's client surface calls need.
+/// still attached to the same window, once that device has submitted a
+/// frame. Runs on the API thread, a Wine thread, which win32u's client
+/// surface calls need.
 pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<Attachment>> {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
@@ -61,13 +62,22 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
     // Another device still presenting into this window gets its surface
-    // shown again, rather than the window keeping this view's last frame.
+    // shown again, rather than the window keeping this view's last frame. A
+    // device that has not drawn yet presents its own surface at its first
+    // frame instead.
     if let Some(calls) = client_surface::SurfaceCalls::load() {
-        if let Some(sibling) =
-            attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
-        {
-            calls.present(sibling);
-            calls.release(sibling);
+        match attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface)) {
+            attachment::NewestSurface::Retained(sibling) => {
+                calls.present(sibling, "the device left on the window");
+                calls.release(sibling);
+            }
+            attachment::NewestSurface::NotDrawn(sibling) => debug!(
+                target: LOG_TARGET,
+                "present: client surface {sibling:#x}, the newest left on window {:#x}, waits \
+                 for its device's first frame",
+                att.hwnd(),
+            ),
+            attachment::NewestSurface::None => {}
         }
         calls.release(att.client_surface());
     }
@@ -82,14 +92,17 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
 
 /// Have Wine show and size the client surface of the newest device on a view's window.
 ///
-/// The device whose metal view is `view_handle` asks at its `Present` after
+/// The device whose metal view is `view_handle` asks at a `Present` that
+/// submitted a frame: its first one after the attach, and the next one after
 /// its client view was hidden or its window's client area changed
-/// (`reasons`). win32u's `client_surface_present` updates the surface's
-/// cocoa view to the window's client rect and makes it the one Wine shows,
-/// the two things winemac's `nextDrawable` override did on every present.
-/// The surface is the newest device's on the record's window, as at a
-/// teardown. Runs on the API thread, a Wine thread, which win32u's calls
-/// need; a view no record names asks for nothing, logged once.
+/// (`reasons`). The call is what marks the device as having drawn. win32u's
+/// `client_surface_present` updates the surface's cocoa view to the window's
+/// client rect and makes it the one Wine shows, the two things winemac's
+/// `nextDrawable` override did on every present. The surface is the newest
+/// device's on the record's window, as at a teardown, and only once that
+/// device has drawn: its own first frame presents it otherwise. Runs on the
+/// API thread, a Wine thread, which win32u's calls need; a view no record
+/// names asks for nothing, logged once.
 pub fn present_client_surface(
     view_handle: MetalHandle<NSViewKind>,
     reasons: mtld3d_shared::mtl::ClientSurfaceRequest,
@@ -104,14 +117,22 @@ pub fn present_client_surface(
         );
         return;
     };
+    att.note_frame_submitted();
     let Some(calls) = client_surface::SurfaceCalls::load() else {
         return;
     };
-    if let Some(surface) =
-        attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
-    {
-        calls.present_requested(surface, reasons);
-        calls.release(surface);
+    match attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface)) {
+        attachment::NewestSurface::Retained(surface) => {
+            calls.present_requested(surface, reasons);
+            calls.release(surface);
+        }
+        attachment::NewestSurface::NotDrawn(surface) => debug!(
+            target: LOG_TARGET,
+            "present: client surface {surface:#x}, the newest on window {:#x}, waits for its \
+             device's first frame ({reasons:?})",
+            att.hwnd(),
+        ),
+        attachment::NewestSurface::None => {}
     }
 }
 
@@ -1084,15 +1105,17 @@ pub fn attach_metal_layer(
     // thread; the view is retained for as long as the device holds it. The
     // same hop takes the layer off winemac's `nextDrawable` override, which
     // walks the view from the presenter thread, reads a hosted view's
-    // client surface, which the override would have presented, and takes
-    // the fade out of the window's order-out, so the layer can move on at
-    // once when the window goes.
+    // client surface, which the override would have presented, takes the
+    // fade out of the window's order-out, so the layer can move on at once
+    // when the window goes, and shows a kept view the park hid, before the
+    // present below shows its client view.
     let mut hint = None;
     let mut layer_class = client_surface::LayerClass::Plain;
     let mut surface = 0;
     let can_present = surface_calls.is_some();
     run_on_main_thread_sync(|| {
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
+        show_metal_view(view, mtm);
         hint = Some(view_display_caps(view, mtm));
         layer_class = client_surface::bypass_present_hook(layer, can_present, mtm);
         if !order_out_without_fade(view, mtm) {
@@ -1186,10 +1209,15 @@ pub fn attach_metal_layer(
         },
     );
     // A new view's surface is the one Wine shows already; a kept view's may
-    // have been hidden for a later surface of the same window since.
+    // have been hidden for a later surface of the same window since. This
+    // present also has win32u set the surface's frame and superview. The
+    // device's first submitted frame presents the surface again, which is
+    // the present after which Wine keeps the client view shown across its
+    // window surface flushes; until then no other device's call presents it.
     if let Some(calls) = &surface_calls {
-        calls.present(surface);
+        calls.present(surface, "attach");
     }
+    attachment::request_first_frame_present(view as usize);
     attachment::publish_backing_scale(&att, backing_scale);
     // `Auto` turns the software cursor on under HDR, where the hardware
     // cursor reads dim. The overlay window costs the game window its
@@ -1847,9 +1875,11 @@ mod bounded_cast {
 /// follows.
 ///
 /// [`KEPT_METAL_VIEWS`] views are kept, one per window, and parking past
-/// that releases the oldest. Parking also drops the layer's drawable pool
-/// ([`shrink_parked_layer`]), so a kept layer holds the one surface it still
-/// displays rather than a pool at the window's size. A device attaching to
+/// that releases the oldest. Parking also drops the layer's drawable pool, so
+/// a kept layer holds the one surface it last displayed rather than a pool at
+/// the window's size, and hides the view, so its window no longer shows the
+/// departed device's last frame ([`prepare_parked_view`]); the next device's
+/// attach shows it again. A device attaching to
 /// another window leaves a kept view for a device that comes back to its
 /// own, as long as that window is there. A kept view whose window is gone
 /// (an application that destroys its device window between two devices and
@@ -1876,15 +1906,17 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
     };
     // Before the park publishes the view, not after: a device that took it
     // back in between would present into the shrunk drawable until its own
-    // attach put the layer's geometry back.
-    shrink_parked_layer(view, record.layer());
+    // attach put the layer's geometry back, and the park's hide could land
+    // after that attach showed the view.
+    prepare_parked_view(view, record.layer());
     let displaced = PARKED_METAL_VIEW
         .lock()
         .expect("metal view park mutex poisoned")
         .park(record.hwnd(), view, record.layer());
     debug!(
         target: LOG_TARGET,
-        "present: metal view {view:#x} kept for the next device on window {:#x}",
+        "present: metal view {view:#x} kept for the next device on window {:#x}, hidden until \
+         then",
         record.hwnd(),
     );
     if let Some(displaced) = displaced {
@@ -1892,7 +1924,7 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
     }
 }
 
-/// Drop the drawable pool of a layer about to be parked, keeping the frame it shows.
+/// Drop the drawable pool of a view about to be parked and hide the view.
 ///
 /// A layer's pool is its window's size, `maximumDrawableCount` deep: at
 /// 3456x2234 `RGBA16Float` that is about 62 MB a drawable, held while no
@@ -1902,22 +1934,74 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
 /// why [`sync_drawable_size`] compares before it writes. So the park writes
 /// the smallest drawable Metal takes, and attach restores the layer's own
 /// geometry through [`configure_metal_layer`], as it does for a view Wine
-/// just created. What survives the write is the surface the layer
-/// displays, which is the frame the window shows until its next device
-/// presents.
+/// just created. What survives the write is the surface the layer last
+/// displayed.
+///
+/// The view is hidden ([`hide_parked_view`]), so the window stops showing
+/// the departed device's last frame; it stays in its client view and its
+/// window, and attach shows it again ([`show_metal_view`]).
 ///
 /// Synchronous, because the caller is about to publish the view to the park:
-/// the write has to land before another device can take the view back.
+/// all of this has to land before another device can take the view back.
 ///
 /// The same hop takes the fade out of the order-out of the window the view
 /// still sits in ([`order_out_without_fade`]), for a view attach found in no
 /// window.
-fn shrink_parked_layer(view: usize, layer: usize) {
+fn prepare_parked_view(view: usize, layer: usize) {
     run_on_main_thread_sync(|| {
-        let mtm = MainThreadMarker::new().expect("the parked layer is shrunk on the main thread");
+        let mtm = MainThreadMarker::new().expect("a view is parked on the main thread");
         shrink_layer_drawable(layer, mtm);
         order_out_without_fade(view as *mut c_void, mtm);
+        hide_parked_view(view, mtm);
     });
+}
+
+/// Hide a view about to be parked; its window draws its surface again. **Main thread only.**
+///
+/// Hidden, the view leaves its client view, which draws nothing of its own,
+/// showing Wine's window surface under it rather than the departed device's
+/// last frame, and a winemac that keeps a client view shown across window
+/// surface flushes while a metal view presents through it treats a hidden one
+/// as absent, so the next flush hides the client view as it does any other.
+/// The view keeps its place in the client view and the window, so the window
+/// still walks it when the retina mode changes, and nothing changes for the
+/// layer but its visibility: it keeps its identity and its place in the
+/// layer tree, the state the kept layer's per-layer frame metrics were
+/// checked in.
+///
+/// [`clear_covered_window_layers`] may have taken the surface image off the
+/// window's content view while the view covered the window, and Wine sets it
+/// again only on its next flush. Marking the content view for display has
+/// Wine's `updateLayer` put the image back now, so a window between two
+/// devices shows its surface rather than nothing.
+fn hide_parked_view(view: usize, _mtm: MainThreadMarker) {
+    // SAFETY: the view is the retiring device's, still retained by the
+    // handle `macdrv_view_create_metal_view` handed out, since the caller has
+    // not parked or released it yet; the retain taken here covers the calls.
+    let Some(view) = (unsafe { Retained::retain(view as *mut NSView) }) else {
+        return;
+    };
+    view.setHidden(true);
+    if let Some(content) = view.window().and_then(|window| window.contentView()) {
+        content.setNeedsDisplay(true);
+    }
+}
+
+/// Show a metal view a device attaches to, which the park hid. **Main thread only.**
+///
+/// A view Wine just created is shown already, and showing it again changes
+/// nothing. Runs before the attach presents the view's client surface, so
+/// the client view Wine shows again holds a shown metal view.
+fn show_metal_view(view: *mut c_void, _mtm: MainThreadMarker) {
+    // SAFETY: the view is the one attach holds, created by Wine just now or
+    // kept for this device and handed over by the park, retained either way;
+    // the retain taken here covers the call.
+    let Some(view) = (unsafe { Retained::retain(view.cast::<NSView>()) }) else {
+        return;
+    };
+    if view.isHidden() {
+        view.setHidden(false);
+    }
 }
 
 /// Write the smallest drawable size `layer` accepts. **Main thread only.**
@@ -1949,8 +2033,8 @@ fn shrink_layer_drawable(layer: usize, _mtm: MainThreadMarker) {
 /// devices leaves one kept view per switch, taken by the next window; the
 /// end-to-end suite runs four devices at once, and a smaller park would hand
 /// its recreations new layers by accident of timing. Each kept view holds
-/// the one surface its layer still displays; the pool behind it goes at the
-/// park ([`shrink_parked_layer`]).
+/// the one surface its layer last displayed; the pool behind it goes at the
+/// park ([`prepare_parked_view`]).
 const KEPT_METAL_VIEWS: usize = 4;
 
 /// Drawables the layer hands out before one has to come back from the display.
@@ -3001,10 +3085,13 @@ fn follow_layer_backing_scale(att: &Arc<Attachment>, mtm: MainThreadMarker) {
 /// view does not cover shows them and keeps them, and so does a window whose
 /// metal view is hidden, as Wine hides the client view when another client
 /// surface takes over or, on some Wines, on every surface flush: the surface
-/// image is then all the window shows. Nothing is restored: Wine sets the
-/// surface image again on its next flush, which a resize makes, and the
+/// image is then all the window shows. Nothing is restored here: Wine sets
+/// the surface image again on its next flush, which a resize makes, and the
 /// background colour on the window's next show, and the next refresh clears
 /// whichever property `AppKit` or Wine has set again while the cover holds.
+/// The park, which hides the view, has the content view draw its surface
+/// image again at once ([`hide_parked_view`]); the image covers what the
+/// view covered, so the background colour stays cleared.
 fn clear_covered_window_layers(view: &NSView, _mtm: MainThreadMarker) {
     // A view between windows has none; the next pass finds the new one.
     let Some(window) = view.window() else {
