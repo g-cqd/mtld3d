@@ -19,6 +19,14 @@ fn empty_input_returns_defaults() {
 }
 
 #[test]
+fn drop_unscalable_sizes_is_on_by_default_and_can_be_turned_off() {
+    assert!(parse(None, "", None).display_drop_unscalable_sizes);
+    let off = parse(None, "display.dropUnscalableSizes=false", None);
+    assert!(!off.display_drop_unscalable_sizes);
+    assert_ne!(off, Mtld3dConfig::default());
+}
+
+#[test]
 fn legacy_display_mode_option_is_opt_in_and_can_be_overridden() {
     let enabled = parse(None, "display.legacy4By3=true", None);
     assert!(enabled.display_legacy_4_by_3);
@@ -79,6 +87,7 @@ fn defaults_match_documented_values() {
     assert!(!d.managed_memory);
     assert!(!d.linear_align256);
     assert!(!d.display_legacy_4_by_3);
+    assert!(d.display_drop_unscalable_sizes);
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
