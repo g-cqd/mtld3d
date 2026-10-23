@@ -107,6 +107,17 @@ pub struct Mtld3dConfig {
     /// so changing it requires a restart. Default:
     /// `false`. File key: `display.legacy4By3`.
     pub display_legacy_4_by_3: bool,
+    /// Leave out the display sizes some Wine builds cannot rescale the monitor from.
+    ///
+    /// After a mode-set win32u of some builds (CrossOver 27) packs the monitor
+    /// scale ratio into 16 bits per term and aborts when a term does not fit,
+    /// so such sizes are left out of the adapter modes. A Wine whose win32u
+    /// computes the scale in floating point has no such limit, and with this
+    /// option `false` every size it lists is served, including the display's
+    /// own modes. The process-wide display table latches this option like
+    /// `display.legacy4By3`. Default: `true`. File key:
+    /// `display.dropUnscalableSizes`.
+    pub display_drop_unscalable_sizes: bool,
     /// Enable HDR present pipeline on EDR-capable displays.
     ///
     /// The display gates this, not the value: the present pipeline only
@@ -403,6 +414,7 @@ impl Default for Mtld3dConfig {
             managed_memory: false,
             linear_align256: false,
             display_legacy_4_by_3: false,
+            display_drop_unscalable_sizes: true,
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
@@ -541,6 +553,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(
         target: crate::LOG_TARGET,
         "config: display.legacy4By3 = {}", cfg.display_legacy_4_by_3
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: display.dropUnscalableSizes = {}", cfg.display_drop_unscalable_sizes
     );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
     info!(
@@ -690,6 +706,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "intel.managedMemory" => assign_bool(source, key, value, &mut cfg.managed_memory),
         "intel.linearAlign256" => assign_bool(source, key, value, &mut cfg.linear_align256),
         "display.legacy4By3" => assign_bool(source, key, value, &mut cfg.display_legacy_4_by_3),
+        "display.dropUnscalableSizes" => {
+            assign_bool(source, key, value, &mut cfg.display_drop_unscalable_sizes);
+        }
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),

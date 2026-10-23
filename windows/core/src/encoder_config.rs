@@ -89,6 +89,8 @@ impl WireValue for Mtld3dConfig {
             df_formats: <bool>::read_wire(reader)?,
             display_legacy_4_by_3: <bool>::read_wire(reader)?,
             preserve_discard_backbuffer: <bool>::read_wire(reader)?,
+            // Read only by the Windows half's display table: not on the wire.
+            display_drop_unscalable_sizes: true,
         })
     }
 }

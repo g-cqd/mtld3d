@@ -70,7 +70,13 @@ fn adapter_modes() -> &'static AdapterModes {
     // An import hook can run before the first factory. Only that path needs
     // to resolve the process configuration here; later queries borrow the
     // table initialized from the factory's captured configuration.
-    ADAPTER_MODES.get_or_init(|| build_adapter_modes(crate::config::load().display_legacy_4_by_3))
+    ADAPTER_MODES.get_or_init(|| {
+        let config = crate::config::load();
+        build_adapter_modes(
+            config.display_legacy_4_by_3,
+            config.display_drop_unscalable_sizes,
+        )
+    })
 }
 
 // Adapter color formats enumerated. X8R8G8B8 = "32-bit" in most game UIs
@@ -167,7 +173,7 @@ pub fn served_sizes() -> &'static [(u32, u32)] {
     &adapter_modes().served_sizes
 }
 
-fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
+fn build_adapter_modes(legacy_4_by_3: bool, drop_unscalable: bool) -> AdapterModes {
     // Both the host mode and the candidates come from the Win32 view
     // (`EnumDisplaySettingsW` → win32u), NOT from `NSScreen` or a table of
     // our own: win32u validates a fullscreen device's `ChangeDisplaySettingsW`
@@ -199,9 +205,15 @@ fn build_adapter_modes(legacy_4_by_3: bool) -> AdapterModes {
     // packs into 16 bits each, and some Wine builds abort the process when a
     // term does not fit. Those builds cannot be told apart from here, so the
     // sizes are left out on every Wine: a fullscreen request for one follows
-    // the window rather than setting the mode.
+    // the window rather than setting the mode. A Wine whose win32u rescales in
+    // floating point has no such limit: `display.dropUnscalableSizes = false`
+    // serves every size it lists.
     let dpi = crate::fullscreen::system_dpi();
-    let unscalable = drop_unscalable_sizes(&mut settable, physical, dpi);
+    let unscalable = if drop_unscalable {
+        drop_unscalable_sizes(&mut settable, physical, dpi)
+    } else {
+        Vec::new()
+    };
     if !unscalable.is_empty() {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
@@ -335,7 +347,12 @@ impl Drop for Direct3D9Inner {
 
 impl Direct3D9 {
     pub fn new(config: Arc<Mtld3dConfig>, extended: bool) -> Self {
-        ADAPTER_MODES.get_or_init(|| build_adapter_modes(config.display_legacy_4_by_3));
+        ADAPTER_MODES.get_or_init(|| {
+            build_adapter_modes(
+                config.display_legacy_4_by_3,
+                config.display_drop_unscalable_sizes,
+            )
+        });
         Self {
             vtbl: &raw const DIRECT3D9_VTBL.base,
             refcount: AtomicU32::new(1),
