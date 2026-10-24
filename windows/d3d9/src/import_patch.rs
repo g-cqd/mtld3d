@@ -154,9 +154,10 @@ impl MappedImage {
             }
             // `IMAGE_IMPORT_BY_NAME`: a u16 hint, then the name.
             if self.c_string(entry + 2) == func {
-                // An import-address-table entry is pointer-aligned by the PE
-                // layout; the address stays inside the mapping (see `read`)
-                // and keeps the image's provenance.
+                // An import-address-table entry may be 4-byte-aligned even in a
+                // 64-bit image (e.g. GTA5.exe's Arxan-packed import table); the
+                // address stays inside the mapping (see `read`) and keeps the
+                // image's provenance.
                 let slot = addresses + j * size_of::<usize>();
                 return Some(ptr::with_exposed_provenance_mut(
                     self.base.expose_provenance() + slot,
@@ -222,9 +223,10 @@ impl<const N: usize> PatchedImports<N> {
             // The original is published before the slot names the
             // replacement, so a thread that calls through the slot the moment
             // it changes finds the entry point it forwards to.
-            // SAFETY: `slot` is an aligned, readable entry of the main
-            // module's import address table (`MappedImage::import_slot`).
-            let original = unsafe { slot.read_volatile() };
+            // SAFETY: `slot` is a readable entry of the main module's import
+            // address table (`MappedImage::import_slot`); `read_unaligned`
+            // tolerates 4-byte-aligned IATs in packed 64-bit images.
+            let original = unsafe { slot.read_unaligned() };
             self.originals[i].store(original.cast_mut(), Ordering::Release);
             let Some(previous) = write_slot(slot, hook.replacement) else {
                 warn!(
@@ -308,8 +310,10 @@ fn write_slot(slot: *mut *const (), value: *const ()) -> Option<*const ()> {
         return None;
     }
     // SAFETY: the slot's page is writable as of the call above and the slot
-    // is a valid, aligned pointer-sized entry of the import address table.
-    let previous = unsafe { slot.replace(value) };
+    // is a valid pointer-sized entry of the import address table; unaligned
+    // read/write tolerates 4-byte-aligned IATs in packed 64-bit images.
+    let previous = unsafe { slot.read_unaligned() };
+    unsafe { slot.write_unaligned(value) };
     // SAFETY: restoring the protection the page had; a failure here leaves
     // the page writable, which is harmless.
     unsafe {
