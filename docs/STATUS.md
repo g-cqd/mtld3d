@@ -96,9 +96,12 @@ unimplemented. Earlier Direct3D and DirectDraw APIs remain future work.
   RESZ readback.
 - Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
 - Anisotropic filtering, LOD bias, sRGB read on the formats whose Metal
-  counterpart has an sRGB twin and sRGB write into any render target (through
-  that twin where it exists, through the pixel shader otherwise, which is
-  what `D3DUSAGE_QUERY_SRGBWRITE` answers), alpha test, scissor,
+  counterpart has an sRGB twin and sRGB write into the render targets of
+  those formats (the 8-bit four-channel ones, through the twin view, after
+  the blender), which is what `D3DUSAGE_QUERY_SRGBWRITE` answers. Every other
+  render target, R5G6B5, A1R5G5B5, G16R16, A16B16G16R16 and the float
+  formats, is written linear under `D3DRS_SRGBWRITEENABLE`, beside encoded
+  targets of the same pass too. Alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
@@ -185,7 +188,8 @@ unless its entry says otherwise.
 - Additional swap chains with a window of their own:
   `CreateAdditionalSwapChain` checks the swap effect, the back-buffer count
   and the presentation interval as `CreateDevice` and `Reset` do, for the
-  kind of device it is called on. An additional chain owns its back buffer,
+  kind of device it is called on, and refuses a lockable back buffer that is
+  also multisampled as they do. An additional chain owns its back buffer,
   but the device has one window and one drawable, so its `Present` shows
   that back buffer in the device window, and a title that presents a second
   chain into another window sees it in the first. Within any one swap chain,
@@ -360,11 +364,12 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes
-  the primary display only and serves first the sizes that fill it (a bar
-  of less than one physical pixel once win32u has scaled them onto it), then
-  the standard sizes of another shape that user32 lists for it (2560x1440
-  down to 640x480), which win32u letterboxes in fullscreen, and nothing else
-  of user32's list. No knob.
+  the primary display only. No knob.
+- With `display.maxResolutions` set, the adapter mode list and the main
+  module's `EnumDisplaySettings` offer at most that many sizes, the largest
+  ones and always the desktop's, where a driver lists every mode it has. The
+  World of Warcraft profile sets it to 32, the entries its resolution menu
+  holds. `display.maxResolutions`, off by default.
 - A windowed device's `SetGammaRamp` is stored and reported back but changes
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.

@@ -51,6 +51,7 @@ impl WireValue for Mtld3dConfig {
         self.df_formats.write_wire(writer)?;
         self.display_legacy_4_by_3.write_wire(writer)?;
         self.preserve_discard_backbuffer.write_wire(writer)?;
+        self.max_resolutions.write_wire(writer)?;
         Ok(())
     }
 
@@ -89,6 +90,7 @@ impl WireValue for Mtld3dConfig {
             df_formats: <bool>::read_wire(reader)?,
             display_legacy_4_by_3: <bool>::read_wire(reader)?,
             preserve_discard_backbuffer: <bool>::read_wire(reader)?,
+            max_resolutions: <u32>::read_wire(reader)?,
             // Read only by the Windows half's display table: not on the wire.
             display_drop_unscalable_sizes: true,
         })

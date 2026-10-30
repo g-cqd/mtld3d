@@ -14,6 +14,12 @@ pub const D3DCREATE_SOFTWARE_VERTEXPROCESSING: u32 = 0x20;
 /// `CreateDevice` allows switching between hardware and software vertex processing.
 pub const D3DCREATE_MIXED_VERTEXPROCESSING: u32 = 0x80;
 
+/// `CreateDevice` behaviour flag `D3DCREATE_FPU_PRESERVE`.
+///
+/// The device leaves the calling thread's x87 control word as the app set
+/// it, instead of switching it to single precision.
+pub const D3DCREATE_FPU_PRESERVE: u32 = 0x2;
+
 /// `CreateDevice` behaviour flag `D3DCREATE_MULTITHREADED`.
 ///
 /// The app may call the device and its resources from any thread; every

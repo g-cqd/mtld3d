@@ -160,8 +160,8 @@ impl PixelFormat {
     /// one; `D3DSAMP_SRGBTEXTURE=1` selects it as the sampled view, and
     /// `D3DRS_SRGBWRITEENABLE=1` attaches it as the render pass's colour
     /// attachment so the hardware encodes after the blender. A colour target
-    /// whose format returns `None` here keeps the pixel-shader OETF variant,
-    /// which encodes before the blender.
+    /// whose format returns `None` here takes no sRGB write and is written
+    /// linear under the state, as D3D9 writes such a format.
     ///
     /// Returning `None` means the linear format is the only thing mtld3d
     /// supports — callers fall back to the linear view with a once-per-id
@@ -788,6 +788,13 @@ bitflags! {
         /// waits for the last submitted command buffer before it copies
         /// out of a resolve target when this is set.
         const RESOLVE_NEEDS_RETIRE = 1 << 6;
+        /// The device takes a visibility query offset up to 256 KB.
+        ///
+        /// Apple's Metal feature set tables give that maximum for the Apple7
+        /// family and later; they give 65,528 bytes for Apple2 to Apple6 and
+        /// none for Mac2, which therefore keep the smaller buffer. Sizes one
+        /// occlusion-query visibility buffer.
+        const VISIBILITY_OFFSET_256K = 1 << 7;
     }
 }
 

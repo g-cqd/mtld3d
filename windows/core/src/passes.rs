@@ -928,6 +928,12 @@ pub struct Pass {
     /// set and keeps the `MTL_DEBUG_LAYER` validator from retaining
     /// per-pass tracking state for it.
     has_counting_visibility: bool,
+    /// Which of the frame's visibility buffers the pass's Counting modes name.
+    ///
+    /// Stamped when the pass opens from [`PassState`]'s current buffer, which
+    /// moves on only through [`PassState::break_for_visibility_buffer`], so
+    /// every visibility offset recorded into a pass is one of its buffer's.
+    visibility_buffer: u32,
     /// What the depth attachment is and what the pass's draws did with it.
     ///
     /// See [`PassDepthFlags`] for the bits.
@@ -1327,6 +1333,12 @@ impl Pass {
         self.has_counting_visibility
     }
 
+    /// Which of the frame's visibility buffers the submit path binds to this pass.
+    #[must_use]
+    pub const fn visibility_buffer(&self) -> u32 {
+        self.visibility_buffer
+    }
+
     #[must_use]
     pub const fn color_writes_observed(&self) -> bool {
         self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
@@ -1601,6 +1613,11 @@ pub struct FrameReset {
 pub struct PassState {
     passes: Vec<Pass>,
     current_pass_closed: bool,
+    /// The frame's visibility buffer that passes opened from now on count into.
+    ///
+    /// Zero at every frame start; [`Self::break_for_visibility_buffer`] moves
+    /// it on when the frame's queries fill a buffer.
+    visibility_buffer: u32,
 
     current_color_texture: MetalHandle<MTLTextureKind>,
     /// Multisampled companion of the bound render target 0, NULL for none.
@@ -1848,11 +1865,15 @@ pub struct PassState {
     /// Whether the next pass binds sRGB twin views of its colour attachments.
     ///
     /// True when `srgb_write_enabled` is set and every colour target the
-    /// pass attaches has a twin. Metal then converts linear → sRGB *after*
-    /// the blender, which is the D3D9 order the
-    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises. False leaves the
-    /// encode to the pixel shader's OETF variant, which runs before the
-    /// blender and is exact only for opaque draws.
+    /// pass attaches whose format has an sRGB twin has its twin view, at
+    /// least one target being such a format. Metal then converts linear →
+    /// sRGB *after* the blender, which is the D3D9 order the
+    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises, and a target of a
+    /// format without a twin (float, 16-bit and packed formats) is written
+    /// linear beside them, as D3D9 writes it. False with the state set
+    /// leaves the encode of the twin-capable targets to the pixel shader's
+    /// OETF variant, which runs before the blender and is exact only for
+    /// opaque draws ([`Self::shader_srgb_encode_mask`]).
     ///
     /// A change ends the current pass: the view is an attachment property,
     /// so draws on either side of the toggle cannot share one encoder.
@@ -1939,6 +1960,7 @@ impl PassState {
         Self {
             passes: Vec::with_capacity(4),
             current_pass_closed: true,
+            visibility_buffer: 0,
             current_color_texture: MetalHandle::NULL,
             current_color_msaa_texture: MetalHandle::NULL,
             current_color_msaa_srgb_texture: MetalHandle::NULL,
@@ -2050,6 +2072,7 @@ impl PassState {
         }
         self.upload_pass_end = 0;
         self.current_pass_closed = true;
+        self.visibility_buffer = 0;
         // No pass open → no viewport emitted yet; the next pass's open
         // reseeds this. (`set_viewport` only reads it inside an open pass.)
         self.last_emitted_viewport = None;
@@ -2988,8 +3011,7 @@ impl PassState {
             self.current_extra_srgb[i] = self.twin_of(self.current_extra_color[i].texture);
         }
         self.pass_srgb_write = self.srgb_write_enabled && self.srgb_write_is_attachable();
-        if self.srgb_write_enabled && !self.pass_srgb_write && !self.current_color_texture.is_null()
-        {
+        if self.shader_srgb_encode_mask() & 1 != 0 {
             mtld3d_shared::log_once_info_by!(
                 target: crate::LOG_TARGET,
                 key: self.current_color_texture.raw(),
@@ -3010,27 +3032,71 @@ impl PassState {
             .unwrap_or(MetalHandle::NULL)
     }
 
-    /// Whether every colour target the next pass attaches has an sRGB twin.
+    /// Whether the next pass can bind an sRGB twin for every target that encodes.
     ///
-    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment only then:
-    /// one render pass has one set of views, so a target without a twin
-    /// would have to be written linear while its neighbours encode. The
-    /// all-or-nothing rule keeps a mixed set on the shader path.
+    /// D3D9 applies `D3DRS_SRGBWRITEENABLE` to the targets whose format takes
+    /// an sRGB write, the formats with an sRGB twin, and writes every other
+    /// target linear: the encode is a property of each attachment's view. So
+    /// a target of a format without a twin is attached linear beside twin
+    /// views and does not hold the pass back. A twin-capable target whose
+    /// view Metal declined keeps the whole set on the shader path, since the
+    /// pass would otherwise write it linear. False when no target encodes, so
+    /// toggling the state over targets that never encode ends no pass.
     fn srgb_write_is_attachable(&self) -> bool {
-        !self.current_color_texture.is_null()
-            && !self.twin_of(self.current_color_texture).is_null()
-            && Self::companion_twin_present(
-                self.current_color_msaa_texture,
-                self.current_color_msaa_srgb_texture,
-            )
-            && (0..3).all(|i| {
-                self.current_extra_present_mask & (1 << i) == 0
-                    || (!self.twin_of(self.current_extra_color[i].texture).is_null()
-                        && Self::companion_twin_present(
-                            self.current_extra_color[i].msaa_texture,
-                            self.current_extra_color[i].msaa_srgb_texture,
-                        ))
-            })
+        if self.current_color_texture.is_null() {
+            return false;
+        }
+        let mut any_encodes = self.current_color_format.srgb_twin().is_some();
+        if any_encodes
+            && (self.twin_of(self.current_color_texture).is_null()
+                || !Self::companion_twin_present(
+                    self.current_color_msaa_texture,
+                    self.current_color_msaa_srgb_texture,
+                ))
+        {
+            return false;
+        }
+        for (i, slot) in self.current_extra_color.iter().enumerate() {
+            if self.current_extra_present_mask & (1 << i) == 0 || slot.format.srgb_twin().is_none()
+            {
+                continue;
+            }
+            if self.twin_of(slot.texture).is_null()
+                || !Self::companion_twin_present(slot.msaa_texture, slot.msaa_srgb_texture)
+            {
+                return false;
+            }
+            any_encodes = true;
+        }
+        any_encodes
+    }
+
+    /// The colour outputs the pixel shader has to encode itself under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Bit 0 is render target 0 and bits 1..3 render targets 1..3. Zero while
+    /// the state is off and while the pass binds twin views
+    /// ([`Self::pass_srgb_write`]), where Metal encodes after the blender.
+    /// Otherwise it names the attached targets whose format takes an sRGB
+    /// write: those then reach the pass through their linear view, so the
+    /// shader's OETF variant has to encode them. A target of a format without
+    /// a twin is never named; it stays linear.
+    #[must_use]
+    pub fn shader_srgb_encode_mask(&self) -> u8 {
+        if !self.srgb_write_enabled || self.pass_srgb_write {
+            return 0;
+        }
+        let mut mask = u8::from(
+            !self.current_color_texture.is_null()
+                && self.current_color_format.srgb_twin().is_some(),
+        );
+        for i in 0..3 {
+            if self.current_extra_present_mask & (1 << i) != 0
+                && self.current_extra_color[i].format.srgb_twin().is_some()
+            {
+                mask |= 1 << (i + 1);
+            }
+        }
+        mask
     }
 
     /// Whether a multisampled companion, if there is one, has an sRGB twin.
@@ -3820,6 +3886,7 @@ impl PassState {
             commands,
             leading_blits,
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: self.pass_depth_flags(),
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
@@ -3973,6 +4040,7 @@ impl PassState {
             commands: cmds,
             leading_blits,
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
@@ -4097,6 +4165,29 @@ impl PassState {
         }
     }
 
+    /// Close the current pass because the frame's visibility buffer is full.
+    ///
+    /// Passes opened after this count into the frame's next visibility
+    /// buffer: a Metal render pass counts into the one buffer its descriptor
+    /// names. Unlike [`Self::end_current_pass`] this keeps the render-target-0
+    /// decision, since the draw about to be recorded already made it for the
+    /// pass it opens. The pass opened next loads what this one stored, as
+    /// after any other break, and Rule J keeps the two apart.
+    pub fn break_for_visibility_buffer(&mut self) {
+        if !self.passes.is_empty() && !self.current_pass_closed {
+            self.current_pass_closed = true;
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                let idx = self.passes.len() - 1;
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-close idx={idx} caller=visibility_buffer_full buffer={}",
+                    self.visibility_buffer
+                );
+            }
+        }
+        self.visibility_buffer += 1;
+    }
+
     /// Materialize any pending clears as a standalone pass on the current attachments.
     ///
     /// D3D9 semantics: `Clear()` applies to whichever rt is bound at call
@@ -4174,6 +4265,7 @@ impl PassState {
             commands,
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
             depth_flags: self.pass_depth_flags(),
             color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
@@ -5388,7 +5480,8 @@ impl PassState {
     /// load of every attachment between the halves. That split is what a
     /// render-target change undone before anything is drawn leaves, or an sRGB
     /// toggle undone the same way, or a borrowed binding put back. The second
-    /// pass joins the first when the join changes nothing D3D9 can see
+    /// pass joins the first when the join changes nothing D3D9 can see and
+    /// both count into the same visibility buffer, since a pass binds one
     /// (`merge_join` has the conditions): it has no leading blits and loads
     /// every attachment the first stores unresolved (a depth plane it discards
     /// on load may have any store before it), and the second samples none of
@@ -6398,7 +6491,8 @@ impl PassJoin {
 
 /// The join that fuses `next` into `prev` under Rule J, `None` when the two must stay apart.
 ///
-/// The passes stay apart unless they bind identical attachments, `next` has
+/// The passes stay apart unless they bind identical attachments and the same
+/// visibility buffer (a full one is what split them), `next` has
 /// no leading blits, every attachment carries over ([`color_carries_over`],
 /// [`depth_carries_over`]), and no sampler bind in `next` reads an
 /// attachment. Then every state of [`JOIN_STATES`] that `next` reads before
@@ -6413,6 +6507,7 @@ fn merge_join(
     frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> Option<PassJoin> {
     if !attachments_match(prev, next)
+        || prev.visibility_buffer != next.visibility_buffer
         || !next.leading_blits.is_empty()
         || !color_carries_over(prev, next)
         || !depth_carries_over(prev, next)

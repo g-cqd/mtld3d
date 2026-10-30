@@ -340,6 +340,19 @@ pub struct DrawIndexedUpParams {
     pub index_format: u32,
 }
 
+/// Run `f` under the shared environment lock, with the suite-wide `MTLD3D_CONFIG` in force.
+///
+/// For a call that lets the layer read its configuration outside
+/// `Direct3DCreate9`: d3d9's redirect of the main module's
+/// `EnumDisplaySettings` resolves `display.maxResolutions` on its first
+/// enumeration and keeps it for the process, so that first enumeration must
+/// never see the entries a harness holds in the variable for its own
+/// interface.
+pub fn with_suite_environment<R>(f: impl FnOnce() -> R) -> R {
+    let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
 /// The suite-wide `MTLD3D_CONFIG`, read under the shared environment lock.
 ///
 /// `None` when the variable is unset. The lock keeps a harness that is
@@ -3514,25 +3527,64 @@ impl Harness {
     /// # Panics
     /// Panics if the back-buffer size does not fit a window's `i32` extent.
     pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        self.create_device_observed(pp, |_| ()).0
+    }
+
+    /// [`Self::create_device_hr`], calling `observe` with the new window while the device lives.
+    ///
+    /// `observe` runs after the create returned and before the device is
+    /// released, whether or not the create succeeded, and its result is
+    /// returned beside the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    pub fn create_device_observed<R>(
+        &self,
+        pp: &mut D3DPRESENT_PARAMETERS,
+        observe: impl FnOnce(usize) -> R,
+    ) -> (i32, R) {
+        let create = self.factory_vtbl().create_device;
+        Self::create_device_through(
+            pp,
+            |pp, device| {
+                // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device`
+                // are writable for the call and a null focus window is permitted.
+                unsafe {
+                    create(
+                        self.d3d9,
+                        0,
+                        D3DDEVTYPE_HAL,
+                        core::ptr::null_mut(),
+                        D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                        core::ptr::from_mut(pp).cast::<c_void>(),
+                        device,
+                    )
+                }
+            },
+            observe,
+        )
+    }
+
+    /// One device create of `pp` into a hidden window of its own, through `create`.
+    ///
+    /// `create` gets the parameters and the device out slot; the rest is
+    /// [`Self::create_device_observed`].
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    fn create_device_through<R>(
+        pp: &mut D3DPRESENT_PARAMETERS,
+        create: impl FnOnce(&mut D3DPRESENT_PARAMETERS, *mut *mut c_void) -> i32,
+        observe: impl FnOnce(usize) -> R,
+    ) -> (i32, R) {
         let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
         let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
         let hwnd =
             win32::create_styled_window(width, height, false, &win32::WindowStyle::Borderless);
         pp.device_window = hwnd;
         let mut device: *mut c_void = core::ptr::null_mut();
-        // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device` are
-        // writable for the call and a null focus window is permitted.
-        let hr = unsafe {
-            (self.factory_vtbl().create_device)(
-                self.d3d9,
-                0,
-                D3DDEVTYPE_HAL,
-                core::ptr::null_mut(),
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
-                core::ptr::from_mut(pp).cast::<c_void>(),
-                &raw mut device,
-            )
-        };
+        let hr = create(pp, &raw mut device);
+        let observed = observe(hwnd);
         if !device.is_null() {
             // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
             let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
@@ -3540,7 +3592,7 @@ impl Harness {
             unsafe { (vtbl.release)(device) };
         }
         win32::destroy_window(hwnd);
-        hr
+        (hr, observed)
     }
 
     /// `IDirect3D9::CheckDeviceFormatConversion`.

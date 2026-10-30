@@ -91,7 +91,7 @@ before. A key with no entries yet makes its
 leg's run report every failing site as new and fail, and the runner says so
 in one line naming the key and `make conformance-baseline`. The header's
 `Wine:` line is one for the file and names the build of the tests every
-section was recorded against, `wine-11.19-17-gd57b522eea5`: the version of
+section was recorded against, `wine-11.20-32-g9c44ed65ef`: the version of
 the Wine the tests were built from, never of the Wine that runs them. The
 Makefile tells the runner that version (`--tests-wine-version`) from the
 first of these that answers:
@@ -108,10 +108,13 @@ first of these that answers:
    tests with their `VERSION`, so every CI image compares.
 
 A run compares the header with that version and warns when they differ, and
-`make conformance-baseline` writes it into the header. When it is unknown
-the run says so in one line and compares nothing, and a re-record keeps the
-header as it is. A site the arm64 Wine moves is reclassified only on the
-evidence of a recorded run.
+`make conformance-baseline` writes it into the header. Two `git describe`
+versions that differ only in how long they abbreviate one commit's hash
+(git picks the length per repository, so a local build can read
+`...-g9c44ed65ef4` where the release reads `...-g9c44ed65ef`) agree. When it
+is unknown the run says so in one line and compares nothing, and a re-record
+keeps the header as it is. A site the arm64 Wine moves is reclassified only
+on the evidence of a recorded run.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
@@ -189,7 +192,7 @@ The test binaries are the `{i386,x86_64}-windows/d3d9_test.exe` of
 wine-build's arm64 Wine release, under its `lib/wine/tests`, and every leg
 runs that one build whichever Wine it runs under: a site is named by its
 `file:line`, which moves between Wine versions (the x86_64 Wine cx-26.3.0-7
-ships Wine 11.0's tests, the arm64 Wine arm64-11.19-2 Wine 11.19's), so one
+ships Wine 11.0's tests, the arm64 Wine arm64-11.20-1 Wine 11.20's), so one
 classification list can only serve one build of the tests, and a PE test
 runs under any Wine. `WINE_TESTS` names the directory. Under the arm64 Wine
 it defaults to `$WINE_SDK/lib/wine/tests`, the same install `make install`
@@ -210,6 +213,39 @@ subtest as its own process, so a crash in one cannot poison another's counts,
 with Metal API validation left on in `nslog` mode (it logs rather than aborting,
 so it cannot mask the failure counts) and with our logs and Wine's debug
 channels silenced.
+
+A subtest that reports a refused display-mode restore (`Failed to restore
+display modes`, which only `device.c/test_mode_change` prints) leaves the mode
+it wrote with `CDS_UPDATEREGISTRY` as the session's desktop, and every later
+process of the prefix would start from it. win32u keeps that state in
+volatile registry keys that a wineserver builds from the display when it
+starts, so the runner then starts the prefix's session again, in the steps the
+Makefile's prefix configuration ends with (`wineserver -k`, `wineserver -w`,
+`wineserver -p`, `wine wineboot`, then `wineserver -k0` to check that a
+server stayed), with the prefix and `WINEMSYNC` named for each, and the next
+subtest, the next run of a repeat or the next leg starts from the display's
+own mode. A mode-set could not do that: the display's own mode need not be
+one win32u lists (see `device.c/test_mode_change`). The restart holds the
+prefix's configure lock (`<prefix>/.mtld3d-configure.lock`, the flock
+`configure-test-prefix` holds while it ends and boots a server), asking for it
+again while another run holds it until its 120 s budget runs out, so a leg
+configuring the same prefix meanwhile waits instead of booting a second
+server; a lock it never gets, or one the system refuses for another reason
+(named at once), leaves the session as it is. The runner's stderr and the
+raw log, ahead of its last line, say that it happened and how long it took,
+or why it did not or which step failed; a failed step fails nothing, since
+the next subtest's process starts a session of its own, and a step still
+running at the deadline is killed (the step itself, not what it started). A
+run that ends on a GPU hang restarts nothing, since the leg ends with it.
+
+Ending the server ends every process of the session, every other run in that
+prefix included, so this happens only where the restore was refused, which is
+on a display below 60 Hz (the condition is under `device.c/test_mode_change`):
+the Intel CI image's 30 Hz display, and as well a Mac driving an external
+display at 59.94 Hz or 50 Hz. On a display at 60 Hz or above the restore
+works and no run restarts anything. The tests of the same subtest that run
+after the refused restore still run on the mode it left; the runner cannot
+reach into a running subtest.
 
 The layer's validation *errors* are reported, deduplicated, as
 `metal-validation:` lines; its *warnings* are ignored. A warning is a
@@ -476,6 +512,17 @@ record. A knob, where one makes sense, is named with its default.
   desktop's, which was 2992x1934 and aborted the `device` subtest on
   CrossOver 27. No knob: the sizes a knob would restore end the process on
   the Wine that lists them.
+- **`display.maxResolutions` bounds the sizes a game enumerates.** Unset, as
+  in the suite, the adapter lists every settable size at every refresh rate
+  Wine lists, as a driver does. Set, `EnumAdapterModes` and the main module's
+  `EnumDisplaySettings` offer at most that many sizes, the largest by pixel
+  count and always the desktop's, each still at every rate, while a
+  fullscreen request for any settable size is still set. It exists for menus
+  built with a fixed number of entries: World of Warcraft 1.12 lists each
+  size of at least 800x600 its `EnumDisplaySettingsA` walk finds once, in a
+  dropdown of 32 buttons, and Wine's emulated list of forty-odd sizes made
+  opening Video Options fail with a Lua error. The `wow` profile sets 32. No
+  site observes it.
 - **A windowed device's `SetGammaRamp` changes nothing on screen**, and only
   the implicit swap chain carries a ramp at all. The ramp is stored and
   `GetGammaRamp` reports it back either way, and it starts applying as soon as
@@ -947,8 +994,9 @@ they disagree. When a re-baseline adds or removes sites, update the matching
 cluster block (and its rationale) in the same commit.
 
 Line numbers refer to the build of the tests the baseline header names,
-Wine 11.19's (`wine-11.19-17-gd57b522eea5`), including the dated notes below,
-which were renumbered from Wine 11.0's lines with the rest. (2026-10-18: the
+Wine 11.20's (`wine-11.20-32-g9c44ed65ef`, arm64-11.20-1's), including the
+dated notes below, which were renumbered from Wine 11.0's and then Wine
+11.19's lines with the rest. (2026-10-18: the
 header moved from `wine-11.19-17-ge2e42653b41`, arm64-11.19-1's, to
 arm64-11.19-2's without a re-record: the two Wine commits differ only in
 winebuild, and `dlls/d3d9/tests` is the same in both, so every site and count
@@ -963,11 +1011,107 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-18: 6 `real`, 183 `expected`, 3 `caps`,
-6 `ceiling`, 3 `flaky`, 0 `untriaged`, 201 unique sites in all.
+`Sites:` tokens below on 2026-10-25: 0 `real`, 177 `expected`, 3 `caps`,
+7 `ceiling`, 3 `flaky`, 0 `untriaged`, 190 unique sites in all.
 The 2026-07-20 audit recorded all 24 Apple-family subtest-legs of Wine
 11.0's tests `crash=0`; on Wine 11.19's tests some record `crash=1`, as the
-note below says.
+2026-10-18 note below says, and Wine 11.20's tests keep them.
+(2026-10-25: the fixed-function `D3DTSS_TCI_SPHEREMAP` texgen divides by
+`m = 2 * length(R + (0, 0, -1))`, so `test_generated_texcoords` 29162 left
+every key and its cluster left this document. Linear table fog with
+`D3DRS_FOGSTART` equal to `D3DRS_FOGEND` is a step at the end, a depth
+below it unfogged and one at or above it fully fogged, so
+`fog_special_test` 18390 left every key and its cluster went too; vertex
+fog with an equal start and end still fogs everything, which its cases 0 to
+3 check. The two sites were removed from all fourteen sections by hand.
+For the arm64 Wine's six Apple keys the edit was checked against a local
+re-record on an Apple Silicon machine, which read neither site and differed
+from the edit only in the header's tests build and in the flaky and ceiling
+pins, both kept as they were. On the x86_64 Wine no run was made here. CI
+confirms the plain `i686` and `x86_64` keys on macos-15, and the two
+`@mac2` keys are to be confirmed by CI's `record_intel_baseline` dispatch
+with `intel_only` before the change merges; no CI run reads `i686+intel`,
+`x86_64+intel`, `i686+scale` or `x86_64+scale`, which stay unconfirmed
+until a local x86_64-Wine run. Removing the sites there is still safe:
+both are fixed-function and pixel-stage MSL that `mtld3d-core` emits the
+same way under either Wine, the `intel.*` keys change neither the texgen,
+the fog nor the A8R8G8B8 back buffer both tests read, and the arm64 Wine's
+`+intel` and `+scale` re-records read both sites at zero, the fog probes
+included, ten pixels either side of the step.)
+(2026-10-25: `CreateDevice`, `CreateDeviceEx`, `CreateAdditionalSwapChain`,
+`Reset` and `ResetEx` refuse `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` with a
+multisampled back buffer, and a plain device's refused `Reset` leaves it
+needing another, so test_lockable_backbuffer 13133, 13136 and 13141 and
+test_swapchain_multisample_reset 13288 and 13290 pass and both clusters left
+this document. The arm64 Wine's six keys were recorded locally on an Apple
+Silicon machine and moved by those five sites alone; the re-record's drop of
+the flaky test_wndproc 4471 and 4476 and its lower test_fetch4 15686 reads
+were not taken, as their clusters say. The fix is a check of the present
+parameters on the API thread, before any Wine, translator or GPU takes part
+and independent of the `intel.*` answers and `render.scale`, so the five
+sites were taken out of the x86_64 Wine's six keys and the two `@mac2` keys
+by hand at the same time. CI confirms the plain `i686` and `x86_64` keys on
+macos-15 and the `@mac2` keys through a `record_intel_baseline` dispatch; no
+CI run reads `i686+intel`, `i686+scale`, `x86_64+intel` or `x86_64+scale`,
+so those four stay unconfirmed until a local run under the x86_64 Wine.)
+(2026-10-25: the runner starts the prefix's session again after a subtest
+that reports a refused display-mode restore (see `device.c/test_mode_change`),
+so the `@mac2` subtests after `device` run on the display's own 3840x2160 at
+30 Hz. The eleven `d3d9ex.c/test_wndproc` sites joined both `@mac2` d3d9ex
+keys at the counts the other keys read (that cluster lists them). No other
+`@mac2` site moved. Recorded by the `record_intel_baseline` dispatch with
+`intel_only`, run 40166000744: `i686+intel@mac2` in attempt 1,
+`x86_64+intel@mac2` in attempt 2. Only the d3d9ex lines were taken: the
+artifacts predate the lockable back-buffer check (#1184) and the sphere-map
+and table-fog fixes (#1187), so they still carry device.c 13133 to 13290
+and visual.c 18390 and 29162. test_fetch4 15686 keeps its higher pins.)
+(2026-10-24: since every size is served, smallest first, the mode
+`test_mode_change` leaves in the registry on the `@mac2` legs, where its
+restore fails, is 800x600 rather than 3200x1800, so the rest of those legs
+runs on a 4:3 desktop on the Intel image's 16:9 display.
+`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15039
+joined both `@mac2` device keys at one, `expected` like the
+`test_mode_change` sites whose failed restore they follow, and
+`d3d9ex.c/test_wndproc` skips its mode tests there, so its eleven sites left
+both `@mac2` d3d9ex keys. CI's `record_intel_baseline` dispatch with
+`intel_only` recorded the two keys; nothing else moved.)
+(2026-10-24: a 32-bit device sets the creating thread's x87 control word
+to single precision, round to nearest and every exception masked, unless
+`D3DCREATE_FPU_PRESERVE` is passed, as D3D9 does, so test_fpu_setup 5037
+and 5047 left every i686 key and the cluster left this document. The 64-bit
+legs never carried them: a 64-bit device leaves the word alone, which is
+what those checks expect.)
+(2026-10-24: every leg moved to Wine 11.20's tests, the build arm64-11.20-1
+publishes. Against Wine 11.19's, `dlls/d3d9/tests` changes only `visual.c`:
+`test_fog` gains ten lines and `test_texture_transform_flags` loses one, so
+the two sites after them move nine lines later, test_generated_texcoords
+from 29153 to 29162 and test_blit_format_conversion from 29210 to 29219,
+and no other site moves. Three `todo_wine` marks go, or no longer apply to
+us: the one on the `fog_special_test` check of the unfogged side, the one on
+the `test_fog` checks of the fixed-function table fog under an orthogonal
+projection, which now covers only an adapter of vendor 0x10de and device
+0x0041, and the one on the `test_texture_transform_flags` check of a
+projected `D3DTTFF_COUNT1` coordinate. The runner counts a failure inside a
+todo block apart and never gates on it, so the first adds
+`fog_special_test` 18390, `real`, at four on every Apple key; the checks
+under the other two pass. A `stretchrect_test` check whose `==` bound
+tighter than its `?:` now compares what it meant to and passes for the
+runner: on tests 7, 9, 15, 17, 23, 25 and 31 it is still under
+`todo_wine_if` and prints `Test succeeded inside todo block`, which the
+runner does not count. The pin move also brings a loadable d3d12.dll (from
+arm64-11.19-3 on), so `init_d3d9on12_modules` 15104 reads 1 on every arm64
+Wine key; on the x86_64 Wine it still reads 1 on the `x86_64` keys and 0 on
+the `i686` ones. Recorded locally on an Apple Silicon machine: the arm64
+Wine's six keys (`i686-arm64`, `arm64x` and their `+intel` and `+scale`
+forms) under arm64-11.20-1, and the x86_64 Wine's six Apple keys (`i686`,
+`x86_64` and their `+intel` and `+scale` forms) under cx-26.3.0-7 through
+Rosetta, the Wine CI's macos-15 image runs. CI's `record_intel_baseline`
+dispatch with `intel_only` on the branch recorded the two `@mac2` keys (see
+"Running"): they add 18390 at four and renumber the two moved sites like
+the Apple keys, and nothing else moved. The flaky and ceiling pins kept
+their values: test_wndproc 4471 and 4476 read 0 on every key recorded here,
+4324 and 4325 read 0 on `i686` and `i686+intel`, and test_fetch4 15686 read
+3 to 9, all tolerated.)
 (2026-10-18: every leg moved to Wine 11.19's tests, and the Apple-family
 sections of both Wines, 48 subtest-legs, were recorded against them; the
 `Sites:` tokens and the line numbers in the prose moved with the source. The
@@ -977,7 +1121,7 @@ read, and the flaky and ceiling pins the cluster prose names. The 11.19 tests
 add eight sites in five clusters: the six `real` ones of
 `test_lockable_backbuffer`, `test_swapchain_multisample_reset` and
 `test_generated_texcoords`, the `expected` 15357 of
-`test_device_vtbl_initialization_assembly_hook` and the `caps` 29210 of
+`test_device_vtbl_initialization_assembly_hook` and the `caps` 29219 of
 `test_blit_format_conversion`. Two of them end their subtest in a fault, so
 every i686 `device` leg and every `+intel` `visual` leg records `crash=1`;
 both are the subtest's last test and the clusters say why. The desktop-mode
@@ -1078,24 +1222,24 @@ harness pins it, and so does the launcher) win32u leaves the physical display
 alone, answers the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, the
 client rect and every mouse coordinate in the mode, and scales the window
 onto the physical monitor; without it the mac driver would hand the change to
-`CGDisplaySetDisplayMode` and switch the whole desktop. The device leaves the
-z-order alone: raising the window to the topmost level deadlocks winemac (see
-test_window_style 5216).
+`CGDisplaySetDisplayMode` and switch the whole desktop. Before the mode-set
+the device activates the focus window, as native does, which raises it to the
+top of the windows that are not topmost (test_wndproc 4203). It never makes
+the window topmost: raising the window to the topmost level deadlocks winemac
+(see test_window_style 5216).
 
-The mode list `EnumAdapterModes` serves is a bounded subset of
-`EnumDisplaySettingsW`'s (the sizes that fill the display, largest first,
-which are those win32u's uniform scale onto the physical display leaves a bar
-of less than one physical pixel for, then the standard sizes of another shape
-that user32 lists, largest first: 2560x1440, 1920x1080, 1600x900, 1280x720,
-1024x768, 800x600 and 640x480, which win32u letterboxes), so an enumerated
-mode is one win32u accepts by construction, and a fullscreen request for any
-mode in the full list is set whether or not the bounded list carries it. Both
-lists leave out the sizes win32u cannot scale the monitor to (see Kept
-divergences). The test binary, being the process's main module, enumerates the
-same sizes through its own `EnumDisplaySettingsW` import, in user32's order
-rather than the served one (d3d9 redirects it at load; user32's list is
-untouched and `ENUM_CURRENT_SETTINGS` passes through), so a mode the test
-picks from either list is one user32 accepts. When the app requests one, the
+The mode list `EnumAdapterModes` serves is `EnumDisplaySettingsW`'s at the
+desktop's colour depth: every size no larger than the desktop, each at every
+refresh rate user32 lists for it, ordered by width, height and refresh rate,
+so an enumerated mode is one win32u accepts by construction. It leaves out
+only the sizes win32u cannot scale the monitor to (see Kept divergences).
+`display.maxResolutions` can bound it to the largest sizes; the suite sets no
+bound, and a fullscreen request for any mode in the full list is set whether
+or not a bounded list carries it. The test binary, being the process's main
+module, enumerates the same sizes through its own `EnumDisplaySettingsW`
+import, in user32's order rather than the served one (d3d9 redirects it at
+load; user32's list is untouched and `ENUM_CURRENT_SETTINGS` passes through),
+so a mode the test picks from either list is one user32 accepts. When the app requests one, the
 device sets it and the back buffer is that mode; present scales it to the
 drawable, which stays at the display's size (MetalFX when enlarging, the same
 resample `render.scale` rides). Both halves of the contract then agree with
@@ -1137,11 +1281,9 @@ walk further):
   `GetAdapterDisplayMode` come from `EnumDisplaySettingsW`, the same view
   win32u validates `ChangeDisplaySettingsW` against and derives
   `GetMonitorInfoW` from, instead of `NSScreen`: the current mode for
-  `GetAdapterDisplayMode` (read live, so it follows a mode-set), a bounded
-  subset of the enumerated list for `EnumAdapterModes`, the sizes that fill
-  the display and then the standard ones (so a mode a game picks is one user32
-  accepts, the sizes that fill the display come first, and a menu built for a
-  driver's short list does not overflow). On this machine the two views agree
+  `GetAdapterDisplayMode` (read live, so it follows a mode-set) and the
+  enumerated list for `EnumAdapterModes` (so a mode a game picks is one user32
+  accepts). On this machine the two views agree
   under the pinned Retina mode; on the runner's virtual display they disagreed
   by exactly 2x (Win32 2048x1536, `NSScreen` 1024x768), which split
   `GetDisplayMode` from the monitor rect (test_get_display_mode 14488/14490)
@@ -1196,14 +1338,9 @@ exactly as on any other leg; the legs carry none today.
 
 ### The `real` backlog
 
-Two defects, both first observed by the Wine 11.19 tests:
-`D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` accepted with a multisampled
-back buffer (`device.c/test_lockable_backbuffer` and
-`device.c/test_swapchain_multisample_reset`, five sites, issue #1160), and
-the sign of the `D3DTSS_TCI_SPHEREMAP` denominator
-(`visual.c/test_generated_texcoords`, one site, issue #1161).
+None: no failing site is `real` today.
 
-Every other failing site is a recorded decision (`expected`), a capability we
+Every failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin above the usual read, because the site
 reads lower on other hardware or flaps below it here (`ceiling`), or a known
 flap (`flaky`), each with its rationale in the
@@ -1225,7 +1362,7 @@ baseline.
 ### device.c clusters
 
 ### device.c/test_wndproc
-Sites: 4203=expected 4208=expected 4210=expected 4215=expected
+Sites: 4215=expected
 Sites: 4219=expected 4244=expected 4253=expected 4289=expected
 Sites: 4294=expected 4298=ceiling 4315=ceiling 4324=ceiling 4325=ceiling
 Sites: 4336=expected 4416=expected
@@ -1236,10 +1373,16 @@ Sites: 4476=flaky
 4157/4227, the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
 before any D3D9 object is involved, pass on both Wines now that the mode the
 test picks from `EnumAdapterModes` is one user32 accepts, and carry no pin.
-The rest of the fullscreen focus lifecycle we
-deliberately do not drive: no focus/foreground mutation (4208/4210), no focus-
+A fullscreen create activates the focus window as native does, one
+`SetWindowPos` to `HWND_TOP` without `SWP_NOACTIVATE` before the window is
+styled and shown, so the create's `WM_WINDOWPOSCHANGING`, `WM_ACTIVATE` and
+`WM_SETFOCUS` on the focus window (4203) and the focus and foreground
+windows read after it (4208/4210) pass in both iterations, the
+`D3DCREATE_NOWINDOWCHANGES` one included. The rest of the fullscreen focus
+lifecycle we deliberately do not drive: no focus-
 window subclass (4219/4568), no WM_* activation/mode message generation
-(4203/4244/4289/4315/4336/4428/4521/4541), no focus-window minimize
+on focus loss, re-activation or mode change
+(4244/4289/4315/4336/4428/4521/4541), no focus-window minimize
 (4416), device-never-lost TestCooperativeLevel (4253/4294/4420/4483).
 4298 (both iterations) expects the desktop still at the registry mode after
 the app is re-activated, native leaving the mode-set to the app's next
@@ -1374,19 +1517,6 @@ The other six expect the device window's wndproc UNCHANGED and fail because
 of our cursor subclass, the same deliberate hook as test_wndproc 4215,
 kept on purpose (cursor realization is driven from it).
 
-### device.c/test_reset_fullscreen
-Sites: 4867=expected
-
-WM_ACTIVATEAPP delivery on a windowed→fullscreen Reset; we do not
-force-show/activate the window.
-
-### device.c/test_fpu_setup
-Sites: 5037=expected 5047=expected
-
-i686 only. Native D3D9 rewrites the x87 control word to single precision
-(0x7f) at device creation and keeps it for callbacks; we deliberately never
-touch the FPU control word. On x86_64 the same checks are todo_wine (free).
-
 ### device.c/test_window_style
 Sites: 5216=expected
 
@@ -1416,11 +1546,44 @@ mode and the test's own CDS calls pick a mode user32 accepts, on both Wines.
 5548/5550 (the back buffer must keep the size a fullscreen create asked for
 across an external mode change) pass because the back buffer honors the
 request and never follows the window. 5594/5614/5637/5672/5896 ("Failed to
-restore display modes") fire on the `@mac2` legs only, where the test's
-restore of the original display modes fails. Why it fails there is not
-established: the Intel CI image's display runs 3840x2160 at 30 Hz and user32
-lists 25 sizes for it, so it is not a single-mode display. Desktop mode
-switching is out of scope, so `expected`.
+restore display modes") fire on the `@mac2` legs only, where win32u refuses
+the modes the test hands back. The test saves each display's
+`ENUM_CURRENT_SETTINGS` mode and restores it with
+`ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)`, and win32u
+matches that mode, its refresh rate included, against the display's mode
+list (`find_display_mode` in `dlls/win32u/sysparams.c`). Under
+`EmulateModeset` the list is win32u's own: every size at 60 Hz, and the
+display's own rate as well only when it is above 60 (`get_virtual_modes`,
+the same in Wine 11.0 and 11.20). The Intel CI image's display runs
+3840x2160 at 30 Hz, so the saved mode is no mode of its list and every
+restore returns `DISP_CHANGE_BADMODE`; the layer's log there reads "host
+3840x2160@30Hz on a 3840x2160 display; 25 sizes settable of 75 enumerated
+modes", 25 sizes at three depths and one rate. The condition is the rate
+winemac reports, which it truncates to whole hertz and reads as 60 when the
+display gives none (`winemac.drv/display.c`): a rate from 2 to 59 is refused
+(59.94 reads 59), a rate of 60 matches the 60 Hz entries, a rate above 60 is
+listed, and `find_display_mode` ignores a requested rate of 1 or 0. So any
+display below 60 Hz refuses the restore, an external 50 Hz or 59.94 Hz one on
+an Apple Silicon Mac too; the displays the Apple keys were recorded on run
+at 60 Hz or above (a 120 Hz panel lists 60 and 120), and the restore passes
+on every Apple key. The device's own restores pass on that image too, since
+they apply the registry mode without a `DEVMODE`, which win32u does not
+match against the list. A Wine defect rather than ours, and desktop mode
+switching is out of scope, so `expected`. Listing the display's own rate
+below 60 Hz too, in wine-build's Wine, would let the restore pass and take
+these five sites and the three below that follow from them off the `@mac2`
+keys (issue #1183).
+
+A failed restore leaves the mode the test's own `CDS_UPDATEREGISTRY` calls
+wrote in the registry, and the session serves it as the desktop to every
+later test of the subtest. The test takes that mode from the served list,
+which is ordered smallest first: on the Intel image it is 800x600, the
+second size of at least 640x480 there. So the `@mac2` legs run the rest of
+the `device` subtest on a 4:3 desktop on a 16:9 display, which is what
+`test_cursor_clipping` 14930 and 14955 and `test_window_position` 15039 read.
+The runner starts the prefix's session again once the subtest has ended (see
+"The test binaries" under Running), so the later subtests start from the
+display's own mode.
 
 ### device.c/test_device_window_reset
 Sites: 5971=expected 5974=expected
@@ -1535,45 +1698,56 @@ layout assertion across six cube faces and their mip levels. Cube staging is
 also one PageBox per subresource so a face or mip can rename independently.
 Per-subresource pixel data is correct.
 
-### device.c/test_lockable_backbuffer
-Sites: 13133=real 13136=real 13141=real
-
-`D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` together with a multisampled back buffer
-must be refused with `D3DERR_INVALIDCALL`, since a multisampled surface
-cannot be locked. 13133 asks `CreateAdditionalSwapChain` for it with four
-samples and 13141 `CreateDevice`; both read "Unexpected hr 0". 13136 follows
-from 13133: the swap chain that should not exist holds a device reference,
-so the release reads "Device has 1 references left". The present-parameter
-check every create and reset shares
-(`mtld3d_core::present::present_params_are_valid`) never reads `Flags`, where
-wined3d refuses the combination in `wined3d_swapchain_desc_validate_flags`.
-A defect, on every leg of both Wines, issue #1160.
-
-### device.c/test_swapchain_multisample_reset
-Sites: 13288=real 13290=real
-
-The `Reset` counterpart of `test_lockable_backbuffer`: 13288 resets a
-two-sample swap chain with `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` and expects
-`D3DERR_INVALIDCALL`, and 13290 expects the `D3DERR_DEVICENOTRESET` a
-rejected `Reset` latches; both read `S_OK`/`D3D_OK` because the `Reset`
-succeeds. The same missing check, so the same fix moves all five sites
-(issue #1160).
-
 ### device.c/test_cursor_clipping
+Sites: 14930=expected 14946=ceiling 14955=expected
 
 The test creates a fullscreen device at the first served mode of at least
 640x480 that differs from the desktop mode on both axes, and the cursor clip
-must then equal the virtual screen, i.e. the mode. Under Wine's emulated
-mode-set win32u clips the foreground fullscreen window to the physical
-monitor and reports that rect mapped back into the mode, so a mode of
-another aspect than the display's has its letterbox bars inside the clip:
-640x480 on a 3456x2234 panel reads "(-51,0)-(691,480)". That is win32u's
-mapping, not ours; the device sets the mode exactly as native does. The
-cluster carries no site: the served list puts the sizes that fill the display
-first, so the pick is one of them and 14946 passes, 2624x1696 on a 3456x2234
-panel and 1600x1200 on the CI runner's 4:3 virtual display. It would fire
-only where no second size fills the display and the pick is a standard size
-of another shape.
+must equal the virtual screen, i.e. the desktop mode, before the create
+(14930), while the device holds the mode (14946) and after its release
+(14955). Under Wine's emulated mode-set win32u clips the foreground
+fullscreen window to the physical monitor and reports that rect mapped back
+into the mode, so a mode of another aspect than the display's has its
+letterbox bars inside the clip: 640x480 on a 3456x2234 panel reads
+"(-51,0)-(691,480)". That is win32u's mapping, not ours; the device sets the
+mode exactly as native does. The served list is ordered smallest first, as a
+driver lists it, so the pick is 640x480 wherever Wine lists it: 14946 fires
+on a display of another shape (a MacBook panel, the Intel image) and passes
+on the CI runner's 4:3 virtual display, hence `ceiling` at 1 on every leg.
+
+14930 and 14955 fire on the `@mac2` legs only. There the desktop is already
+800x600 when the test starts, the mode `test_mode_change`, earlier in the
+same process, leaves in the registry when its restore fails (see that
+cluster; the runner's restart of the session comes after the process), and
+win32u maps the clip with no fullscreen window the same way: on the Intel
+image's 3840x2160 display it reads "(-133,0)-(933,600)" against
+"(0,0)-(800,600)", before the create and again after the release. They read
+1 on every run of the Intel image and appear on no Apple key, and they come
+from the same failed restore as the `test_mode_change` sites, so they are
+`expected` like those and go with the Wine fix for that restore
+(issue #1183).
+
+### device.c/test_window_position
+Sites: 15039=expected
+
+The test creates a fullscreen device at the monitor's size, shrinks the
+window by one pixel on each axis, and after the second such resize expects
+the window to keep that rect once events are processed. It fires on the
+`@mac2` legs only, where the desktop is the 800x600 mode `test_mode_change`
+leaves behind earlier in the same process (see that cluster), which win32u
+scales onto the 3840x2160 display by 3.6 with bars at both sides: the
+window comes back from the event round trip one pixel lower,
+"(0,1)-(799,600)" for "(0,0)-(799,599)", the same size. The failure message
+prints the monitor rect, not the rect the test expects, so the log reads
+"Expect window rect (0,0)-(800,600)". The device sets no mode here, the
+request being the desktop's own size, and a window the layer re-covered the
+monitor with would read "(0,0)-(800,600)". That the pixel is lost rounding
+the window's frame through the 3.6 scale is conjecture. With a desktop of
+the display's shape it passes, as it did on the Intel image while the mode
+left behind was 3200x1800. It reads 1 on every run of the Intel image and
+comes from the same failed restore as the `test_mode_change` sites, so it is
+`expected` like those and goes with the Wine fix for that restore
+(issue #1183).
 
 ### device.c/init_d3d9on12_modules
 Sites: 15104=ceiling
@@ -1583,10 +1757,16 @@ counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
 Metal. Ceiling, not expected, because the site only fires where the Wine
 build ships a loadable d3d12.dll: the win_skip sits after the three
 LoadLibrary calls, and a failed load takes a plain `skip()` that counts
-nothing. The x86_64 Wine (cx-26.3.0-7) ships a d3d12.dll the 64-bit test
-process loads and reads 1 on its `x86_64` legs; the arm64 Wine and every
-i686 leg read 0. Not test-source drift: every leg runs the same build of the
-tests, so the difference is the Wine's own d3d12.
+nothing. wine-build's arm64 Wine ships a d3d12.dll that both the i386 and
+the x86_64 test process load from arm64-11.19-3 on (vkd3d-proton, in the
+dxmt tree its default rules select), so every arm64 Wine key reads 1:
+`i686-arm64`, `arm64x` and their `+intel` and `+scale` forms. On the x86_64
+Wine (cx-26.3.0-7) only the 64-bit test process loads one, so its `x86_64`
+keys read 1 and its `i686` keys 0. Not test-source drift: every leg runs the
+same build of the tests, so the difference is the Wine's own d3d12.
+Exporting a stub `Direct3DCreate9On12` would not clear it: `test_d3d9on12`
+calls the function and checks what it creates, so the failures would move
+there.
 
 ### device.c/test_d3d9on12
 Sites: 15176=expected
@@ -1795,19 +1975,8 @@ so the answer is NOTAVAILABLE. That is the conformant answer for a device
 without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
 
-### visual.c/test_generated_texcoords
-Sites: 29153=real
-
-The `D3DTSS_TCI_SPHEREMAP` row reads `0x00757d00` where `0x00836900` is
-expected; the camera-space position, normal and reflection-vector rows
-pass. The fixed-function emitter (`windows/core/src/dxso/ff.rs`, the
-SPHEREMAP arm) divides by `m = 2 * length(R + (0, 0, 1))`; the test's
-geometry evaluated with that formula gives the value read, and with
-`R + (0, 0, -1)`, which wined3d emits, the value expected. DXVK uses the
-same sign we do. A defect, on every leg of both Wines, issue #1161.
-
 ### visual.c/test_blit_format_conversion
-Sites: 29210=caps
+Sites: 29219=caps
 
 Intel legs only. Test 2 creates an R5G6B5 render-target texture as the
 `StretchRect` destination without asking `CheckDeviceFormat` first. On a
@@ -1969,17 +2138,32 @@ run under Wine counts it; 2049 and 2051 accept no `D3D_OK` at all. The
 `TestCooperativeLevel` and `Reset` assertions pass.
 
 ### d3d9ex.c/test_wndproc
-Sites: 2908=expected 2913=expected 2915=expected 2920=expected 2924=expected
+Sites: 2920=expected 2924=expected
 Sites: 2949=expected 2957=expected 3007=expected 3036=expected 3107=expected
 Sites: 3183=expected 3203=expected 3209=expected 3230=expected
 
-The extended copy of `device.c/test_wndproc`, and the same decisions: no
-activation or mode message generation (2908, 2949, 3007, 3036, 3183, 3203),
-no focus or foreground change (2913, 2915), the cursor subclass on the device
+The extended copy of `device.c/test_wndproc`, and the same decisions. The
+fullscreen create activates the focus window, so its messages (2908) and
+the focus and foreground windows after it (2913, 2915) pass, as `device.c`
+4203/4208/4210 do. Not driven: activation or mode message generation on
+focus loss, re-activation or mode change (2949, 3007, 3036, 3183, 3203),
+the cursor subclass on the device
 window rather than a subclass of the focus window (2920, 2924, 3230), no
 focus-window minimize (3107), and a `WINDOWPOS` the message walk never
 reaches (3209, as `device.c` 4547). 2957 expects `S_PRESENT_OCCLUDED` from
 `CheckDeviceState` after the focus loss, the occlusion decision above.
+
+On the `@mac2` legs d3d9ex runs on the display's own mode because the
+runner starts the prefix's session again after `device.c/test_mode_change`
+leaves 800x600 behind (see that cluster). On 800x600 the served list holds
+no pair of other sizes the test's pick accepts and the test skips its mode
+tests at 2838 ("Could not find adequate modes"). Every key, the `@mac2`
+ones included, reads:
+
+| Count | Sites |
+| --- | --- |
+| 2 | 2920, 2924, 2949, 2957, 3007, 3036, 3230 |
+| 1 | 3107, 3183, 3203, 3209 |
 
 ### d3d9ex.c/test_wndproc_windowed
 Sites: 3331=expected 3345=expected 3349=expected 3356=expected 3399=expected
