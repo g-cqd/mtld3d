@@ -109,7 +109,7 @@ pub struct Mtld3dConfig {
     pub display_legacy_4_by_3: bool,
     /// Leave out the display sizes some Wine builds cannot rescale the monitor from.
     ///
-    /// After a mode-set win32u of some builds (CrossOver 27) packs the monitor
+    /// After a mode-set `win32u` of some builds (`CrossOver` 27) packs the monitor
     /// scale ratio into 16 bits per term and aborts when a term does not fit,
     /// so such sizes are left out of the adapter modes. A Wine whose win32u
     /// computes the scale in floating point has no such limit, and with this

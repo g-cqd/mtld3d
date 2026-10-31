@@ -313,6 +313,7 @@ fn write_slot(slot: *mut *const (), value: *const ()) -> Option<*const ()> {
     // is a valid pointer-sized entry of the import address table; unaligned
     // read/write tolerates 4-byte-aligned IATs in packed 64-bit images.
     let previous = unsafe { slot.read_unaligned() };
+    // SAFETY: as above, the slot is a writable pointer-sized IAT entry.
     unsafe { slot.write_unaligned(value) };
     // SAFETY: restoring the protection the page had; a failure here leaves
     // the page writable, which is harmless.

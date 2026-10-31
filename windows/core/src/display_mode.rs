@@ -268,7 +268,7 @@ pub fn served_sizes(settable: &[(u32, u32)], max: usize, legacy_4_by_3: bool) ->
         return sizes;
     }
     if legacy_4_by_3 {
-        return bounded_with_four_by_three(sizes, desktop, max);
+        return bounded_with_four_by_three(&sizes, desktop, max);
     }
     let mut by_area = sizes;
     by_area.sort_unstable_by_key(|&size| Reverse((pixels(size), size)));
@@ -375,7 +375,7 @@ fn is_four_by_three((w, h): (u32, u32)) -> bool {
 /// [`served_sizes`]' bound under `display.legacy4By3`: the desktop, then the
 /// largest 4:3 and the largest other sizes in turn, `max` in all, ordered by
 /// width and then height.
-fn bounded_with_four_by_three(sizes: Vec<(u32, u32)>, desktop: (u32, u32), max: usize) -> Vec<(u32, u32)> {
+fn bounded_with_four_by_three(sizes: &[(u32, u32)], desktop: (u32, u32), max: usize) -> Vec<(u32, u32)> {
     let by_area = |keep: fn((u32, u32)) -> bool| {
         let mut group: Vec<_> = sizes
             .iter()
